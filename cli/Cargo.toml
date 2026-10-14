@@ -15,7 +15,7 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target
 bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
-bxmap = { version = "0.9.4", path = ".." }
+bxmap = { version = "0.9.5", path = ".." }
 rayon = "1"
 regex = "1"
 
