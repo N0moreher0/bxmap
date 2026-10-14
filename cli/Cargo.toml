@@ -1,6 +1,6 @@
 [package]
 name = "bxmap-cli"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Command-line frontend for the bxmap memory-dump string extraction library"
@@ -14,11 +14,21 @@ rust-version = "1.70"
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"
 
+[features]
+default = ["yara"]
+# Full build (YARA via yara-x, 64-bit only). Lite: --no-default-features
+yara = ["bxmap/yara"]
+
 [dependencies]
-bxmap = { version = "0.9.5", path = ".." }
+bxmap = { version = "0.9.6", path = "..", default-features = false }
 rayon = "1"
 regex = "1"
 
 [[bin]]
 name = "bxmap"
 path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

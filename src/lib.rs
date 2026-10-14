@@ -70,6 +70,7 @@ pub struct YaraMatch {
 /// A small overlap is retained between chunks so literals and regular
 /// expressions crossing an I/O boundary are still visible to YARA. Rules are
 /// reported once, at the first chunk in which they match.
+#[cfg(feature = "yara")]
 pub fn scan_yara_from_reader_streaming<R: Read, F: FnMut(YaraMatch)>(
     mut reader: R,
     rules_source: &str,
@@ -114,6 +115,19 @@ pub fn scan_yara_from_reader_streaming<R: Read, F: FnMut(YaraMatch)>(
         global_offset += read as u64;
     }
     Ok(count)
+}
+
+/// Stub used by lite builds (`--no-default-features`): YARA is not compiled in.
+#[cfg(not(feature = "yara"))]
+pub fn scan_yara_from_reader_streaming<R: Read, F: FnMut(YaraMatch)>(
+    _reader: R,
+    _rules_source: &str,
+    _on_match: F,
+) -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "YARA support is not compiled into this lite build; use the full build",
+    ))
 }
 
 /// File-based convenience wrapper for [`scan_yara_from_reader_streaming`].
@@ -206,6 +220,7 @@ impl NoiseConfig {
 const CHUNK_SIZE: usize = 32 * 1024 * 1024;
 // Keeps ordinary YARA literals and bounded regexes visible across chunk
 // boundaries without turning the streaming scan into a whole-file read.
+#[cfg(feature = "yara")]
 const YARA_OVERLAP_SIZE: usize = 64 * 1024;
 /// Fixed window used by the entropy pass. Keeping this separate from the
 /// string-scan chunk makes entropy results comparable across files.
@@ -913,6 +928,7 @@ mod tests {
         assert!((shannon_entropy(&mixed) - 8.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(feature = "yara")]
     #[test]
     fn yara_reader_scan_reports_matching_rule() {
         let rules = r#"

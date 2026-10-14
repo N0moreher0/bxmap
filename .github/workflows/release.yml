@@ -35,6 +35,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build CLI
+        env:
+          # Windows: link the C runtime statically so no VC++ redistributable is needed.
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
 
       - name: Stage Unix binary
@@ -105,3 +108,73 @@ jobs:
               --title "bxmap-cli ${version}" \
               --notes "Prebuilt bxmap-cli binaries for commit ${GITHUB_SHA}."
           fi
+
+  static:
+    name: static-${{ matrix.target }}
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Full builds (with YARA) - 64-bit only
+          - target: x86_64-unknown-linux-musl
+            flags: ""
+          - target: aarch64-unknown-linux-musl
+            flags: ""
+          # Lite builds (no YARA) - small, for routers / 32-bit devices
+          - target: i686-unknown-linux-musl
+            flags: "--no-default-features"
+          - target: armv7-unknown-linux-musleabihf
+            flags: "--no-default-features"
+          - target: arm-unknown-linux-musleabi
+            flags: "--no-default-features"
+          - target: mipsel-unknown-linux-musl
+            flags: "--no-default-features"
+            nightly: true
+          - target: mips-unknown-linux-musl
+            flags: "--no-default-features"
+            nightly: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nightly (tier-3 targets are built with build-std)
+        if: matrix.nightly
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build static binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=""
+          if [ "${{ matrix.nightly }}" = "true" ]; then toolchain="+nightly"; fi
+          cross $toolchain build --release --locked \
+            --manifest-path cli/Cargo.toml \
+            --target "${{ matrix.target }}" ${{ matrix.flags }}
+
+      - name: Stage and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' cli/Cargo.toml | head -n 1)"
+          tag="v${version}"
+          mkdir -p dist
+          out="dist/bxmap-${{ matrix.target }}.bin"
+          cp "cli/target/${{ matrix.target }}/release/bxmap" "$out"
+          chmod +x "$out"
+          (cd dist && sha256sum "$(basename "$out")" > "$(basename "$out").sha256")
+          gh release upload "$tag" dist/* --clobber

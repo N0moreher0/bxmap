@@ -1,6 +1,6 @@
 [package]
 name = "bxmap"
-version = "0.9.5"
+version = "0.9.6"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Fast streaming ASCII/UTF-16LE string extractor for raw binaries, firmware and memory dumps, with entropy, magic-bytes and noise filtering. Never loads the whole file into RAM."
@@ -14,4 +14,10 @@ rust-version = "1.70"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 rayon = "1"
-yara-x = "1.20"
+yara-x = { version = "1.20", optional = true }
+
+[features]
+# "yara" pulls in yara-x (wasmtime/cranelift): 64-bit only and large.
+# Build with --no-default-features for tiny static builds (routers, 32-bit ARM/MIPS).
+default = ["yara"]
+yara = ["dep:yara-x"]

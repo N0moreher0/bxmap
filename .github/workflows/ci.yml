@@ -30,3 +30,9 @@ jobs:
 
       - name: Test CLI
         run: cargo test --manifest-path cli/Cargo.toml
+
+      - name: Test lite build (no YARA)
+        run: cargo test --no-default-features --locked
+
+      - name: Test CLI lite build (no YARA)
+        run: cargo test --manifest-path cli/Cargo.toml --no-default-features --locked

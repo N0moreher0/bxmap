@@ -74,6 +74,34 @@ See all available options:
 bxmap --help
 ```
 
+## Static builds for any machine (routers, embedded, old distros)
+
+One file cannot run on every CPU architecture, so every release ships one
+self-contained `bxmap-<target>.bin` per architecture. The Linux ones are fully
+static (musl): no libc, no dependencies, copy and run.
+
+| Target | Typical hardware | Build |
+| --- | --- | --- |
+| `x86_64-unknown-linux-musl` | PCs, servers | full (YARA) |
+| `aarch64-unknown-linux-musl` | ARM64 boards, phones, newer routers | full (YARA) |
+| `i686-unknown-linux-musl` | old 32-bit x86 | lite |
+| `armv7-unknown-linux-musleabihf` | Raspberry Pi, ARM routers | lite |
+| `arm-unknown-linux-musleabi` | older ARM (ARMv6) | lite |
+| `mipsel-unknown-linux-musl` | many OpenWrt routers (MediaTek, Atheros) | lite |
+| `mips-unknown-linux-musl` | big-endian MIPS routers | lite |
+
+The **lite** build is the same tool without YARA (`--yar` reports that it is not
+compiled in). It is a few MB and has no heavy dependencies, because YARA-X only
+supports 64-bit CPUs. Build it yourself with:
+
+```bash
+cargo build --release --no-default-features
+```
+
+On a router: `chmod +x bxmap-mipsel-unknown-linux-musl.bin && ./bxmap-mipsel-unknown-linux-musl.bin dump.bin`.
+If you are not sure which one you need, run `uname -m` (or `cat /proc/cpuinfo`)
+on the device; for MIPS check endianness with `lscpu | grep -i endian`.
+
 ## Why bxmap?
 
 Memory dumps are large, noisy, and full of useful evidence hidden among
