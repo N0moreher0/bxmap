@@ -45,7 +45,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p package
-          cp "cli/target/${{ matrix.target }}/release/bxmap" package/bxmap
+          cp "target/${{ matrix.target }}/release/bxmap" package/bxmap
           cp LICENSE README.md package/
 
       - name: Stage Windows binary
@@ -53,7 +53,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force package | Out-Null
-          Copy-Item "cli/target/${{ matrix.target }}/release/bxmap.exe" package/bxmap.exe
+          Copy-Item "target/${{ matrix.target }}/release/bxmap.exe" package/bxmap.exe
           Copy-Item LICENSE, README.md package/
 
       - name: Upload binary
@@ -174,7 +174,7 @@ jobs:
           tag="v${version}"
           mkdir -p dist
           out="dist/bxmap-${{ matrix.target }}.bin"
-          cp "cli/target/${{ matrix.target }}/release/bxmap" "$out"
+          cp "target/${{ matrix.target }}/release/bxmap" "$out"
           chmod +x "$out"
           (cd dist && sha256sum "$(basename "$out")" > "$(basename "$out").sha256")
           gh release upload "$tag" dist/* --clobber

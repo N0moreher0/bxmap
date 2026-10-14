@@ -95,7 +95,8 @@ compiled in). It is a few MB and has no heavy dependencies, because YARA-X only
 supports 64-bit CPUs. Build it yourself with:
 
 ```bash
-cargo build --release --no-default-features
+cargo build --release -p bxmap-cli --no-default-features
+# binary: target/release/bxmap
 ```
 
 On a router: `chmod +x bxmap-mipsel-unknown-linux-musl.bin && ./bxmap-mipsel-unknown-linux-musl.bin dump.bin`.

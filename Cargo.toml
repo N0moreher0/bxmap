@@ -11,6 +11,11 @@ keywords = ["strings", "forensics", "binary", "firmware", "dfir"]
 categories = ["parsing", "command-line-utilities"]
 rust-version = "1.70"
 
+[workspace]
+# Single workspace root so cross/docker mounts one directory and
+# target/ + Cargo.lock live at the repo root.
+members = ["cli"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 rayon = "1"
@@ -21,3 +26,9 @@ yara-x = { version = "1.20", optional = true }
 # Build with --no-default-features for tiny static builds (routers, 32-bit ARM/MIPS).
 default = ["yara"]
 yara = ["dep:yara-x"]
+
+# Release profile for the whole workspace (small, fast binaries)
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

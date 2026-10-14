@@ -1,0 +1,6 @@
+# Tier-3 targets have no prebuilt std: build it from source (needs nightly + rust-src).
+[target.mipsel-unknown-linux-musl]
+build-std = true
+
+[target.mips-unknown-linux-musl]
+build-std = true
