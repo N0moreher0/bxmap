@@ -1,0 +1,17 @@
+[package]
+name = "bxmap"
+version = "0.9.4"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Fast streaming ASCII/UTF-16LE string extractor for raw binaries, firmware and memory dumps, with entropy, magic-bytes and noise filtering. Never loads the whole file into RAM."
+readme = "README.md"
+repository = "https://github.com/N0moreher0/bxmap"
+# repository cũ vẫn redirect được, nhưng đổi luôn cho brand mới
+keywords = ["strings", "forensics", "binary", "firmware", "dfir", "malware", "memory-dump"]
+categories = ["parsing", "command-line-utilities"]
+rust-version = "1.70"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+rayon = "1"
+yara-x = "1.20"
