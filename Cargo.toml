@@ -7,7 +7,7 @@ description = "Fast streaming ASCII/UTF-16LE string extractor for raw binaries, 
 readme = "README.md"
 repository = "https://github.com/N0moreher0/bxmap"
 # repository cũ vẫn redirect được, nhưng đổi luôn cho brand mới
-keywords = ["strings", "forensics", "binary", "firmware", "dfir", "malware", "memory-dump"]
+keywords = ["strings", "forensics", "binary", "firmware", "dfir"]
 categories = ["parsing", "command-line-utilities"]
 rust-version = "1.70"
 
