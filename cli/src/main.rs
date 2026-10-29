@@ -108,6 +108,10 @@ struct Args {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Detector {
+    Ip,
+    Url,
+    Domain,
+    Base64,
     Secret,
 }
 
@@ -153,7 +157,11 @@ OPTIONS:
     --brute-xor <1b;2b;3b>
                           Brute-force XOR candidates using selected key sizes
     --parse-pid          Map PID markers in extracted strings
-    --detect-secret       Scan and emit all supported secret/API-key/token values
+    --detect-secret       Full secret/API-key sweep (all supported tokens)
+    --ip                  Output only IPv4/IPv6 strings
+    --url                 Output only HTTP/HTTPS URLs
+    --domain              Output only domain names
+    --b64                 Decode and output Base64 strings
     --detect [secret]     Alias; default runs full secret sweep
     --magic-bytes         Report executable/document magic-byte signatures
     --tree                Parse a Windows minidump and print its process tree
@@ -295,6 +303,10 @@ fn parse_args() -> Result<Args, String> {
             "--heap-only" => args.heap_only = true,
             "--vmware-info" => args.vmware_info = true,
             "--detect-secret" => push_detector(&mut args.detectors, Detector::Secret)?,
+            "--ip" => push_detector(&mut args.detectors, Detector::Ip)?,
+            "--url" => push_detector(&mut args.detectors, Detector::Url)?,
+            "--domain" => push_detector(&mut args.detectors, Detector::Domain)?,
+            "--b64" => push_detector(&mut args.detectors, Detector::Base64)?,
             "--detect" => {
                 let value = if i + 1 < values.len() && !values[i + 1].starts_with("--") {
                     next(&mut i)?
@@ -302,10 +314,15 @@ fn parse_args() -> Result<Args, String> {
                     "secret".to_string()
                 };
                 for part in value.split(',') {
-                    match part.trim() {
-                        "secret" | "all" => push_detector(&mut args.detectors, Detector::Secret)?,
+                    let d = match part.trim() {
+                        "ip" => Detector::Ip,
+                        "url" => Detector::Url,
+                        "domain" => Detector::Domain,
+                        "b64" | "base64" => Detector::Base64,
+                        "secret" | "all" => Detector::Secret,
                         other => return Err(format!("unknown detector '{other}'")),
-                    }
+                    };
+                    push_detector(&mut args.detectors, d)?;
                 }
             }
             other => return Err(format!("unknown option '{other}'")),
@@ -449,17 +466,39 @@ fn apply_detectors(result: ExtractedString, detectors: &[Detector]) -> Vec<Extra
     let mut out = Vec::new();
     for det in detectors {
         match det {
+            Detector::Ip => {
+                if let Some(v) = detected_ip_value(&result.text) {
+                    let mut r = result.clone();
+                    r.text = v;
+                    out.push(r);
+                }
+            }
+            Detector::Url => {
+                if let Some(v) = detected_url_value(&result.text) {
+                    let mut r = result.clone();
+                    r.text = v;
+                    out.push(r);
+                }
+            }
+            Detector::Domain => {
+                if let Some(v) = detected_domain_value(&result.text) {
+                    let mut r = result.clone();
+                    r.text = v;
+                    out.push(r);
+                }
+            }
+            Detector::Base64 => {
+                if let Some(v) = detect_and_decode_base64(&result.text) {
+                    let mut r = result.clone();
+                    r.text = v;
+                    out.push(r);
+                }
+            }
             Detector::Secret => {
-                let matches = bxmap::classifier::detect_secrets(&result.text);
-                if matches.is_empty() {
-                    // keep original if no secret found? For --detect-secret typical: only emit secrets.
-                    // Emit nothing to filter noise.
-                } else {
-                    for m in matches {
-                        let mut r = result.clone();
-                        r.text = m.value;
-                        out.push(r);
-                    }
+                for m in bxmap::classifier::detect_secrets(&result.text) {
+                    let mut r = result.clone();
+                    r.text = m.value;
+                    out.push(r);
                 }
             }
         }
@@ -1237,7 +1276,13 @@ fn print_selected_options(args: &Args, threads: usize) {
     let detector = if args.detectors.is_empty() {
         "off".to_string()
     } else {
-        "secret".to_string()
+        args.detectors.iter().map(|d| match d {
+            Detector::Ip => "ip",
+            Detector::Url => "url",
+            Detector::Domain => "domain",
+            Detector::Base64 => "b64",
+            Detector::Secret => "secret",
+        }).collect::<Vec<_>>().join(",")
     };
 
     if io::stderr().is_terminal() {
