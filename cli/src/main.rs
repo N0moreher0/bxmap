@@ -157,8 +157,7 @@ OPTIONS:
     --brute-xor <1b;2b;3b>
                           Brute-force XOR candidates using selected key sizes
     --parse-pid          Map PID markers in extracted strings
-    --detect-secret       Full secret/API-key sweep (all supported tokens)
-    --detect <list>       Detect specific IOCs: ip, url, domain, b64, secret, all (comma-separated)
+    --detect <list>       Detect IOCs: ip, url, domain, b64, secret, all (comma-separated)
     --magic-bytes         Report executable/document magic-byte signatures
     --tree                Parse a Windows minidump and print its process tree
                           (modules, threads, memory regions), then exit
@@ -298,7 +297,6 @@ fn parse_args() -> Result<Args, String> {
             "--rwx-only" => args.rwx_only = true,
             "--heap-only" => args.heap_only = true,
             "--vmware-info" => args.vmware_info = true,
-            "--detect-secret" => push_detector(&mut args.detectors, Detector::Secret)?,
             "--detect" => {
                 let value = if i + 1 < values.len() && !values[i + 1].starts_with("--") {
                     next(&mut i)?
