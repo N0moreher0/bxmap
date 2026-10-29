@@ -268,7 +268,13 @@ The CLI adds:
   printable/UTF-8 scored XOR brute-forcing in the CLI only
 - `--filter-regex <RE>` to keep extracted strings and XOR plaintext matching a
   Rust regular expression
-- `--detect`/`--detect-ip/url/domain/b64/pem/secret` unified IOC triage - `--format json-tree` grouped output - `--heap-only` for minidumps - UTF-16BE/UTF-32 encodings
+- `--detect <ip|url|domain|b64|secret|all>` unified IOC/secret triage in one pass (replaces individual detector flags). `secret` runs a full sweep for 30+ token types: AWS, Google, Azure, GitHub, GitLab, npm, OpenAI, Anthropic, Hugging Face, DeepSeek, Stripe, PayPal, Slack, Discord, Twilio, SendGrid, JWT, PEM private keys, DB connection URIs, and generic secrets. Detected IOCs replace the string value in output.
+- `--format json-tree` grouped output (`group`/`type`/`items`) with entropy, offset, and PE timestamp when a minidump is loaded.
+- `--heap-only` keeps only MEM_PRIVATE (heap) regions for minidumps.
+- `--encoding all|ascii|utf16|utf32` — utf-16/utf-32 cover both LE and BE in one pass.
+- `--map-va`, `--in-module`, `--rwx-only` for minidump-aware filtering.
+- `--magic-bytes` reports PE/ELF/ZIP-Office/PDF/PNG signatures.
+- IOC triage refangs `[.]`/`[at]`, validates public IPv4, drops private IP noise, uses entropy to reject base64 filler.
   only the selected IOC type; Base64 mode decodes printable UTF-8 payloads
 - `--magic-bytes` to report bounded executable/document signatures such as PE
   (`MZ`), ELF, ZIP/Office, PDF, and PNG
