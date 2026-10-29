@@ -1,6 +1,6 @@
 [package]
 name = "bxmap"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "⚡Bxmap - Fast streaming (ASCII, UTF-16LE, UTF-16BE, UTF-32) string extractor for raw memory dump/binary files"
