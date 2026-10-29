@@ -120,10 +120,7 @@ enum Encoding {
     All,
     Ascii,
     Utf16,
-    Utf16Be,
     Utf32,
-    Utf32Le,
-    Utf32Be,
 }
 
 const HELP: &str = "\
@@ -145,8 +142,8 @@ OPTIONS:
     --format <text|json|json-tree>
                            Output format (default text). json-tree emits
                            grouped classification tree.
-    --encoding <all|ascii|utf16>
-                          Restrict output by encoding (default all)
+    --encoding <all|ascii|utf16|utf32>
+                          Restrict output by encoding (default all). utf-16 includes both LE & BE; utf-32 includes both LE & BE
     -o, --output <PATH>  Write results to a file
     --noise-threshold <N>
                           Repeat-noise threshold; 0 disables filtering
@@ -240,10 +237,7 @@ fn parse_args() -> Result<Args, String> {
                     "all" => Encoding::All,
                     "ascii" => Encoding::Ascii,
                     "utf16" => Encoding::Utf16,
-                    "utf16be" => Encoding::Utf16Be,
                     "utf32" => Encoding::Utf32,
-                    "utf32le" => Encoding::Utf32Le,
-                    "utf32be" => Encoding::Utf32Be,
                     other => return Err(format!("invalid encoding '{other}'")),
                 };
             }
@@ -1237,11 +1231,8 @@ fn print_selected_options(args: &Args, threads: usize) {
     let encoding = match args.encoding {
         Encoding::All => "all",
         Encoding::Ascii => "ascii",
-        Encoding::Utf16 => "utf16",
-        Encoding::Utf16Be => "utf16be",
-        Encoding::Utf32 => "utf32",
-        Encoding::Utf32Le => "utf32le",
-        Encoding::Utf32Be => "utf32be",
+        Encoding::Utf16 => "utf16 (LE+BE)",
+        Encoding::Utf32 => "utf32 (LE+BE)",
     };
     let noise = args
         .noise_threshold
@@ -1565,11 +1556,8 @@ fn main() -> Result<(), String> {
                 }
                 if matches!(args.encoding, Encoding::All)
                     || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
-                    || (args.encoding == Encoding::Utf16 && result.encoding == "utf16le")
-                    || (args.encoding == Encoding::Utf16Be && result.encoding == "utf16be")
+                    || (args.encoding == Encoding::Utf16 && (result.encoding == "utf16le" || result.encoding == "utf16be"))
                     || (args.encoding == Encoding::Utf32 && (result.encoding == "utf32le" || result.encoding == "utf32be"))
-                    || (args.encoding == Encoding::Utf32Le && result.encoding == "utf32le")
-                    || (args.encoding == Encoding::Utf32Be && result.encoding == "utf32be")
                 {
                     for result in apply_detectors(result, &args.detectors) {
                         if matches_filter(filter_regex.as_ref(), &result.text) {
@@ -1703,11 +1691,8 @@ fn main() -> Result<(), String> {
         .filter(|result| match args.encoding {
             Encoding::All => true,
             Encoding::Ascii => result.encoding == "ascii",
-            Encoding::Utf16 => result.encoding == "utf16le",
-            Encoding::Utf16Be => result.encoding == "utf16be",
+            Encoding::Utf16 => result.encoding == "utf16le" || result.encoding == "utf16be",
             Encoding::Utf32 => result.encoding == "utf32le" || result.encoding == "utf32be",
-            Encoding::Utf32Le => result.encoding == "utf32le",
-            Encoding::Utf32Be => result.encoding == "utf32be",
         })
         .filter(|result| passes_region_filter(result.offset, &args.in_module, args.rwx_only, args.heap_only))
         .flat_map(|result| apply_detectors(result, &args.detectors))
