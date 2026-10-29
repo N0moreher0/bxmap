@@ -36,8 +36,8 @@ CLI when you want an immediate command-line workflow.
 
 For the fastest setup, download a prebuilt binary from the
 [latest automated GitHub Release](https://github.com/N0moreher0/bxmap/releases)
-and put `bxmap` on your `PATH`. Every push to `main` publishes platform
-archives for Windows, Linux, and macOS.
+and put `bxmap` on your `PATH`. Tag-based releases (`v*`) publish platform
+archives with `SHA256SUMS`; verify downloads before DFIR use.
 
 If you use [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall),
 it downloads the matching release binary instead of compiling from source:
