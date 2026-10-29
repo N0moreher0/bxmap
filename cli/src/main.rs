@@ -311,7 +311,12 @@ fn parse_args() -> Result<Args, String> {
             "--detect-pem" => push_detector(&mut args.detectors, Detector::Pem)?,
             "--detect-secret" => push_detector(&mut args.detectors, Detector::Secret)?,
             "--detect" => {
-                for part in next(&mut i)?.split(',') {
+                let value = if i + 1 < values.len() && !values[i + 1].starts_with("--") {
+                    next(&mut i)?
+                } else {
+                    "ip,url,domain,b64,pem,secret".to_string()
+                };
+                for part in value.split(',') {
                     let d = match part.trim() {
                         "ip" => Detector::Ip,
                         "url" => Detector::Url,

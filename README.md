@@ -266,7 +266,7 @@ The CLI adds:
   printable/UTF-8 scored XOR brute-forcing in the CLI only
 - `--filter-regex <RE>` to keep extracted strings and XOR plaintext matching a
   Rust regular expression
-- `--detect-ip`, `--detect-url`, `--detect-domain`, and `--detect-b64` to emit
+- `--detect`/`--detect-ip/url/domain/b64/pem/secret` unified IOC triage - `--format json-tree` grouped output - `--heap-only` for minidumps - UTF-16BE/UTF-32 encodings
   only the selected IOC type; Base64 mode decodes printable UTF-8 payloads
 - `--magic-bytes` to report bounded executable/document signatures such as PE
   (`MZ`), ELF, ZIP/Office, PDF, and PNG
