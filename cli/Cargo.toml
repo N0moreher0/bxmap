@@ -1,6 +1,6 @@
 [package]
 name = "bxmap-cli"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Command-line frontend for the bxmap memory-dump string extraction library"
@@ -20,7 +20,7 @@ default = ["yara"]
 yara = ["bxmap/yara"]
 
 [dependencies]
-bxmap = { version = "0.9.6", path = "..", default-features = false }
+bxmap = { version = "1.0.0", path = "..", default-features = false }
 rayon = "1"
 regex = "1"
 
