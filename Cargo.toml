@@ -3,7 +3,7 @@ name = "bxmap"
 version = "1.0.1"
 edition = "2021"
 license = "AGPL-3.0-only"
-description = "Fast streaming ASCII/UTF-16LE string extractor for raw binaries, firmware and memory dumps, with entropy, magic-bytes and noise filtering. Never loads the whole file into RAM."
+description = "⚡Bxmap - Fast streaming (ASCII, UTF-16LE, UTF-16BE, UTF-32) string extractor for raw memory dump/binary files"
 readme = "README.md"
 repository = "https://github.com/N0moreher0/bxmap"
 # repository cũ vẫn redirect được, nhưng đổi luôn cho brand mới
