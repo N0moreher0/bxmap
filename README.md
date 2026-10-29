@@ -8,7 +8,6 @@
 |  B   B    X X    M     M   A   A   P                       |
 |  BBBB    X   X   M     M   A   A   P                       |
 +------------------------------------------------------------+
-
              Fast, composable memory-dump extraction
 ```
 
@@ -60,6 +59,9 @@ bxmap memory.dmp --auto-tune
 bxmap memory.dmp --entropy --format json -o triage.json
 bxmap memory.dmp --yar rules.yar --format json -o yara.json
 bxmap memory.dmp --brute-xor "1b;2b" --format json -o xor.json
+
+# Malware dump: single-pass IOC + private-key triage
+bxmap suspicious.dmp --encoding all --format json-tree --detect --map-va --heap-only -o triage.json
 ```
 
 Update an existing installation:
