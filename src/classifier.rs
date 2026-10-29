@@ -7,6 +7,15 @@
 use std::sync::OnceLock;
 use regex::Regex;
 
+/// Extract PEM private-key blocks from text.
+pub fn extract_pems(text: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----").unwrap()
+    });
+    re.find_iter(text).map(|m| m.as_str().to_string()).collect()
+}
+
 /// A single classified string record in the JSON tree output.
 #[derive(Debug, Clone)]
 pub struct Classification {

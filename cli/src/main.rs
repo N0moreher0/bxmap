@@ -96,7 +96,7 @@ struct Args {
     parse_pid: bool,
     stats: bool,
     filter_regex: Option<String>,
-    detector: Option<Detector>,
+    detectors: Vec<Detector>,
     magic_bytes: bool,
     tree: bool,
     map_va: bool,
@@ -112,6 +112,8 @@ enum Detector {
     Url,
     Domain,
     Base64,
+    Pem,
+    Secret,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -199,7 +201,7 @@ fn parse_args() -> Result<Args, String> {
         parse_pid: false,
         stats: false,
         filter_regex: None,
-        detector: None,
+        detectors: Vec::new(),
         magic_bytes: false,
         tree: false,
         map_va: false,
@@ -292,10 +294,9 @@ fn parse_args() -> Result<Args, String> {
             "--parse-pid" => args.parse_pid = true,
             "--stats" => args.stats = true,
             "--filter-regex" => args.filter_regex = Some(next(&mut i)?),
-            "--detect-ip" => set_detector(&mut args.detector, Detector::Ip)?,
-            "--detect-url" => set_detector(&mut args.detector, Detector::Url)?,
-            "--detect-domain" => set_detector(&mut args.detector, Detector::Domain)?,
-            "--detect-b64" => set_detector(&mut args.detector, Detector::Base64)?,
+            "--detect-ip" => push_detector(&mut args.detectors, Detector::Ip)?,
+            "--detect-url" => push_detector(&mut args.detectors, Detector::Url)?,
+            "--detect-domain" => push_detector(&mut args.detectors, Detector::Domain)?,
             "--magic-bytes" => args.magic_bytes = true,
             "--tree" => args.tree = true,
             "--map-va" => args.map_va = true,
@@ -303,14 +304,33 @@ fn parse_args() -> Result<Args, String> {
             "--rwx-only" => args.rwx_only = true,
             "--heap-only" => args.heap_only = true,
             "--vmware-info" => args.vmware_info = true,
+            "--detect-ip" => push_detector(&mut args.detectors, Detector::Ip)?,
+            "--detect-url" => push_detector(&mut args.detectors, Detector::Url)?,
+            "--detect-domain" => push_detector(&mut args.detectors, Detector::Domain)?,
+            "--detect-b64" => push_detector(&mut args.detectors, Detector::Base64)?,
+            "--detect-pem" => push_detector(&mut args.detectors, Detector::Pem)?,
+            "--detect-secret" => push_detector(&mut args.detectors, Detector::Secret)?,
+            "--detect" => {
+                for part in next(&mut i)?.split(',') {
+                    let d = match part.trim() {
+                        "ip" => Detector::Ip,
+                        "url" => Detector::Url,
+                        "domain" => Detector::Domain,
+                        "b64" | "base64" => Detector::Base64,
+                        "pem" | "key" | "private-key" => Detector::Pem,
+                        "secret" => Detector::Secret,
+                        other => return Err(format!("unknown detector '{other}'")),
+                    };
+                    push_detector(&mut args.detectors, d)?;
+                }
+            }
             other => return Err(format!("unknown option '{other}'")),
         }
 
-        fn set_detector(current: &mut Option<Detector>, detector: Detector) -> Result<(), String> {
-            if current.is_some() {
-                return Err("detector options are mutually exclusive".to_string());
+        fn push_detector(list: &mut Vec<Detector>, detector: Detector) -> Result<(), String> {
+            if !list.contains(&detector) {
+                list.push(detector);
             }
-            *current = Some(detector);
             Ok(())
         }
         i += 1;
@@ -438,26 +458,60 @@ fn detect_and_decode_base64(text: &str) -> Option<String> {
     })
 }
 
-fn apply_detector(mut result: ExtractedString, detector: Option<Detector>) -> Option<ExtractedString> {
-    match detector {
-        None => Some(result),
-        Some(Detector::Ip) => {
-            result.text = detected_ip_value(&result.text)?;
-            Some(result)
-        }
-        Some(Detector::Url) => {
-            result.text = detected_url_value(&result.text)?;
-            Some(result)
-        }
-        Some(Detector::Domain) => {
-            result.text = detected_domain_value(&result.text)?;
-            Some(result)
-        }
-        Some(Detector::Base64) => {
-            result.text = detect_and_decode_base64(&result.text)?;
-            Some(result)
+fn apply_detectors(result: ExtractedString, detectors: &[Detector]) -> Vec<ExtractedString> {
+    if detectors.is_empty() {
+        return vec![result];
+    }
+    let mut out = Vec::new();
+    for det in detectors {
+        match det {
+            Detector::Ip => {
+                if let Some(v) = detected_ip_value(&result.text) {
+                    let mut r = result.clone();
+                    r.text = v;
+                    out.push(r);
+                }
+            }
+            Detector::Url => {
+                if let Some(v) = detected_url_value(&result.text) {
+                    let mut r = result.clone();
+                    r.text = v;
+                    out.push(r);
+                }
+            }
+            Detector::Domain => {
+                if let Some(v) = detected_domain_value(&result.text) {
+                    let mut r = result.clone();
+                    r.text = v;
+                    out.push(r);
+                }
+            }
+            Detector::Base64 => {
+                if let Some(v) = detect_and_decode_base64(&result.text) {
+                    let mut r = result.clone();
+                    r.text = v;
+                    out.push(r);
+                }
+            }
+            Detector::Pem => {
+                for pem in bxmap::classifier::extract_pems(&result.text) {
+                    let mut r = result.clone();
+                    r.text = pem;
+                    out.push(r);
+                }
+            }
+            Detector::Secret => {
+                // classify; if any secret group, emit original
+                if bxmap::classifier::classify(&result.text)
+                    .map(|c| c.group == "SECRET")
+                    .unwrap_or(false)
+                {
+                    out.push(result.clone());
+                }
+            }
         }
     }
+    out
 }
 
 #[derive(Clone)]
@@ -1146,8 +1200,7 @@ mod tests {
             text: "prefix example.org suffix".to_string(),
         };
         assert_eq!(
-            super::apply_detector(result, Some(super::Detector::Domain))
-                .unwrap()
+            super::apply_detectors(result, &[super::Detector::Domain])[0]
                 .text,
             "example.org"
         );
@@ -1228,12 +1281,17 @@ fn print_selected_options(args: &Args, threads: usize) {
     let auto_tune = if args.auto_tune { "on" } else { "off" };
     let parse_pid = if args.parse_pid { "on" } else { "off" };
     let entropy = if args.entropy { "on" } else { "off" };
-    let detector = match args.detector {
-        Some(Detector::Ip) => "ip",
-        Some(Detector::Url) => "url",
-        Some(Detector::Domain) => "domain",
-        Some(Detector::Base64) => "b64",
-        None => "off",
+    let detector = if args.detectors.is_empty() {
+        "off".to_string()
+    } else {
+        args.detectors.iter().map(|d| match d {
+            Detector::Ip => "ip",
+            Detector::Url => "url",
+            Detector::Domain => "domain",
+            Detector::Base64 => "b64",
+            Detector::Pem => "pem",
+            Detector::Secret => "secret",
+        }).collect::<Vec<_>>().join(",")
     };
 
     if io::stderr().is_terminal() {
@@ -1428,7 +1486,7 @@ fn main() -> Result<(), String> {
         .map(Regex::new)
         .transpose()
         .map_err(|error| format!("invalid --filter-regex: {error}"))?;
-    if args.detector.is_some() && filter_regex.is_some() {
+    if !args.detectors.is_empty() && filter_regex.is_some() {
         return Err("--filter-regex cannot be combined with a detector".to_string());
     }
     let file_size = std::fs::metadata(&args.path)
@@ -1532,21 +1590,21 @@ fn main() -> Result<(), String> {
                     || (args.encoding == Encoding::Utf32Le && result.encoding == "utf32le")
                     || (args.encoding == Encoding::Utf32Be && result.encoding == "utf32be")
                 {
-                    if let Some(result) = apply_detector(result, args.detector) {
-                    if matches_filter(filter_regex.as_ref(), &result.text) {
-                        if let Err(error) = record_result(
-                            result,
-                            &mut writer,
-                            args.format,
-                            &mut result_count,
-                            &mut short,
-                            &mut medium,
-                            &mut long,
-                            &mut important,
-                            args.parse_pid,
-                        ) {
-                            write_error = Some(error);
-                        }
+                    for result in apply_detectors(result, &args.detectors) {
+                        if matches_filter(filter_regex.as_ref(), &result.text) {
+                            if let Err(error) = record_result(
+                                result,
+                                &mut writer,
+                                args.format,
+                                &mut result_count,
+                                &mut short,
+                                &mut medium,
+                                &mut long,
+                                &mut important,
+                                args.parse_pid,
+                            ) {
+                                write_error = Some(error);
+                            }
                         }
                     }
                 }
@@ -1671,7 +1729,7 @@ fn main() -> Result<(), String> {
             Encoding::Utf32Be => result.encoding == "utf32be",
         })
         .filter(|result| passes_region_filter(result.offset, &args.in_module, args.rwx_only, args.heap_only))
-        .filter_map(|result| apply_detector(result, args.detector))
+        .flat_map(|result| apply_detectors(result, &args.detectors))
         .filter(|result| {
             filter_regex
                 .as_ref()
