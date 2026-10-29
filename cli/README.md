@@ -1,13 +1,13 @@
 # bxmap-cli
 
 ```text
-+------------------------------------------------------------+
-|  BBBB    X   X   MMM MMM    AAA    PPPP                    |
-|  B   B    X X    M M M M   A   A   P   P                   |
-|  BBBB      X     M  M  M   AAAAA   PPPP                    |
-|  B   B    X X    M     M   A   A   P                       |
-|  BBBB    X   X   M     M   A   A   P                       |
-+------------------------------------------------------------+
++-----------------------------------------+
+|  BBBB    X   X   MMM MMM    AAA    PPPP |
+|  B   B    X X    M M M M   A   A   P   P|
+|  BBBB      X     M  M  M   AAAAA   PPPP |
+|  B   B    X X    M     M   A   A   P    |
+|  BBBB    X   X   M     M   A   A   P    |
++-----------------------------------------+
 ```
 
 Professional command-line frontend for the
