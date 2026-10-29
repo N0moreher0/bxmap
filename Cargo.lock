@@ -226,6 +226,7 @@ name = "bxmap"
 version = "0.9.6"
 dependencies = [
  "rayon",
+ "regex",
  "serde",
  "yara-x",
 ]

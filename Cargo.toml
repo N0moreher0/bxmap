@@ -19,6 +19,7 @@ members = ["cli"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 rayon = "1"
+regex = "1"
 yara-x = { version = "1.20", optional = true }
 
 [features]

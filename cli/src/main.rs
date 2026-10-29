@@ -31,8 +31,8 @@ fn va_annotation(offset: u64) -> Option<(u64, String)> {
     Some((va, label))
 }
 
-fn passes_region_filter(offset: u64, module: &Option<String>, rwx_only: bool) -> bool {
-    if module.is_none() && !rwx_only {
+fn passes_region_filter(offset: u64, module: &Option<String>, rwx_only: bool, heap_only: bool) -> bool {
+    if module.is_none() && !rwx_only && !heap_only {
         return true;
     }
     let dump = match DUMP_MAP.get() {
@@ -56,6 +56,12 @@ fn passes_region_filter(offset: u64, module: &Option<String>, rwx_only: bool) ->
             _ => return false,
         }
     }
+    if heap_only {
+        match dump.region_for_va(va) {
+            Some(r) if r.kind == 0x20000 => {}
+            _ => return false,
+        }
+    }
     true
 }
 
@@ -71,6 +77,7 @@ const MIN_XOR_ALNUM_CHARS: usize = 3;
 enum Format {
     Text,
     Json,
+    JsonTree,
 }
 
 struct Args {
@@ -96,6 +103,7 @@ struct Args {
     in_module: Option<String>,
     rwx_only: bool,
     vmware_info: bool,
+    heap_only: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -111,6 +119,10 @@ enum Encoding {
     All,
     Ascii,
     Utf16,
+    Utf16Be,
+    Utf32,
+    Utf32Le,
+    Utf32Be,
 }
 
 const HELP: &str = "\
@@ -129,7 +141,9 @@ USAGE:
 OPTIONS:
     --min-len <N>        Minimum string length (default 4)
     --max-strings <N>    Maximum results (default 200000)
-    --format <text|json> Output format (default text)
+    --format <text|json|json-tree>
+                           Output format (default text). json-tree emits
+                           grouped classification tree.
     --encoding <all|ascii|utf16>
                           Restrict output by encoding (default all)
     -o, --output <PATH>  Write results to a file
@@ -192,6 +206,7 @@ fn parse_args() -> Result<Args, String> {
         in_module: None,
         rwx_only: false,
         vmware_info: false,
+        heap_only: false,
     };
     let mut i = 0;
     while i < values.len() {
@@ -218,6 +233,7 @@ fn parse_args() -> Result<Args, String> {
                 args.format = match next(&mut i)?.as_str() {
                     "text" => Format::Text,
                     "json" => Format::Json,
+                    "json-tree" => Format::JsonTree,
                     other => return Err(format!("invalid format '{other}'")),
                 };
             }
@@ -226,6 +242,10 @@ fn parse_args() -> Result<Args, String> {
                     "all" => Encoding::All,
                     "ascii" => Encoding::Ascii,
                     "utf16" => Encoding::Utf16,
+                    "utf16be" => Encoding::Utf16Be,
+                    "utf32" => Encoding::Utf32,
+                    "utf32le" => Encoding::Utf32Le,
+                    "utf32be" => Encoding::Utf32Be,
                     other => return Err(format!("invalid encoding '{other}'")),
                 };
             }
@@ -281,6 +301,7 @@ fn parse_args() -> Result<Args, String> {
             "--map-va" => args.map_va = true,
             "--in-module" => args.in_module = Some(next(&mut i)?),
             "--rwx-only" => args.rwx_only = true,
+            "--heap-only" => args.heap_only = true,
             "--vmware-info" => args.vmware_info = true,
             other => return Err(format!("unknown option '{other}'")),
         }
@@ -1160,6 +1181,7 @@ fn print_banner(path: &str, size: u64, format: Format) {
     let format = match format {
         Format::Text => "text",
         Format::Json => "json",
+        Format::JsonTree => "json-tree",
     };
     eprintln!("\x1b[1;36m+------------------------------------------------------------+\x1b[0m");
     eprintln!(
@@ -1175,11 +1197,16 @@ fn print_selected_options(args: &Args, threads: usize) {
     let format = match args.format {
         Format::Text => "text",
         Format::Json => "json",
+        Format::JsonTree => "json-tree",
     };
     let encoding = match args.encoding {
         Encoding::All => "all",
         Encoding::Ascii => "ascii",
         Encoding::Utf16 => "utf16",
+        Encoding::Utf16Be => "utf16be",
+        Encoding::Utf32 => "utf32",
+        Encoding::Utf32Le => "utf32le",
+        Encoding::Utf32Be => "utf32be",
     };
     let noise = args
         .noise_threshold
@@ -1314,6 +1341,9 @@ fn record_result(
         Format::Json => {
             write_string_json(&result, writer, result_count, parse_pid)?;
         }
+        Format::JsonTree => {
+            // handled separately in main(); no-op here
+        }
     }
     *result_count += 1;
     match result.text.chars().count() {
@@ -1364,6 +1394,7 @@ fn write_results(
             }
             writeln!(writer, "]")?;
         }
+        Format::JsonTree => {}
     }
     Ok(())
 }
@@ -1382,10 +1413,14 @@ fn main() -> Result<(), String> {
         print!("{}", dump.render_tree(30));
         return Ok(());
     }
-    if args.map_va || args.in_module.is_some() || args.rwx_only {
-        let dump = bxmap::minidump::Minidump::open(&args.path)
-            .map_err(|e| format!("--map-va needs a minidump: {e}"))?;
-        let _ = DUMP_MAP.set(dump);
+    if args.map_va || args.in_module.is_some() || args.rwx_only || args.heap_only
+        || args.path.to_ascii_lowercase().ends_with(".mdmp")
+        || args.path.to_ascii_lowercase().ends_with(".hdmp")
+        || args.path.to_ascii_lowercase().ends_with(".dmp")
+    {
+        if let Ok(dump) = bxmap::minidump::Minidump::open(&args.path) {
+            let _ = DUMP_MAP.set(dump);
+        }
     }
     let filter_regex = args
         .filter_regex
@@ -1464,7 +1499,7 @@ fn main() -> Result<(), String> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    if threads == 1 {
+    if threads == 1 && args.format != Format::JsonTree {
         let mut writer: Box<dyn Write> = match args.output.as_ref() {
             Some(path) => Box::new(BufWriter::new(
                 File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
@@ -1492,6 +1527,10 @@ fn main() -> Result<(), String> {
                 if matches!(args.encoding, Encoding::All)
                     || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
                     || (args.encoding == Encoding::Utf16 && result.encoding == "utf16le")
+                    || (args.encoding == Encoding::Utf16Be && result.encoding == "utf16be")
+                    || (args.encoding == Encoding::Utf32 && (result.encoding == "utf32le" || result.encoding == "utf32be"))
+                    || (args.encoding == Encoding::Utf32Le && result.encoding == "utf32le")
+                    || (args.encoding == Encoding::Utf32Be && result.encoding == "utf32be")
                 {
                     if let Some(result) = apply_detector(result, args.detector) {
                     if matches_filter(filter_regex.as_ref(), &result.text) {
@@ -1626,8 +1665,12 @@ fn main() -> Result<(), String> {
             Encoding::All => true,
             Encoding::Ascii => result.encoding == "ascii",
             Encoding::Utf16 => result.encoding == "utf16le",
+            Encoding::Utf16Be => result.encoding == "utf16be",
+            Encoding::Utf32 => result.encoding == "utf32le" || result.encoding == "utf32be",
+            Encoding::Utf32Le => result.encoding == "utf32le",
+            Encoding::Utf32Be => result.encoding == "utf32be",
         })
-        .filter(|result| passes_region_filter(result.offset, &args.in_module, args.rwx_only))
+        .filter(|result| passes_region_filter(result.offset, &args.in_module, args.rwx_only, args.heap_only))
         .filter_map(|result| apply_detector(result, args.detector))
         .filter(|result| {
             filter_regex
@@ -1643,6 +1686,53 @@ fn main() -> Result<(), String> {
         )),
         None => Box::new(BufWriter::new(io::stdout().lock())),
     };
+    if args.format == Format::JsonTree {
+        use std::collections::BTreeMap;
+        let mut groups: BTreeMap<(String, String), Vec<&ExtractedString>> = BTreeMap::new();
+        for r in &results {
+            let cls = bxmap::classifier::classify(&r.text);
+            let (g, t) = match cls {
+                Some(c) => (c.group.to_string(), c.typ.to_string()),
+                None => ("STRING".to_string(), "GENERIC".to_string()),
+            };
+            groups.entry((g, t)).or_default().push(r);
+        }
+        let mut out = String::from("{\"groups\":[\n");
+        let mut first_group = true;
+        for ((g, t), items) in &groups {
+            if !first_group { out.push_str(",\n"); }
+            first_group = false;
+            out.push_str(&format!("  {{\"group\":{},\"type\":{},\"items\":[\n", json_escape(g), json_escape(t)));
+            let mut first_item = true;
+            for r in items {
+                if !first_item { out.push_str(",\n"); }
+                first_item = false;
+                let ent = bxmap::classifier::entropy_of(&r.text);
+                let ts_part = if let Some(dump) = DUMP_MAP.get() {
+                    if let Some(va) = dump.offset_to_va(r.offset) {
+                        if let Some(m) = dump.module_for_va(va) {
+                            format!(",\"timestamp\":{}", m.timestamp)
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!("    {{\"text\":{},\"offset\":{},\"entropy\":{:.4}{}}}", json_escape(&r.text), r.offset, ent, ts_part));
+            }
+            out.push_str("\n  ]}");
+        }
+        out.push_str(&format!("\n],\"metadata\":{{\"total_strings\":{}}}\n}}\n", results.len()));
+        write!(writer, "{}", out).map_err(|e| format!("write failed: {e}"))?;
+        writer.flush().map_err(|e| format!("write failed: {e}"))?;
+        if let Some(path) = output_path.clone() { eprintln!("wrote {} results to '{}'", results.len(), path); }
+        let _ = args.stats;
+        print_report(results.len(), 0, 0, 0, &[], &entropy_regions, file_size, start.elapsed().as_secs_f64(), threads);
+        return Ok(());
+    }
     if args.format == Format::Json {
         write!(writer, "[\n").map_err(|e| format!("write failed: {e}"))?;
         let mut json_count = 0;

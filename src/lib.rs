@@ -50,6 +50,7 @@
 //! filter more broadly (no entropy/complex statistics) to avoid false
 //! negatives (missing real strings), staying true to the "only filter
 //! what's certainly noise" spirit.
+pub mod classifier;
 pub mod minidump;
 pub mod vmware;
 
@@ -381,6 +382,18 @@ struct StringRunScanner<'a> {
     u16_start: i64,
     u16_next_pos: i64,
     u16_buf: Vec<u16>,
+
+    u16be_start: i64,
+    u16be_next_pos: i64,
+    u16be_buf: Vec<u16>,
+
+    u32le_start: i64,
+    u32le_next_pos: i64,
+    u32le_buf: Vec<u32>,
+
+    u32be_start: i64,
+    u32be_next_pos: i64,
+    u32be_buf: Vec<u32>,
 }
 
 impl<'a> StringRunScanner<'a> {
@@ -398,6 +411,18 @@ impl<'a> StringRunScanner<'a> {
             u16_start: -1,
             u16_next_pos: -1,
             u16_buf: Vec::with_capacity(64),
+
+            u16be_start: -1,
+            u16be_next_pos: -1,
+            u16be_buf: Vec::with_capacity(64),
+
+            u32le_start: -1,
+            u32le_next_pos: -1,
+            u32le_buf: Vec::with_capacity(64),
+
+            u32be_start: -1,
+            u32be_next_pos: -1,
+            u32be_buf: Vec::with_capacity(64),
         }
     }
 
@@ -432,8 +457,17 @@ impl<'a> StringRunScanner<'a> {
             // calling the no-op flush() for every junk byte -- the
             // non-printable binary region is usually the bulk of a real
             // RAM dump's payload, so this is the hottest path.
-            if self.ascii_start < 0 && self.u16_start < 0 {
-                while k < process_count && !is_printable(buffer[offset + k]) {
+            if self.ascii_start < 0
+                && self.u16_start < 0
+                && self.u16be_start < 0
+                && self.u32le_start < 0
+                && self.u32be_start < 0
+            {
+                while k < process_count {
+                    let b = buffer[offset + k];
+                    if b == 0x00 || is_printable(b) {
+                        break;
+                    }
                     k += 1;
                 }
                 if k >= process_count {
@@ -481,6 +515,98 @@ impl<'a> StringRunScanner<'a> {
                 }
             }
 
+            // -- UTF-16BE --
+            if i + 1 < (offset + buffer_valid_len) {
+                let aligned = self.u16be_start < 0 || g as i64 == self.u16be_next_pos;
+                if aligned {
+                    let lo = buffer[i + 1];
+                    if buffer[i] == 0x00 && is_printable(lo) {
+                        if self.u16be_start < 0 {
+                            self.u16be_start = g as i64;
+                            self.u16be_buf.clear();
+                        }
+                        self.u16be_buf.push(lo as u16);
+                        self.u16be_next_pos = g as i64 + 2;
+                        if self.u16be_buf.len() >= MAX_RUN_CHARS {
+                            self.flush_u16be();
+                        }
+                    } else {
+                        // only flush if we were at an aligned boundary position
+                        if self.u16be_start >= 0 && g as i64 == self.u16be_next_pos - 2 {
+                            // fall through to flush below
+                        }
+                    }
+                }
+            }
+            // flush u16be if not aligned continuation
+            if !(i + 1 < (offset + buffer_valid_len)) {
+                self.flush_u16be();
+            } else {
+                let aligned = self.u16be_start < 0 || g as i64 == self.u16be_next_pos;
+                if aligned {
+                    let lo = buffer[i + 1];
+                    let cond = buffer[i] == 0x00 && is_printable(lo);
+                    if !cond {
+                        self.flush_u16be();
+                    }
+                }
+            }
+
+            // -- UTF-32LE --
+            if i + 3 < (offset + buffer_valid_len) {
+                let aligned = self.u32le_start < 0 || g as i64 == self.u32le_next_pos;
+                if aligned {
+                    let b1 = buffer[i + 1];
+                    let b2 = buffer[i + 2];
+                    let b3 = buffer[i + 3];
+                    if printable_b && b1 == 0 && b2 == 0 && b3 == 0 {
+                        if self.u32le_start < 0 {
+                            self.u32le_start = g as i64;
+                            self.u32le_buf.clear();
+                        }
+                        self.u32le_buf.push(b as u32);
+                        self.u32le_next_pos = g as i64 + 4;
+                        if self.u32le_buf.len() >= MAX_RUN_CHARS {
+                            self.flush_u32le();
+                        }
+                    } else {
+                        // flush if currently open and aligned
+                        if self.u32le_start >= 0 {
+                            self.flush_u32le();
+                        }
+                    }
+                }
+            } else if self.u32le_start >= 0 {
+                self.flush_u32le();
+            }
+
+            // -- UTF-32BE --
+            if i + 3 < (offset + buffer_valid_len) {
+                let aligned = self.u32be_start < 0 || g as i64 == self.u32be_next_pos;
+                if aligned {
+                    let b1 = buffer[i + 1];
+                    let b2 = buffer[i + 2];
+                    let b3 = buffer[i + 3];
+                    if b == 0 && b1 == 0 && b2 == 0 && is_printable(b3) {
+                        if self.u32be_start < 0 {
+                            self.u32be_start = g as i64;
+                            self.u32be_buf.clear();
+                        }
+                        self.u32be_buf.push(b3 as u32);
+                        self.u32be_next_pos = g as i64 + 4;
+                        if self.u32be_buf.len() >= MAX_RUN_CHARS {
+                            self.flush_u32be();
+                        }
+                    } else {
+                        if self.u32be_start >= 0 {
+                            self.flush_u32be();
+                        }
+                    }
+                }
+            } else if self.u32be_start >= 0 {
+                self.flush_u32be();
+            }
+
             k += 1;
         }
     }
@@ -490,6 +616,9 @@ impl<'a> StringRunScanner<'a> {
     fn flush_all(&mut self) {
         self.flush_ascii();
         self.flush_u16();
+        self.flush_u16be();
+        self.flush_u32le();
+        self.flush_u32be();
     }
 
     fn flush_ascii(&mut self) {
@@ -525,6 +654,57 @@ impl<'a> StringRunScanner<'a> {
         self.u16_start = -1;
         self.u16_next_pos = -1;
         self.u16_buf.clear();
+    }
+
+    fn flush_u16be(&mut self) {
+        if self.u16be_start >= 0 && self.u16be_buf.len() >= self.min_len {
+            let as_bytes: Vec<u8> = self.u16be_buf.iter().map(|&c| c as u8).collect();
+            if !is_low_information_repeat(&as_bytes, &self.noise_cfg) {
+                let text = String::from_utf16_lossy(&self.u16be_buf);
+                (self.on_found)(ExtractedString {
+                    offset: self.u16be_start as u64,
+                    encoding: "utf16be",
+                    text,
+                });
+            }
+        }
+        self.u16be_start = -1;
+        self.u16be_next_pos = -1;
+        self.u16be_buf.clear();
+    }
+
+    fn flush_u32le(&mut self) {
+        if self.u32le_start >= 0 && self.u32le_buf.len() >= self.min_len {
+            let as_bytes: Vec<u8> = self.u32le_buf.iter().map(|&c| c as u8).collect();
+            if !is_low_information_repeat(&as_bytes, &self.noise_cfg) {
+                let text: String = as_bytes.iter().map(|&b| b as char).collect();
+                (self.on_found)(ExtractedString {
+                    offset: self.u32le_start as u64,
+                    encoding: "utf32le",
+                    text,
+                });
+            }
+        }
+        self.u32le_start = -1;
+        self.u32le_next_pos = -1;
+        self.u32le_buf.clear();
+    }
+
+    fn flush_u32be(&mut self) {
+        if self.u32be_start >= 0 && self.u32be_buf.len() >= self.min_len {
+            let as_bytes: Vec<u8> = self.u32be_buf.iter().map(|&c| c as u8).collect();
+            if !is_low_information_repeat(&as_bytes, &self.noise_cfg) {
+                let text: String = as_bytes.iter().map(|&b| b as char).collect();
+                (self.on_found)(ExtractedString {
+                    offset: self.u32be_start as u64,
+                    encoding: "utf32be",
+                    text,
+                });
+            }
+        }
+        self.u32be_start = -1;
+        self.u32be_next_pos = -1;
+        self.u32be_buf.clear();
     }
 }
 
@@ -658,7 +838,7 @@ pub fn extract_strings_from_reader_with_noise_config<R: Read>(
 
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut global_base: u64 = 0;
-        let mut carry_len: usize = 0; // 0 or 1 -- whether buffer[0] currently holds a carry byte from the previous chunk
+        let mut carry_len: usize = 0; // 0 or 1
 
         while count.get() < max_strings {
             let to_read_into = buffer.len() - carry_len;
@@ -667,31 +847,23 @@ pub fn extract_strings_from_reader_with_noise_config<R: Read>(
                 let n =
                     reader.read(&mut buffer[carry_len + read_total..carry_len + to_read_into])?;
                 if n == 0 {
-                    break; // no more data (EOF)
+                    break;
                 }
                 read_total += n;
             }
 
             let len = carry_len + read_total;
             if len == 0 {
-                break; // nothing left to process (including the carry)
+                break;
             }
 
-            let is_last_chunk = read_total < to_read_into; // read fewer bytes than requested = hit EOF
+            let is_last_chunk = read_total < to_read_into;
 
             if is_last_chunk {
-                // Last chunk: process ALL `len` bytes (there's no
-                // following chunk left for the last byte to carry into),
-                // then flush any still-open run.
                 scanner.feed(&buffer, 0, len, len, global_base);
                 scanner.flush_all();
                 break;
             } else {
-                // There's a next chunk: process the first (len-1) bytes,
-                // but allow lookahead across the full `len` bytes
-                // (buffer_valid_len=len) so a UTF-16LE pair right at the
-                // boundary is still tested correctly within this chunk.
-                // Keep buffer[len-1] as the carry byte for the next chunk.
                 scanner.feed(&buffer, 0, len - 1, len, global_base);
                 buffer[0] = buffer[len - 1];
                 carry_len = 1;
