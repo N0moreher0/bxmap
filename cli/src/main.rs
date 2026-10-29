@@ -158,11 +158,7 @@ OPTIONS:
                           Brute-force XOR candidates using selected key sizes
     --parse-pid          Map PID markers in extracted strings
     --detect-secret       Full secret/API-key sweep (all supported tokens)
-    --ip                  Output only IPv4/IPv6 strings
-    --url                 Output only HTTP/HTTPS URLs
-    --domain              Output only domain names
-    --b64                 Decode and output Base64 strings
-    --detect [secret]     Alias; default runs full secret sweep
+    --detect <list>       Detect specific IOCs: ip, url, domain, b64, secret, all (comma-separated)
     --magic-bytes         Report executable/document magic-byte signatures
     --tree                Parse a Windows minidump and print its process tree
                           (modules, threads, memory regions), then exit
@@ -303,10 +299,6 @@ fn parse_args() -> Result<Args, String> {
             "--heap-only" => args.heap_only = true,
             "--vmware-info" => args.vmware_info = true,
             "--detect-secret" => push_detector(&mut args.detectors, Detector::Secret)?,
-            "--ip" => push_detector(&mut args.detectors, Detector::Ip)?,
-            "--url" => push_detector(&mut args.detectors, Detector::Url)?,
-            "--domain" => push_detector(&mut args.detectors, Detector::Domain)?,
-            "--b64" => push_detector(&mut args.detectors, Detector::Base64)?,
             "--detect" => {
                 let value = if i + 1 < values.len() && !values[i + 1].starts_with("--") {
                     next(&mut i)?
