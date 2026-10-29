@@ -7,6 +7,73 @@
 use std::sync::OnceLock;
 use regex::Regex;
 
+/// A concrete secret value extracted from text.
+#[derive(Debug, Clone)]
+pub struct SecretMatch {
+    pub typ: &'static str,
+    pub value: String,
+}
+
+/// Built-in secret/API-key detection patterns (name, regex).
+/// Order matters only for `classify()` preference (first match wins).
+pub static SECRET_PATTERNS: &[(&str, &str)] = &[
+    ("AWS_ACCESS_KEY", r"AKIA[0-9A-Z]{16}"),
+    ("AWS_SECRET_KEY", r"(?i)aws.{0,20}secret.{0,20}[A-Za-z0-9/+=]{30,}"),
+    ("GOOGLE_API_KEY", r"AIza[0-9A-Za-z_-]{35}"),
+    ("GOOGLE_OAUTH_CLIENT_ID", r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com"),
+    ("AZURE_STORAGE_KEY", r"(?i)azure.{0,20}(?:storage|account).{0,20}key.{0,20}[A-Za-z0-9+/=]{40,}"),
+    ("AZURE_SAS_TOKEN", r"(?i)\?[^ ]*sig=[A-Za-z0-9%+/=]{20,}"),
+    ("GITHUB_PAT_CLASSIC", r"ghp_[A-Za-z0-9]{36,}"),
+    ("GITHUB_FINE_GRAINED_PAT", r"github_pat_[A-Za-z0-9_]{20,}"),
+    ("GITHUB_OAUTH_TOKEN", r"gho_[A-Za-z0-9]{36,}"),
+    ("GITHUB_APP_TOKEN", r"(ghu|ghs)_[A-Za-z0-9]{36,}"),
+    ("GITLAB_PAT", r"glpat-[A-Za-z0-9_-]{20,}"),
+    ("NPM_TOKEN", r"npm_[A-Za-z0-9]{36,}"),
+    ("OPENAI_API_KEY", r"sk-[A-Za-z0-9]{20,}"),
+    ("ANTHROPIC_API_KEY", r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    ("HUGGINGFACE_TOKEN", r"hf_[A-Za-z0-9]{20,}"),
+    ("DEEPSEEK_API_KEY", r"sk-[A-Za-z0-9]{20,}"),
+    ("STRIPE_SECRET_KEY", r"sk_(?:live|test)_[A-Za-z0-9]{20,}"),
+    ("STRIPE_PUBLISHABLE_KEY", r"pk_(?:live|test)_[A-Za-z0-9]{20,}"),
+    ("STRIPE_RESTRICTED_KEY", r"rk_(?:live|test)_[A-Za-z0-9]{20,}"),
+    ("PAYPAL_CLIENT_SECRET", r"(?i)paypal.{0,20}secret.{0,20}[A-Za-z0-9]{20,}"),
+    ("SLACK_BOT_TOKEN", r"xoxb-[0-9A-Za-z-]{20,}"),
+    ("SLACK_USER_TOKEN", r"xoxp-[0-9A-Za-z-]{20,}"),
+    ("SLACK_WEBHOOK", r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+"),
+    ("DISCORD_BOT_TOKEN", r"[MN][A-Za-z0-9]{23}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}"),
+    ("TWILIO_API_KEY_SID", r"SK[0-9a-fA-F]{32}"),
+    ("TWILIO_AUTH_TOKEN", r"(?i)twilio.{0,20}auth.{0,20}token.{0,20}[0-9a-f]{32}"),
+    ("SENDGRID_API_KEY", r"SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}"),
+    ("JWT_TOKEN", r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    ("PRIVATE_KEY_BLOCK", r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+    ("DATABASE_URI", r#"(?i)(postgres|postgresql|mysql|mongodb|redis|sqlserver|mssql)://[^\s"'<>]+"#),
+    ("GENERIC_SECRET", r"(?i)(password|passwd|secret|token|apikey|api_key)\s*[=:]\s*\S{6,}"),
+];
+
+static SECRET_COMPILED: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+fn secret_compiled() -> &'static Vec<(&'static str, Regex)> {
+    SECRET_COMPILED.get_or_init(|| {
+        SECRET_PATTERNS.iter().map(|(name, pat)| {
+            let re = Regex::new(pat).unwrap_or_else(|_| Regex::new(r".^").unwrap());
+            (*name, re)
+        }).collect()
+    })
+}
+
+pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (name, re) in secret_compiled() {
+        for m in re.find_iter(text) {
+            let val = m.as_str().to_string();
+            if seen.insert(val.clone()) {
+                out.push(SecretMatch { typ: name, value: val });
+            }
+        }
+    }
+    out
+}
+
 /// Extract PEM private-key blocks from text.
 pub fn extract_pems(text: &str) -> Vec<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -88,6 +155,16 @@ pub fn entropy_of(text: &str) -> f64 {
 /// Classify a single extracted string. Returns None if no rule matches.
 pub fn classify(text: &str) -> Option<Classification> {
     let e = entropy_of(text);
+    // Secret patterns take priority
+    for (name, re) in secret_compiled() {
+        if re.is_match(text) {
+            if *name == "GENERIC_SECRET" {
+                // only classify if entropy reasonable? keep as-is
+            }
+            return Some(Classification { group: "SECRET", typ: name });
+        }
+    }
+    // existing rules...
     for (rule, re) in compiled_rules() {
         if re.is_match(text) {
             if rule.min_entropy > 0.0 && e < rule.min_entropy { continue; }
@@ -110,7 +187,7 @@ mod tests {
     fn aws_key_classified() {
         let c = classify("AKIAIOSFODNN7EXAMPLE").unwrap();
         assert_eq!(c.group, "SECRET");
-        assert_eq!(c.typ, "AWS_KEY");
+        assert_eq!(c.typ, "AWS_ACCESS_KEY");
     }
     #[test]
     fn generic_string_unclassified() {

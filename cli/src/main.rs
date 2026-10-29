@@ -108,11 +108,6 @@ struct Args {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Detector {
-    Ip,
-    Url,
-    Domain,
-    Base64,
-    Pem,
     Secret,
 }
 
@@ -158,10 +153,8 @@ OPTIONS:
     --brute-xor <1b;2b;3b>
                           Brute-force XOR candidates using selected key sizes
     --parse-pid          Map PID markers in extracted strings
-    --detect-ip           Output only IPv4/IPv6 strings
-    --detect-url          Output only HTTP/HTTPS URLs
-    --detect-domain       Output only domain names
-    --detect-b64          Decode and output Base64 strings
+    --detect-secret       Scan and emit all supported secret/API-key/token values
+    --detect [secret]     Alias; default runs full secret sweep
     --magic-bytes         Report executable/document magic-byte signatures
     --tree                Parse a Windows minidump and print its process tree
                           (modules, threads, memory regions), then exit
@@ -301,29 +294,18 @@ fn parse_args() -> Result<Args, String> {
             "--rwx-only" => args.rwx_only = true,
             "--heap-only" => args.heap_only = true,
             "--vmware-info" => args.vmware_info = true,
-            "--detect-ip" => push_detector(&mut args.detectors, Detector::Ip)?,
-            "--detect-url" => push_detector(&mut args.detectors, Detector::Url)?,
-            "--detect-domain" => push_detector(&mut args.detectors, Detector::Domain)?,
-            "--detect-b64" => push_detector(&mut args.detectors, Detector::Base64)?,
-            "--detect-pem" => push_detector(&mut args.detectors, Detector::Pem)?,
             "--detect-secret" => push_detector(&mut args.detectors, Detector::Secret)?,
             "--detect" => {
                 let value = if i + 1 < values.len() && !values[i + 1].starts_with("--") {
                     next(&mut i)?
                 } else {
-                    "ip,url,domain,b64,pem,secret".to_string()
+                    "secret".to_string()
                 };
                 for part in value.split(',') {
-                    let d = match part.trim() {
-                        "ip" => Detector::Ip,
-                        "url" => Detector::Url,
-                        "domain" => Detector::Domain,
-                        "b64" | "base64" => Detector::Base64,
-                        "pem" | "key" | "private-key" => Detector::Pem,
-                        "secret" => Detector::Secret,
+                    match part.trim() {
+                        "secret" | "all" => push_detector(&mut args.detectors, Detector::Secret)?,
                         other => return Err(format!("unknown detector '{other}'")),
-                    };
-                    push_detector(&mut args.detectors, d)?;
+                    }
                 }
             }
             other => return Err(format!("unknown option '{other}'")),
@@ -467,48 +449,17 @@ fn apply_detectors(result: ExtractedString, detectors: &[Detector]) -> Vec<Extra
     let mut out = Vec::new();
     for det in detectors {
         match det {
-            Detector::Ip => {
-                if let Some(v) = detected_ip_value(&result.text) {
-                    let mut r = result.clone();
-                    r.text = v;
-                    out.push(r);
-                }
-            }
-            Detector::Url => {
-                if let Some(v) = detected_url_value(&result.text) {
-                    let mut r = result.clone();
-                    r.text = v;
-                    out.push(r);
-                }
-            }
-            Detector::Domain => {
-                if let Some(v) = detected_domain_value(&result.text) {
-                    let mut r = result.clone();
-                    r.text = v;
-                    out.push(r);
-                }
-            }
-            Detector::Base64 => {
-                if let Some(v) = detect_and_decode_base64(&result.text) {
-                    let mut r = result.clone();
-                    r.text = v;
-                    out.push(r);
-                }
-            }
-            Detector::Pem => {
-                for pem in bxmap::classifier::extract_pems(&result.text) {
-                    let mut r = result.clone();
-                    r.text = pem;
-                    out.push(r);
-                }
-            }
             Detector::Secret => {
-                // classify; if any secret group, emit original
-                if bxmap::classifier::classify(&result.text)
-                    .map(|c| c.group == "SECRET")
-                    .unwrap_or(false)
-                {
-                    out.push(result.clone());
+                let matches = bxmap::classifier::detect_secrets(&result.text);
+                if matches.is_empty() {
+                    // keep original if no secret found? For --detect-secret typical: only emit secrets.
+                    // Emit nothing to filter noise.
+                } else {
+                    for m in matches {
+                        let mut r = result.clone();
+                        r.text = m.value;
+                        out.push(r);
+                    }
                 }
             }
         }
@@ -1199,12 +1150,12 @@ mod tests {
         let result = ExtractedString {
             offset: 4,
             encoding: "ascii",
-            text: "prefix example.org suffix".to_string(),
+            text: "prefix AKIAIOSFODNN7EXAMPLE suffix".to_string(),
         };
         assert_eq!(
-            super::apply_detectors(result, &[super::Detector::Domain])[0]
+            super::apply_detectors(result, &[super::Detector::Secret])[0]
                 .text,
-            "example.org"
+            "AKIAIOSFODNN7EXAMPLE"
         );
     }
 
@@ -1286,14 +1237,7 @@ fn print_selected_options(args: &Args, threads: usize) {
     let detector = if args.detectors.is_empty() {
         "off".to_string()
     } else {
-        args.detectors.iter().map(|d| match d {
-            Detector::Ip => "ip",
-            Detector::Url => "url",
-            Detector::Domain => "domain",
-            Detector::Base64 => "b64",
-            Detector::Pem => "pem",
-            Detector::Secret => "secret",
-        }).collect::<Vec<_>>().join(",")
+        "secret".to_string()
     };
 
     if io::stderr().is_terminal() {

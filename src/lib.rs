@@ -1271,4 +1271,4 @@ mod tests {
             .any(|s| s.encoding == "utf16le" && s.text == "aaaaaaaa"));
     }
 }
-pub const VERSION: &str = "1.0.2";
+pub const VERSION: &str = "1.0.3";

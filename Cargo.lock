@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "bxmap"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "rayon",
  "regex",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "bxmap-cli"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "bxmap",
  "rayon",
