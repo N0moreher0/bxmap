@@ -192,7 +192,8 @@ Every result is an `ExtractedString`:
 ```rust
 pub struct ExtractedString {
     pub offset: u64,
-    pub encoding: &'static str, // "ascii" or "utf16le"
+    pub encoding: &'static str, // "ascii", "utf16le", "utf16be",
+                               // "utf32le", or "utf32be"
     pub text: String,
 }
 ```
@@ -376,8 +377,9 @@ This makes the core suitable for both the included CLI and a custom
 - Constant-memory streaming path with respect to file size.
 - Parallel path bounded by active worker regions, not total file size.
 - Result collection is capped by `max_strings`.
-- No `.dmp`/MDMP structural parsing: the input is treated as raw bytes so the
-  extractor remains independent of minidump format and producer.
+- Core extractor treats input as raw bytes by default; optional
+  `bxmap::minidump` parses Windows minidumps (MDMP) for VA mapping,
+  process/module/thread timeline, and region filters.
 
 Benchmark your target storage, CPU, and result density with your own dump
 corpus. Output volume and downstream processing often dominate end-to-end
