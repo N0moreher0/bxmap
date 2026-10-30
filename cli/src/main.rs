@@ -91,6 +91,36 @@ const MIN_XOR_ALNUM_CHARS: usize = 3;
 /// Cap on unique artifacts kept in memory. Memory dumps can contain millions of
 /// distinct paths; the cap keeps `--extract` bounded on huge inputs.
 const MAX_ARTIFACTS: usize = 20_000;
+/// Encodings the scanner can emit, in report order.
+const ENCODING_LABELS: [&str; 5] = ["ascii", "utf16le", "utf16be", "utf32le", "utf32be"];
+
+fn count_encodings(results: &[ExtractedString]) -> [usize; ENCODING_LABELS.len()] {
+    let mut counts = [0usize; ENCODING_LABELS.len()];
+    for result in results {
+        if let Some(slot) = ENCODING_LABELS
+            .iter()
+            .position(|label| *label == result.encoding)
+        {
+            counts[slot] += 1;
+        }
+    }
+    counts
+}
+
+/// `ascii 12 | utf16le 3`, skipping encodings that produced nothing.
+fn encoding_breakdown(counts: &[usize; ENCODING_LABELS.len()]) -> String {
+    let parts: Vec<String> = ENCODING_LABELS
+        .iter()
+        .zip(counts.iter())
+        .filter(|(_, count)| **count > 0)
+        .map(|(label, count)| format!("{label} {count}"))
+        .collect();
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" | ")
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -100,7 +130,7 @@ enum Format {
     /// Newline-delimited JSON: one self-contained record per line, with a
     /// `"type"` discriminator so mixed record kinds stay parseable.
     Ndjson,
-    /// RFC 4180 CSV with a fixed header; strings and findings only.
+    /// RFC 4180 CSV with a fixed header; strings, findings and artifacts.
     Csv,
 }
 
@@ -198,6 +228,7 @@ struct Args {
     dedupe: bool,
     compact: bool,
     extract: ArtifactKinds,
+    report_summary: bool,
     format: Format,
     detect_format: DetectFormat,
     encoding: Encoding,
@@ -278,6 +309,10 @@ OPTIONS:
                            collected from the extracted strings, sorted
                            rarest-first and appended after the normal rows.
                            Not supported with --format json-tree.
+    --report <summary>   Print a detailed stderr summary: string counts per
+                           encoding, the scanned byte range, whether a limit
+                           stopped the scan and the top artifacts (when
+                           --extract is active). `none` disables it (default).
     --format <text|json|json-tree|ndjson|csv>
                            Output format (default text). json-tree emits
                            grouped classification tree. ndjson emits one JSON
@@ -354,6 +389,7 @@ fn parse_args() -> Result<Args, String> {
         dedupe: false,
         compact: false,
         extract: ArtifactKinds::NONE,
+        report_summary: false,
         format: Format::Text,
         detect_format: DetectFormat::Flat,
         encoding: Encoding::All,
@@ -404,6 +440,18 @@ fn parse_args() -> Result<Args, String> {
             "--dedupe" => args.dedupe = true,
             "--compact" => args.compact = true,
             "--extract" => args.extract = ArtifactKinds::from_list(&next(&mut i)?)?,
+            "--report" => {
+                let value = next(&mut i)?;
+                args.report_summary = match value.as_str() {
+                    "summary" => true,
+                    "none" => false,
+                    other => {
+                        return Err(format!(
+                            "invalid --report mode '{other}' (expected summary or none)"
+                        ))
+                    }
+                };
+            }
             "--max-str-len" => {
                 args.max_str_len = next(&mut i)?
                     .parse()
@@ -1980,6 +2028,29 @@ fn print_banner(path: &str, size: u64, format: Format) {
     eprintln!("  \x1b[1;34m[..] scanning\x1b[0m");
 }
 
+/// Opening line of `--report summary`, printed even when stderr is piped so the
+/// scan scope ends up in logs next to the closing summary.
+fn print_summary_header(
+    range_start: u64,
+    range_end: u64,
+    file_size: u64,
+    encoding: Encoding,
+    extract: ArtifactKinds,
+) {
+    let scope = match encoding {
+        Encoding::All => "all",
+        Encoding::Ascii => "ascii",
+        Encoding::Utf16 => "utf16",
+        Encoding::Utf32 => "utf32",
+    };
+    let artifacts = if extract.is_empty() { "off" } else { "on" };
+    let span = range_end.saturating_sub(range_start);
+    eprintln!(
+        "  [report] window {range_start:#010x}-{range_end:#010x} ({span} of {file_size} bytes) \
+         | encodings {scope} | artifacts {artifacts}"
+    );
+}
+
 /// Print a truncation warning when the result limit stopped the scan early.
 ///
 /// `last_absolute` is the absolute offset of the last emitted string and
@@ -2051,18 +2122,30 @@ fn dedupe_findings(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print_report(
+/// Everything the stderr summary needs. Grouped into a struct because the
+/// report grew past a readable argument list.
+struct ReportData<'a> {
     result_count: usize,
     short: usize,
     medium: usize,
     long: usize,
-    important: &[ExtractedString],
-    entropy_regions: &[EntropyRegion],
-    size: u64,
+    important: &'a [ExtractedString],
+    entropy_regions: &'a [EntropyRegion],
+    artifacts: &'a [Artifact],
+    encodings: [usize; ENCODING_LABELS.len()],
+    file_size: u64,
+    range_start: u64,
+    range_end: u64,
     elapsed: f64,
     threads: usize,
-    artifacts: usize,
-) {
+    truncated: bool,
+    max_strings: usize,
+    scanned_until: u64,
+    /// `--report summary`: add encoding, coverage and artifact details.
+    detailed: bool,
+}
+
+fn print_report(data: &ReportData<'_>) {
     let color = io::stderr().is_terminal();
     if color {
         eprintln!("\x1b[1;32m  [OK] scan complete\x1b[0m");
@@ -2071,22 +2154,57 @@ fn print_report(
         eprintln!("  [OK] scan complete");
         eprintln!("+-------------------- summary -----------------------------+");
     }
-    eprintln!("  results    : {result_count}");
-    if artifacts > 0 {
-        eprintln!("  artifacts  : {artifacts} unique");
+    eprintln!("  results    : {}", data.result_count);
+    if !data.artifacts.is_empty() {
+        eprintln!("  artifacts  : {} unique", data.artifacts.len());
     }
-    eprintln!("  length     : {short} short | {medium} medium | {long} long");
-    eprintln!("  threads    : {threads}");
-    eprintln!("  file size  : {size} bytes");
-    eprintln!("  elapsed    : {:.3} ms", elapsed * 1000.0);
+    eprintln!(
+        "  length     : {} short | {} medium | {} long",
+        data.short, data.medium, data.long
+    );
+    if data.detailed {
+        eprintln!("  encodings  : {}", encoding_breakdown(&data.encodings));
+        eprintln!(
+            "  scanned    : {:#010x}-{:#010x} ({})",
+            data.range_start,
+            data.covered_end(),
+            data.coverage_text()
+        );
+        if data.truncated {
+            eprintln!(
+                "  limit      : --max-strings {} reached at {:#010x} (exit 3)",
+                data.max_strings, data.scanned_until
+            );
+        } else {
+            eprintln!(
+                "  limit      : not reached (--max-strings {})",
+                data.max_strings
+            );
+        }
+    }
+    eprintln!("  threads    : {}", data.threads);
+    eprintln!("  file size  : {} bytes", data.file_size);
+    eprintln!("  elapsed    : {:.3} ms", data.elapsed * 1000.0);
     eprintln!(
         "  throughput : {:.2} MiB/s",
-        size as f64 / elapsed.max(f64::MIN_POSITIVE) / 1_048_576.0
+        data.file_size as f64 / data.elapsed.max(f64::MIN_POSITIVE) / 1_048_576.0
     );
     eprintln!("+------------------------------------------------------------+");
-    if !important.is_empty() {
+    if data.detailed && !data.artifacts.is_empty() {
+        eprintln!("  [!] top artifacts (rarest first, up to 10)");
+        for artifact in data.artifacts.iter().take(10) {
+            eprintln!(
+                "      - {:<8} count={:<5} offset {:#010x}  {}",
+                artifact.kind.as_str(),
+                artifact.count,
+                artifact.offset,
+                artifact.value
+            );
+        }
+    }
+    if !data.important.is_empty() {
         eprintln!("  [!] priority findings (up to 12)");
-        for result in important {
+        for result in data.important {
             let reason = important_reason(&result.text).unwrap_or("interesting");
             eprintln!(
                 "      - {:<12} | offset {:#010x} | {:<7} | {}",
@@ -2094,13 +2212,47 @@ fn print_report(
             );
         }
     }
-    if !entropy_regions.is_empty() {
+    if !data.entropy_regions.is_empty() {
         eprintln!("  [!] high-entropy regions (showing up to 12)");
-        for region in entropy_regions {
+        for region in data.entropy_regions {
             eprintln!(
                 "      offset {:#010x}  {:>6} bytes  entropy {:.3}/8.000",
                 region.offset, region.length, region.entropy
             );
+        }
+    }
+}
+
+impl ReportData<'_> {
+    /// Last byte actually reached: the scan window end, or the last emitted
+    /// offset when `--max-strings` stopped the scan early.
+    fn covered_end(&self) -> u64 {
+        if self.truncated {
+            self.scanned_until.min(self.range_end).max(self.range_start)
+        } else {
+            self.range_end
+        }
+    }
+
+    fn coverage_text(&self) -> String {
+        let span = self.range_end.saturating_sub(self.range_start);
+        let covered = self.covered_end().saturating_sub(self.range_start);
+        let window_pct = if span == 0 {
+            100.0
+        } else {
+            covered as f64 * 100.0 / span as f64
+        };
+        let file_pct = if self.file_size == 0 {
+            100.0
+        } else {
+            covered as f64 * 100.0 / self.file_size as f64
+        };
+        if self.range_start == 0 && self.range_end >= self.file_size {
+            format!("{covered} bytes, {file_pct:.1}% of file")
+        } else {
+            format!(
+                "{covered} bytes, {window_pct:.1}% of {span}-byte window, {file_pct:.1}% of file"
+            )
         }
     }
 }
@@ -2493,6 +2645,15 @@ fn run() -> Result<(), String> {
     // "finished the file at exactly the cap".
     let internal_limit = args.max_strings.saturating_add(1);
     print_banner(&args.path, file_size, args.format);
+    if args.report_summary {
+        print_summary_header(
+            range_start,
+            range_end,
+            file_size,
+            args.encoding,
+            args.extract,
+        );
+    }
     let threads = if args.auto_tune {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -2610,6 +2771,7 @@ fn run() -> Result<(), String> {
         let mut raw_count = 0usize;
         let mut truncated = false;
         let mut artifacts = ArtifactCollector::new(args.extract, MAX_ARTIFACTS);
+        let mut encoding_counts = [0usize; ENCODING_LABELS.len()];
         let progress_results = std::cell::Cell::new(0usize);
         let mut handle = |result: ExtractedString| {
             if write_error.is_some() {
@@ -2641,6 +2803,12 @@ fn run() -> Result<(), String> {
                 || (args.encoding == Encoding::Utf32
                     && (result.encoding == "utf32le" || result.encoding == "utf32be"))
             {
+                if let Some(slot) = ENCODING_LABELS
+                    .iter()
+                    .position(|label| *label == result.encoding)
+                {
+                    encoding_counts[slot] += 1;
+                }
                 artifacts.observe(&result.text, result.offset);
                 if args.detect_format == DetectFormat::Rich {
                     let findings = detect_findings(&result, &args.detectors);
@@ -2840,18 +3008,25 @@ fn run() -> Result<(), String> {
         if let Some(path) = args.output {
             eprintln!("wrote {result_count} results to '{path}'");
         }
-        print_report(
+        print_report(&ReportData {
             result_count,
             short,
             medium,
             long,
-            &important,
-            &entropy_regions,
+            important: &important,
+            entropy_regions: &entropy_regions,
+            artifacts: &artifacts,
+            encodings: encoding_counts,
             file_size,
-            start.elapsed().as_secs_f64(),
+            range_start,
+            range_end,
+            elapsed: start.elapsed().as_secs_f64(),
             threads,
-            artifacts.len(),
-        );
+            truncated,
+            max_strings: args.max_strings,
+            scanned_until: last_offset,
+            detailed: args.report_summary,
+        });
         if truncated {
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
@@ -2990,18 +3165,25 @@ fn run() -> Result<(), String> {
         for result in &raw_results {
             update_stats(result, &mut short, &mut medium, &mut long, &mut important);
         }
-        print_report(
+        print_report(&ReportData {
             result_count,
             short,
             medium,
             long,
-            &important,
-            &entropy_regions,
+            important: &important,
+            entropy_regions: &entropy_regions,
+            artifacts: &artifacts,
+            encodings: count_encodings(&raw_results),
             file_size,
-            start.elapsed().as_secs_f64(),
+            range_start,
+            range_end,
+            elapsed: start.elapsed().as_secs_f64(),
             threads,
-            artifacts.len(),
-        );
+            truncated,
+            max_strings: args.max_strings,
+            scanned_until: raw_results.iter().map(|r| r.offset).max().unwrap_or(0),
+            detailed: args.report_summary,
+        });
         if truncated {
             let last_offset = raw_results.iter().map(|r| r.offset).max().unwrap_or(0);
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
@@ -3112,18 +3294,25 @@ fn run() -> Result<(), String> {
             eprintln!("wrote {} results to '{}'", results.len(), path);
         }
         let _ = args.stats;
-        print_report(
-            results.len(),
-            0,
-            0,
-            0,
-            &[],
-            &entropy_regions,
+        print_report(&ReportData {
+            result_count: results.len(),
+            short: 0,
+            medium: 0,
+            long: 0,
+            important: &[],
+            entropy_regions: &entropy_regions,
+            artifacts: &artifacts,
+            encodings: count_encodings(&results),
             file_size,
-            start.elapsed().as_secs_f64(),
+            range_start,
+            range_end,
+            elapsed: start.elapsed().as_secs_f64(),
             threads,
-            artifacts.len(),
-        );
+            truncated,
+            max_strings: args.max_strings,
+            scanned_until: last_offset,
+            detailed: args.report_summary,
+        });
         if truncated {
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
@@ -3300,18 +3489,25 @@ fn run() -> Result<(), String> {
             important.push(result.clone());
         }
     }
-    print_report(
-        results.len(),
+    print_report(&ReportData {
+        result_count: results.len(),
         short,
         medium,
         long,
-        &important,
-        &entropy_regions,
+        important: &important,
+        entropy_regions: &entropy_regions,
+        artifacts: &artifacts,
+        encodings: count_encodings(&results),
         file_size,
-        start.elapsed().as_secs_f64(),
+        range_start,
+        range_end,
+        elapsed: start.elapsed().as_secs_f64(),
         threads,
-        artifacts.len(),
-    );
+        truncated,
+        max_strings: args.max_strings,
+        scanned_until: results.iter().map(|r| r.offset).max().unwrap_or(0),
+        detailed: args.report_summary,
+    });
     if truncated {
         let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
         print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);

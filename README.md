@@ -283,6 +283,8 @@ The CLI adds:
   (paths with `user=`/`category=` detail, environment assignments, URLs,
   e-mails, registry keys) sorted rarest-first; works with `text`, `json`,
   `ndjson` and `csv`.
+- `--report summary` adds encoding counts, scanned-range coverage, limit status
+  and top artifacts to the stderr summary.
 - IOC triage refangs `[.]`/`[at]`, validates public IPv4, drops private IP noise, uses entropy to reject base64 filler.
   only the selected IOC type; Base64 mode decodes printable UTF-8 payloads
 - `--magic-bytes` to report bounded executable/document signatures such as PE

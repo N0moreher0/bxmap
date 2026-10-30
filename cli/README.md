@@ -67,6 +67,11 @@ bxmap --help
   `json`, `ndjson` and `csv`; `json-tree` is rejected because artifacts are a
   flat record type. The library equivalent is
   `bxmap::artifacts::ArtifactCollector`.
+- `--report summary` — print a detailed summary on stderr: string counts per
+  encoding, the scanned byte range (percentage of the requested window and of
+  the file), whether `--max-strings` stopped the scan early, and the top
+  artifacts when `--extract` is active. `--report none` (default) keeps the
+  compact summary.
 - `--entropy` — report high-entropy regions.
 - `--entropy-window <BYTES>` — bytes per entropy window (default 65536).
 - `--entropy-threshold <BITS>` — minimum Shannon entropy per window, 0–8

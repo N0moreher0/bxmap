@@ -122,7 +122,7 @@ Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì b
 - [ ] Nhận diện **công cụ tạo dump** (DumpIt, WinPmem, FTK Imager, `.raw`/`.mem` tên mặc định) và dấu vết khởi chạy.
 - [x] `--extract env`: tách khối biến môi trường `NAME=value\0` (case Lab 6: `RAR password=...`); tên nhạy cảm (`password`, `token`, `secret`, ...) được đánh dấu `sensitive=true`.
 - [x] `--extract urls|emails|registry` với dedupe và đếm.
-- [ ] Báo cáo tóm tắt (`--report summary`) in đầu/cuối: số chuỗi theo encoding, phần dump đã quét, giới hạn đã chạm, top artifact.
+- [x] Báo cáo tóm tắt (`--report summary`) in đầu/cuối: số chuỗi theo encoding, phần dump đã quét, giới hạn đã chạm, top artifact.
 
 ---
 

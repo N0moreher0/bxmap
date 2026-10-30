@@ -76,6 +76,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`ArtifactCollector`, `ArtifactKinds`, `Artifact`) exposes the same logic to
   library users. `--format json-tree` rejects `--extract` because artifacts are
   a flat record type.
+- `--report summary` enriches the stderr summary with the string count per
+  encoding, the scanned byte range (percentage of the requested window and of
+  the file), whether `--max-strings` stopped the scan, and the top artifacts
+  collected by `--extract`. `--report none` restores the compact summary.
 
 ### Changed
 - `apply_detectors` allocates output capacity up front and clones lazily.

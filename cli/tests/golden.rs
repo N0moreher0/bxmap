@@ -1304,3 +1304,140 @@ fn golden_extract_rejects_unknown_kind() {
         "{stderr}"
     );
 }
+
+#[test]
+fn golden_report_summary_breaks_down_encodings_and_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.bin");
+    let mut data = b"hello ascii\x00".to_vec();
+    for unit in "hello wide".encode_utf16() {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    data.extend_from_slice(&[0, 0]);
+    std::fs::write(&path, data).unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "all",
+            "--report",
+            "summary",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[report] window 0x00000000-"), "{stderr}");
+    assert!(
+        stderr.contains("encodings  : ascii 1 | utf16le 1"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("scanned    : 0x00000000-"), "{stderr}");
+    assert!(stderr.contains("% of file"), "{stderr}");
+    assert!(
+        stderr.contains("limit      : not reached (--max-strings 200000)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn golden_report_summary_flags_truncation() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--max-strings",
+            "1",
+            "--report",
+            "summary",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("limit      : --max-strings 1 reached at 0x"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("(exit 3)"), "{stderr}");
+}
+
+#[test]
+fn golden_report_summary_lists_top_artifacts() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--extract",
+            "paths",
+            "--report",
+            "summary",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("top artifacts (rarest first"), "{stderr}");
+    assert!(
+        stderr.contains("C:\\Users\\eminem\\Desktop\\a.txt"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("count=2"), "{stderr}");
+}
+
+#[test]
+fn golden_report_is_off_by_default() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("encodings  :"), "{stderr}");
+    assert!(!stderr.contains("scanned    :"), "{stderr}");
+    assert!(!stderr.contains("limit      :"), "{stderr}");
+    assert!(!stderr.contains("[report] window"), "{stderr}");
+}
+
+#[test]
+fn golden_report_rejects_unknown_mode() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([path.to_str().unwrap(), "--report", "bogus"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid --report mode 'bogus'"), "{stderr}");
+}
