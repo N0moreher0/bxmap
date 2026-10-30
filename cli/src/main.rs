@@ -89,6 +89,18 @@ enum Format {
     Text,
     Json,
     JsonTree,
+    /// Newline-delimited JSON: one self-contained record per line, with a
+    /// `"type"` discriminator so mixed record kinds stay parseable.
+    Ndjson,
+}
+
+/// How a JSON record is framed when written one at a time.
+#[derive(Clone, Copy, PartialEq)]
+enum JsonLayout {
+    /// Inside a pretty-printed array: `,\n` separator, two-space indent.
+    Array,
+    /// NDJSON: `\n` separator, no indent, plus a `type` discriminator.
+    Lines,
 }
 
 /// Detector output shape. `Flat` preserves the historical behaviour (replace
@@ -177,9 +189,10 @@ OPTIONS:
     --no-progress        Disable the progress line.
     --dedupe             Emit each unique string once with `count=` and the
                            first offset. Buffers results in memory.
-    --format <text|json|json-tree>
+    --format <text|json|json-tree|ndjson>
                            Output format (default text). json-tree emits
-                           grouped classification tree.
+                           grouped classification tree. ndjson emits one JSON
+                           object per line with a `type` field.
     --encoding <all|ascii|utf16|utf32>
                           Restrict output by encoding (default all). utf-16 includes both LE & BE; utf-32 includes both LE & BE
     -o, --output <PATH>  Write results to a file
@@ -299,6 +312,7 @@ fn parse_args() -> Result<Args, String> {
                     "text" => Format::Text,
                     "json" => Format::Json,
                     "json-tree" => Format::JsonTree,
+                    "ndjson" => Format::Ndjson,
                     other => return Err(format!("invalid format '{other}'")),
                 };
             }
@@ -739,18 +753,39 @@ fn scan_magic_bytes(path: &str) -> io::Result<Vec<MagicMatch>> {
     Ok(matches)
 }
 
+/// Separator written before a JSON record, plus the record's indent and the
+/// optional `type` discriminator used by NDJSON.
+fn json_record_open(
+    writer: &mut dyn Write,
+    result_count: &mut usize,
+    layout: JsonLayout,
+    record_type: Option<&str>,
+) -> io::Result<()> {
+    if *result_count > 0 {
+        match layout {
+            JsonLayout::Array => writeln!(writer, ",")?,
+            JsonLayout::Lines => writeln!(writer)?,
+        }
+    }
+    match (layout, record_type) {
+        (JsonLayout::Array, _) => write!(writer, "  {{")?,
+        (JsonLayout::Lines, Some(kind)) => write!(writer, "{{\"type\":\"{kind}\",")?,
+        (JsonLayout::Lines, None) => write!(writer, "{{")?,
+    }
+    Ok(())
+}
+
 fn write_entropy_json(
     region: EntropyRegion,
     data: &[u8],
     writer: &mut dyn Write,
     result_count: &mut usize,
+    layout: JsonLayout,
 ) -> io::Result<()> {
-    if *result_count > 0 {
-        writeln!(writer, ",")?;
-    }
+    json_record_open(writer, result_count, layout, Some("entropy"))?;
     write!(
         writer,
-        "  {{\"group\":\"Undefined\",\"offset\":{},\"length\":{},\"entropy\":{:.6},\"data_hex\":{}}}",
+        "\"group\":\"Undefined\",\"offset\":{},\"length\":{},\"entropy\":{:.6},\"data_hex\":{}}}",
         region.offset,
         region.length,
         region.entropy,
@@ -802,13 +837,12 @@ fn write_yara_json(
     rule: &bxmap::YaraMatch,
     writer: &mut dyn Write,
     result_count: &mut usize,
+    layout: JsonLayout,
 ) -> io::Result<()> {
-    if *result_count > 0 {
-        writeln!(writer, ",")?;
-    }
+    json_record_open(writer, result_count, layout, Some("yara"))?;
     write!(
         writer,
-        "  {{\"group\":\"YARA\",\"offset\":{},\"namespace\":{},\"rule\":{}}}",
+        "\"group\":\"YARA\",\"offset\":{},\"namespace\":{},\"rule\":{}}}",
         rule.offset,
         json_escape(&rule.namespace),
         json_escape(&rule.rule)
@@ -825,13 +859,12 @@ fn write_magic_json(
     magic: &MagicMatch,
     writer: &mut dyn Write,
     result_count: &mut usize,
+    layout: JsonLayout,
 ) -> io::Result<()> {
-    if *result_count > 0 {
-        writeln!(writer, ",")?;
-    }
+    json_record_open(writer, result_count, layout, Some("magic"))?;
     write!(
         writer,
-        "  {{\"group\":\"MAGIC\",\"offset\":{},\"kind\":{}}}",
+        "\"group\":\"MAGIC\",\"offset\":{},\"kind\":{}}}",
         magic.offset,
         json_escape(magic.kind)
     )?;
@@ -1096,13 +1129,12 @@ fn write_xor_json(
     result: &XorResult,
     writer: &mut dyn Write,
     result_count: &mut usize,
+    layout: JsonLayout,
 ) -> io::Result<()> {
-    if *result_count > 0 {
-        writeln!(writer, ",")?;
-    }
+    json_record_open(writer, result_count, layout, Some("xor"))?;
     write!(
         writer,
-        "  {{\"group\":\"XOR\",\"offset\":{},\"key\":{},\"score\":{:.6},\"plaintext\":{}}}",
+        "\"group\":\"XOR\",\"offset\":{},\"key\":{},\"score\":{:.6},\"plaintext\":{}}}",
         result.offset,
         json_escape(&hex_encode(&result.key)),
         result.score,
@@ -1112,19 +1144,35 @@ fn write_xor_json(
     Ok(())
 }
 
+/// Emit the trailing NDJSON metadata record so consumers can detect truncation
+/// without parsing stderr. `records` is the number of records already written.
+fn write_ndjson_metadata(
+    writer: &mut dyn Write,
+    records: usize,
+    truncated: bool,
+    scanned_until: u64,
+) -> io::Result<()> {
+    if records > 0 {
+        writeln!(writer)?;
+    }
+    writeln!(
+        writer,
+        "{{\"type\":\"metadata\",\"total_records\":{records},\"truncated\":{truncated},\"scanned_until\":{scanned_until}}}"
+    )
+}
+
 fn write_string_json(
     result: &ExtractedString,
     writer: &mut dyn Write,
     result_count: &mut usize,
     parse_pid: bool,
     count: Option<usize>,
+    layout: JsonLayout,
 ) -> io::Result<()> {
-    if *result_count > 0 {
-        writeln!(writer, ",")?;
-    }
+    json_record_open(writer, result_count, layout, Some("string"))?;
     write!(
         writer,
-        "  {{\"offset\":{},\"encoding\":{},\"text\":{}",
+        "\"offset\":{},\"encoding\":{},\"text\":{}",
         result.offset,
         json_escape(result.encoding),
         json_escape(&result.text)
@@ -1571,6 +1619,7 @@ fn print_banner(path: &str, size: u64, format: Format) {
         Format::Text => "text",
         Format::Json => "json",
         Format::JsonTree => "json-tree",
+        Format::Ndjson => "ndjson",
     };
     eprintln!("\x1b[1;36m+------------------------------------------------------------+\x1b[0m");
     eprintln!(
@@ -1778,14 +1827,23 @@ fn record_result(
             }
             writeln!(writer)?;
         }
-        Format::Json => {
-            write_string_json(&result, writer, result_count, parse_pid, count)?;
+        Format::Json | Format::Ndjson => {
+            let layout = if format == Format::Ndjson {
+                JsonLayout::Lines
+            } else {
+                JsonLayout::Array
+            };
+            write_string_json(&result, writer, result_count, parse_pid, count, layout)?;
         }
         Format::JsonTree => {
             // handled separately in main(); no-op here
         }
     }
-    *result_count += 1;
+    // `write_string_json` already bumps the counter for JSON/NDJSON records;
+    // counting again here would skew record totals and separators.
+    if !matches!(format, Format::Json | Format::Ndjson) {
+        *result_count += 1;
+    }
     update_stats(&result, short, medium, long, important);
     Ok(())
 }
@@ -1817,13 +1875,16 @@ fn record_finding(
             }
             writeln!(writer)?;
         }
-        Format::Json => {
-            if *result_count > 0 {
-                writeln!(writer, ",")?;
-            }
+        Format::Json | Format::Ndjson => {
+            let layout = if format == Format::Ndjson {
+                JsonLayout::Lines
+            } else {
+                JsonLayout::Array
+            };
+            json_record_open(writer, result_count, layout, Some("finding"))?;
             write!(
                 writer,
-                "  {{\"offset\":{},\"encoding\":{},\"rule\":{},\"value\":{},\"confidence\":{:.4},\"severity\":{},\"context\":{},\"text\":{}",
+                "\"offset\":{},\"encoding\":{},\"rule\":{},\"value\":{},\"confidence\":{:.4},\"severity\":{},\"context\":{},\"text\":{}",
                 finding.offset,
                 json_escape(finding.encoding),
                 json_escape(finding.rule),
@@ -1882,14 +1943,23 @@ fn write_results(
                 writeln!(writer)?;
             }
         }
-        Format::Json => {
-            writeln!(writer, "[")?;
+        Format::Json | Format::Ndjson => {
+            let layout = if format == Format::Ndjson {
+                JsonLayout::Lines
+            } else {
+                JsonLayout::Array
+            };
+            if layout == JsonLayout::Array {
+                writeln!(writer, "[")?;
+            }
             let mut result_count = 0;
             for result in results {
                 let count = counts.and_then(|map| map.get(&result.text).copied());
-                write_string_json(result, writer, &mut result_count, parse_pid, count)?;
+                write_string_json(result, writer, &mut result_count, parse_pid, count, layout)?;
             }
-            writeln!(writer, "]")?;
+            if layout == JsonLayout::Array {
+                writeln!(writer, "]")?;
+            }
         }
         Format::JsonTree => {}
     }
@@ -2099,6 +2169,11 @@ fn main() -> Result<(), String> {
             )),
             None => Box::new(BufWriter::new(io::stdout().lock())),
         };
+        let json_layout = if args.format == Format::Ndjson {
+            JsonLayout::Lines
+        } else {
+            JsonLayout::Array
+        };
         if args.format == Format::Json {
             writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
         }
@@ -2211,22 +2286,22 @@ fn main() -> Result<(), String> {
         if let Some(error) = write_error {
             return Err(format!("write failed: {error}"));
         }
-        if args.format == Format::Json {
+        if args.format == Format::Json || args.format == Format::Ndjson {
             let mut json_count = result_count;
             for matched in &yara_matches {
-                write_yara_json(matched, &mut writer, &mut json_count)
+                write_yara_json(matched, &mut writer, &mut json_count, json_layout)
                     .map_err(|e| format!("write failed: {e}"))?;
             }
             for result in &xor_results {
                 if filter_regex.as_ref().map_or(true, |regex| {
                     regex.is_match(&String::from_utf8_lossy(&result.plaintext))
                 }) {
-                    write_xor_json(result, &mut writer, &mut json_count)
+                    write_xor_json(result, &mut writer, &mut json_count, json_layout)
                         .map_err(|e| format!("write failed: {e}"))?;
                 }
             }
             for magic in &magic_matches {
-                write_magic_json(magic, &mut writer, &mut json_count)
+                write_magic_json(magic, &mut writer, &mut json_count, json_layout)
                     .map_err(|e| format!("write failed: {e}"))?;
             }
             if args.entropy {
@@ -2235,9 +2310,13 @@ fn main() -> Result<(), String> {
                     ENTROPY_THRESHOLD,
                     |region, data| {
                         if write_error.is_none() {
-                            if let Err(error) =
-                                write_entropy_json(region, data, &mut writer, &mut json_count)
-                            {
+                            if let Err(error) = write_entropy_json(
+                                region,
+                                data,
+                                &mut writer,
+                                &mut json_count,
+                                json_layout,
+                            ) {
                                 write_error = Some(error);
                             }
                         }
@@ -2248,7 +2327,12 @@ fn main() -> Result<(), String> {
             if let Some(error) = write_error {
                 return Err(format!("write failed: {error}"));
             }
-            writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
+            if args.format == Format::Ndjson {
+                write_ndjson_metadata(&mut writer, json_count, truncated, last_offset)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            } else {
+                writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
+            }
         } else {
             for matched in &yara_matches {
                 write_yara_text(matched, &mut writer).map_err(|e| format!("write failed: {e}"))?;
@@ -2382,6 +2466,11 @@ fn main() -> Result<(), String> {
             )),
             None => Box::new(BufWriter::new(io::stdout().lock())),
         };
+        let json_layout = if args.format == Format::Ndjson {
+            JsonLayout::Lines
+        } else {
+            JsonLayout::Array
+        };
         if args.format == Format::Json {
             writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
         }
@@ -2397,7 +2486,11 @@ fn main() -> Result<(), String> {
             )
             .map_err(|e| format!("write failed: {e}"))?;
         }
-        if args.format == Format::Json {
+        if json_layout == JsonLayout::Lines {
+            let last_offset = raw_results.iter().map(|r| r.offset).max().unwrap_or(0);
+            write_ndjson_metadata(&mut writer, result_count, truncated, last_offset)
+                .map_err(|e| format!("write failed: {e}"))?;
+        } else if args.format == Format::Json {
             writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
         }
         writer.flush().map_err(|e| format!("write failed: {e}"))?;
@@ -2543,30 +2636,44 @@ fn main() -> Result<(), String> {
         }
         return Ok(());
     }
-    if args.format == Format::Json {
-        writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
+    if args.format == Format::Json || args.format == Format::Ndjson {
+        let json_layout = if args.format == Format::Ndjson {
+            JsonLayout::Lines
+        } else {
+            JsonLayout::Array
+        };
+        if json_layout == JsonLayout::Array {
+            writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
+        }
         let mut json_count = 0;
         for result in &results {
             let count = counts
                 .as_ref()
                 .and_then(|map| map.get(&result.text).copied());
-            write_string_json(result, &mut writer, &mut json_count, args.parse_pid, count)
-                .map_err(|e| format!("write failed: {e}"))?;
+            write_string_json(
+                result,
+                &mut writer,
+                &mut json_count,
+                args.parse_pid,
+                count,
+                json_layout,
+            )
+            .map_err(|e| format!("write failed: {e}"))?;
         }
         for matched in &yara_matches {
-            write_yara_json(matched, &mut writer, &mut json_count)
+            write_yara_json(matched, &mut writer, &mut json_count, json_layout)
                 .map_err(|e| format!("write failed: {e}"))?;
         }
         for result in &xor_results {
             if filter_regex.as_ref().map_or(true, |regex| {
                 regex.is_match(&String::from_utf8_lossy(&result.plaintext))
             }) {
-                write_xor_json(result, &mut writer, &mut json_count)
+                write_xor_json(result, &mut writer, &mut json_count, json_layout)
                     .map_err(|e| format!("write failed: {e}"))?;
             }
         }
         for magic in &magic_matches {
-            write_magic_json(magic, &mut writer, &mut json_count)
+            write_magic_json(magic, &mut writer, &mut json_count, json_layout)
                 .map_err(|e| format!("write failed: {e}"))?;
         }
         if args.entropy {
@@ -2581,7 +2688,7 @@ fn main() -> Result<(), String> {
                         return;
                     }
                     if let Err(error) =
-                        write_entropy_json(region, data, &mut writer, &mut json_count)
+                        write_entropy_json(region, data, &mut writer, &mut json_count, json_layout)
                     {
                         entropy_write_error = Some(error);
                     }
@@ -2592,7 +2699,13 @@ fn main() -> Result<(), String> {
                 return Err(format!("write failed: {error}"));
             }
         }
-        writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
+        if json_layout == JsonLayout::Lines {
+            let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
+            write_ndjson_metadata(&mut writer, results.len(), truncated, last_offset)
+                .map_err(|e| format!("write failed: {e}"))?;
+        } else {
+            writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
+        }
     } else {
         write_results(
             &results,

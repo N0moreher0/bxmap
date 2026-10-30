@@ -93,7 +93,7 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 - [ ] Mở rộng noise filter ngoài chu kỳ 1–2: chu kỳ N, độ đa dạng ký tự thấp, điểm n-gram để loại chuỗi rác/ngẫu nhiên.
 - [x] `--dedupe`: chuỗi duy nhất kèm số lần xuất hiện + offset đầu tiên. Áp dụng cho `text`/`json`/`json-tree`; với `--detect-format rich` thì gộp theo `(rule, value)`.
 - [ ] **Lọc rác nhị phân/bảng hệ thống** (Lab 4: 820 nghìn chuỗi ASCII, phần lớn là bảng ACPI `FACP`/`DSDT`/`VBOXBIOS` và dữ liệu nhị phân ở đầu dump): điểm "độ giống văn bản", loại chuỗi có tỉ lệ ký tự không in cao hoặc entropy ký tự lạ.
-- [ ] **Output gọn:** JSON pretty-print của 1,9 triệu bản ghi nặng 160 MB. Thêm `--format ndjson`/`--compact`, nén (`.gz`/`.zst`) khi `-o`, và tùy chọn bỏ trường không cần.
+- [~] **Output gọn:** JSON pretty-print của 1,9 triệu bản ghi nặng 160 MB. Đã có `--format ndjson` (một record/dòng, có `type` + dòng `metadata`). Còn lại: `--compact`, nén (`.gz`/`.zst`) khi `-o`, và tùy chọn bỏ trường không cần.
 - [ ] Giữ mặc định bảo thủ (không làm mất bằng chứng ngắn như `0000`); mọi bộ lọc mới đều opt-in hoặc có cờ tắt.
 
 ### 4.2 Entropy
@@ -134,7 +134,7 @@ Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì b
 - [ ] Ổn định API trước `1.0`: tài liệu hóa quy ước semver, đánh dấu phần chưa ổn định bằng feature flag.
 
 ### 5.2 CLI
-- [ ] Output `ndjson` và `csv`.
+- [~] Output `ndjson` và `csv`. (`ndjson` đã xong, kèm `type` và dòng `metadata`; `csv` chưa.)
 - [ ] Thanh tiến độ trên stderr (tắt được khi pipe).
 - [ ] Shell completions (bash/zsh/fish/pwsh), man page, `--version` chi tiết (commit, feature build: full/lite).
 - [ ] Exit code rõ ràng (0 sạch, 1 lỗi, 2 có phát hiện nghiêm trọng nếu bật cờ).

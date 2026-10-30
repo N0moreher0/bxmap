@@ -502,3 +502,111 @@ fn golden_dedupe_rich_findings_groups_by_rule_and_value() {
     assert!(stdout.contains("\"count\":2"), "{stdout}");
     assert_eq!(stdout.matches("\"rule\":").count(), 1, "{stdout}");
 }
+
+#[test]
+fn golden_ndjson_emits_one_record_per_line_plus_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--format",
+            "ndjson",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(
+        lines[0].starts_with("{\"type\":\"string\",\"offset\":0,"),
+        "{stdout}"
+    );
+    assert!(
+        lines[2].starts_with("{\"type\":\"metadata\",\"total_records\":2,"),
+        "{stdout}"
+    );
+    for line in &lines {
+        assert!(line.starts_with('{') && line.ends_with('}'), "{line}");
+    }
+}
+
+#[test]
+fn golden_ndjson_rich_finding_keeps_type_and_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(
+        &path,
+        b"key AKIAIOSFODNN7EXAMPLE x\x00other AKIAIOSFODNN7EXAMPLE y\x00",
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--detect",
+            "secret",
+            "--detect-format",
+            "rich",
+            "--dedupe",
+            "--format",
+            "ndjson",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    assert!(
+        lines[0].starts_with("{\"type\":\"finding\",\"offset\":0,"),
+        "{stdout}"
+    );
+    assert!(lines[0].contains("\"rule\":\"AWS_ACCESS_KEY\""), "{stdout}");
+    assert!(lines[0].contains("\"count\":2"), "{stdout}");
+    assert!(
+        lines[1].starts_with("{\"type\":\"metadata\",\"total_records\":1,"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn golden_ndjson_metadata_flags_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00cccc\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--format",
+            "ndjson",
+            "--max-strings",
+            "1",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last = stdout.lines().last().unwrap_or_default();
+    assert!(last.starts_with("{\"type\":\"metadata\""), "{stdout}");
+    assert!(last.contains("\"truncated\":true"), "{stdout}");
+}

@@ -32,6 +32,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `--dedupe` collapses repeated results: each unique string is emitted once
   with `count=<N>` and its first offset (text/json/json-tree). With
   `--detect-format rich`, findings are grouped by `(rule, value)`.
+- `--format ndjson` writes newline-delimited JSON: one self-contained record per
+  line with a `type` discriminator (`string`, `finding`, `magic`, `yara`, `xor`,
+  `entropy`) plus a trailing `{"type":"metadata"}` record with `total_records`,
+  `truncated` and `scanned_until`. It streams records instead of buffering a
+  JSON array, which keeps memory flat on multi-gigabyte dumps.
 - Auxiliary stages (`--magic-bytes`, `--yar`, `--brute-xor`, `--entropy`) now
   filter their output to the `--start`/`--end` window instead of reporting hits
   from the whole file.

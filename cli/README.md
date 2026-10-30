@@ -41,7 +41,11 @@ bxmap --help
 - `--progress` / `--no-progress` — show or hide a live status line on stderr
   (percent, MiB/s, scanned offset). Auto-enabled when stderr is a terminal and
   results are not going to the terminal.
-- `--format <text|json|json-tree>` — output format.
+- `--format <text|json|json-tree|ndjson>` — output format. `ndjson` emits one
+  JSON object per line with a `type` field (`string`, `finding`, `magic`,
+  `yara`, `xor`, `entropy`) and a final `{"type":"metadata",...}` line carrying
+  `total_records`, `truncated` and `scanned_until`. Prefer it for very large
+  dumps: it streams and avoids the array wrapper of `json`.
 - `--detect <list>` — IOC / credential triage.
 - `--detect-format <flat|rich>` — `rich` keeps the original text and adds
   `rule`, `confidence`, `severity` and `context` to every finding.
