@@ -729,3 +729,158 @@ fn golden_csv_rejects_auxiliary_stages() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--format csv supports strings"), "{stderr}");
 }
+
+#[test]
+fn golden_compact_json_is_single_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--format",
+            "json",
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim_end();
+    assert_eq!(trimmed.lines().count(), 1, "must be one line: {stdout}");
+    assert!(
+        trimmed.starts_with('[') && trimmed.ends_with(']'),
+        "{stdout}"
+    );
+    assert!(trimmed.contains("\"text\":\"aaaa\""), "{stdout}");
+    assert!(!trimmed.contains("\n  {"), "no indentation: {stdout}");
+}
+
+#[test]
+fn golden_compact_json_tree_is_single_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--format",
+            "json-tree",
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim_end();
+    assert_eq!(trimmed.lines().count(), 1, "must be one line: {stdout}");
+    assert!(trimmed.starts_with("{\"groups\":[{"), "{stdout}");
+    assert!(trimmed.contains("\"metadata\":"), "{stdout}");
+}
+
+/// Deterministic pseudo-random bytes: entropy is high enough for `--entropy`
+/// to report the block, without pulling in an RNG dependency.
+fn high_entropy_bytes(len: usize) -> Vec<u8> {
+    let mut state: u32 = 0x1234_5678;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn golden_entropy_no_data_omits_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, high_entropy_bytes(16 * 1024)).unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--entropy",
+            "--entropy-no-data",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"entropy\":"), "{stdout}");
+    assert!(
+        !stdout.contains("data_hex"),
+        "--entropy-no-data must omit data_hex: {stdout}"
+    );
+}
+
+#[test]
+fn golden_entropy_with_data_includes_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, high_entropy_bytes(16 * 1024)).unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--entropy",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"data_hex\":\""), "{stdout}");
+}
+
+#[test]
+fn golden_entropy_no_data_requires_entropy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--entropy-no-data",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--entropy-no-data requires --entropy"),
+        "{stderr}"
+    );
+}

@@ -56,6 +56,10 @@ bxmap --help
 - `--detect-format <flat|rich>` — `rich` keeps the original text and adds
   `rule`, `confidence`, `severity` and `context` to every finding.
 - `--auto-tune` — choose a worker count for this machine.
+- `--compact` — minify `json`/`json-tree` output: one line, no indentation.
+  Handy for large exports and for piping into other tools.
 - `--entropy` — report high-entropy regions.
+- `--entropy-no-data` — with `--entropy`, omit the `data_hex` payload and keep
+  only `offset`, `length` and `entropy`.
 
 For library usage see the crate README at <https://docs.rs/bxmap>.

@@ -101,8 +101,19 @@ enum Format {
 enum JsonLayout {
     /// Inside a pretty-printed array: `,\n` separator, two-space indent.
     Array,
+    /// Inside a minified array: `,` separator, no indent.
+    ArrayCompact,
     /// NDJSON: `\n` separator, no indent, plus a `type` discriminator.
     Lines,
+}
+
+/// Pick the record layout for the requested format and `--compact` flag.
+fn json_layout_for(format: Format, compact: bool) -> JsonLayout {
+    match format {
+        Format::Ndjson => JsonLayout::Lines,
+        _ if compact => JsonLayout::ArrayCompact,
+        _ => JsonLayout::Array,
+    }
 }
 
 /// Output sink: plain file/stdout, or gzip-compressed when the `-o` path ends
@@ -177,6 +188,7 @@ struct Args {
     max_strings: usize,
     progress: Option<bool>,
     dedupe: bool,
+    compact: bool,
     format: Format,
     detect_format: DetectFormat,
     encoding: Encoding,
@@ -185,6 +197,7 @@ struct Args {
     threads: usize,
     auto_tune: bool,
     entropy: bool,
+    entropy_no_data: bool,
     yar: Option<String>,
     brute_xor: Option<Vec<usize>>,
     parse_pid: bool,
@@ -245,6 +258,8 @@ OPTIONS:
     --no-progress        Disable the progress line.
     --dedupe             Emit each unique string once with `count=` and the
                            first offset. Buffers results in memory.
+    --compact            Minify json/json-tree output (no indentation or
+                           newlines). No effect on ndjson/csv/text.
     --format <text|json|json-tree|ndjson|csv>
                            Output format (default text). json-tree emits
                            grouped classification tree. ndjson emits one JSON
@@ -258,6 +273,7 @@ OPTIONS:
     --threads <N>        Parallel worker count
     --auto-tune          Choose a safe worker count for this machine
     --entropy            Scan and export high-entropy regions
+    --entropy-no-data    Omit the data_hex payload from entropy records
     --yar <PATH>         Compile and match a YARA/YARA-X rule file while streaming
     --brute-xor <1b;2b;3b>
                           Brute-force XOR candidates using selected key sizes
@@ -311,6 +327,7 @@ fn parse_args() -> Result<Args, String> {
         max_strings: MAX_STRINGS,
         progress: None,
         dedupe: false,
+        compact: false,
         format: Format::Text,
         detect_format: DetectFormat::Flat,
         encoding: Encoding::All,
@@ -319,6 +336,7 @@ fn parse_args() -> Result<Args, String> {
         threads: 1,
         auto_tune: false,
         entropy: false,
+        entropy_no_data: false,
         yar: None,
         brute_xor: None,
         parse_pid: false,
@@ -354,6 +372,7 @@ fn parse_args() -> Result<Args, String> {
             "--progress" => args.progress = Some(true),
             "--no-progress" => args.progress = Some(false),
             "--dedupe" => args.dedupe = true,
+            "--compact" => args.compact = true,
             "--max-str-len" => {
                 args.max_str_len = next(&mut i)?
                     .parse()
@@ -401,6 +420,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--auto-tune" => args.auto_tune = true,
             "--entropy" => args.entropy = true,
+            "--entropy-no-data" => args.entropy_no_data = true,
             "--yar" => args.yar = Some(next(&mut i)?),
             "--brute-xor" => {
                 let value = next(&mut i)?;
@@ -822,11 +842,13 @@ fn json_record_open(
     if *result_count > 0 {
         match layout {
             JsonLayout::Array => writeln!(writer, ",")?,
+            JsonLayout::ArrayCompact => write!(writer, ",")?,
             JsonLayout::Lines => writeln!(writer)?,
         }
     }
     match (layout, record_type) {
         (JsonLayout::Array, _) => write!(writer, "  {{")?,
+        (JsonLayout::ArrayCompact, _) => write!(writer, "{{")?,
         (JsonLayout::Lines, Some(kind)) => write!(writer, "{{\"type\":\"{kind}\",")?,
         (JsonLayout::Lines, None) => write!(writer, "{{")?,
     }
@@ -839,16 +861,18 @@ fn write_entropy_json(
     writer: &mut dyn Write,
     result_count: &mut usize,
     layout: JsonLayout,
+    include_data: bool,
 ) -> io::Result<()> {
     json_record_open(writer, result_count, layout, Some("entropy"))?;
     write!(
         writer,
-        "\"group\":\"Undefined\",\"offset\":{},\"length\":{},\"entropy\":{:.6},\"data_hex\":{}}}",
-        region.offset,
-        region.length,
-        region.entropy,
-        json_escape(&hex_encode(data))
+        "\"group\":\"Undefined\",\"offset\":{},\"length\":{},\"entropy\":{:.6}",
+        region.offset, region.length, region.entropy
     )?;
+    if include_data {
+        write!(writer, ",\"data_hex\":{}", json_escape(&hex_encode(data)))?;
+    }
+    write!(writer, "}}")?;
     *result_count += 1;
     Ok(())
 }
@@ -872,15 +896,17 @@ fn write_entropy_text(
     region: EntropyRegion,
     data: &[u8],
     writer: &mut dyn Write,
+    include_data: bool,
 ) -> io::Result<()> {
-    writeln!(
+    write!(
         writer,
-        "{:#010x}\tUndefined\tlength={}\tentropy={:.6}\tdata_hex={}",
-        region.offset,
-        region.length,
-        region.entropy,
-        hex_encode(data)
-    )
+        "{:#010x}\tUndefined\tlength={}\tentropy={:.6}",
+        region.offset, region.length, region.entropy
+    )?;
+    if include_data {
+        write!(writer, "\tdata_hex={}", hex_encode(data))?;
+    }
+    writeln!(writer)
 }
 
 fn write_yara_text(rule: &bxmap::YaraMatch, writer: &mut dyn Write) -> io::Result<()> {
@@ -1962,6 +1988,7 @@ fn record_result(
     parse_pid: bool,
     max_str_len: usize,
     count: Option<usize>,
+    compact: bool,
 ) -> io::Result<()> {
     match format {
         Format::Text => {
@@ -1984,12 +2011,14 @@ fn record_result(
             writeln!(writer)?;
         }
         Format::Json | Format::Ndjson => {
-            let layout = if format == Format::Ndjson {
-                JsonLayout::Lines
-            } else {
-                JsonLayout::Array
-            };
-            write_string_json(&result, writer, result_count, parse_pid, count, layout)?;
+            write_string_json(
+                &result,
+                writer,
+                result_count,
+                parse_pid,
+                count,
+                json_layout_for(format, compact),
+            )?;
         }
         Format::JsonTree => {
             // handled separately in main(); no-op here
@@ -2014,6 +2043,7 @@ fn record_finding(
     result_count: &mut usize,
     max_str_len: usize,
     count: Option<usize>,
+    compact: bool,
 ) -> io::Result<()> {
     match format {
         Format::Text => {
@@ -2035,11 +2065,7 @@ fn record_finding(
             writeln!(writer)?;
         }
         Format::Json | Format::Ndjson => {
-            let layout = if format == Format::Ndjson {
-                JsonLayout::Lines
-            } else {
-                JsonLayout::Array
-            };
+            let layout = json_layout_for(format, compact);
             json_record_open(writer, result_count, layout, Some("finding"))?;
             write!(
                 writer,
@@ -2076,6 +2102,7 @@ fn write_results(
     parse_pid: bool,
     max_str_len: usize,
     counts: Option<&std::collections::HashMap<String, usize>>,
+    compact: bool,
 ) -> io::Result<()> {
     match format {
         Format::Text => {
@@ -2106,21 +2133,20 @@ fn write_results(
             }
         }
         Format::Json | Format::Ndjson => {
-            let layout = if format == Format::Ndjson {
-                JsonLayout::Lines
-            } else {
-                JsonLayout::Array
-            };
-            if layout == JsonLayout::Array {
-                writeln!(writer, "[")?;
+            let layout = json_layout_for(format, compact);
+            match layout {
+                JsonLayout::Array => writeln!(writer, "[")?,
+                JsonLayout::ArrayCompact => write!(writer, "[")?,
+                JsonLayout::Lines => {}
             }
             let mut result_count = 0;
             for result in results {
                 let count = counts.and_then(|map| map.get(&result.text).copied());
                 write_string_json(result, writer, &mut result_count, parse_pid, count, layout)?;
             }
-            if layout == JsonLayout::Array {
-                writeln!(writer, "]")?;
+            match layout {
+                JsonLayout::Array | JsonLayout::ArrayCompact => writeln!(writer, "]")?,
+                JsonLayout::Lines => {}
             }
         }
         Format::JsonTree => {}
@@ -2234,6 +2260,9 @@ fn run() -> Result<(), String> {
         if args.format == Format::JsonTree {
             return Err("--detect-format rich supports --format text or json".to_string());
         }
+    }
+    if args.entropy_no_data && !args.entropy {
+        return Err("--entropy-no-data requires --entropy".to_string());
     }
     if args.format == Format::Csv
         && (args.magic_bytes || args.yar.is_some() || args.brute_xor.is_some() || args.entropy)
@@ -2349,17 +2378,18 @@ fn run() -> Result<(), String> {
     }
     if (threads == 1 || range_active) && args.format != Format::JsonTree && !args.dedupe {
         let mut writer = Sink::open(args.output.as_deref())?;
+        let json_layout = json_layout_for(args.format, args.compact);
         if args.format == Format::Json {
-            writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
+            match json_layout {
+                JsonLayout::Array => {
+                    writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?
+                }
+                _ => write!(writer, "[").map_err(|e| format!("write failed: {e}"))?,
+            }
         }
         if args.format == Format::Csv {
             write_csv_header(&mut writer).map_err(|e| format!("write failed: {e}"))?;
         }
-        let json_layout = if args.format == Format::Ndjson {
-            JsonLayout::Lines
-        } else {
-            JsonLayout::Array
-        };
         let mut result_count = 0;
         let mut short = 0;
         let mut medium = 0;
@@ -2398,6 +2428,7 @@ fn run() -> Result<(), String> {
                             &mut result_count,
                             args.max_str_len,
                             None,
+                            args.compact,
                         ) {
                             write_error = Some(error);
                         }
@@ -2418,6 +2449,7 @@ fn run() -> Result<(), String> {
                                 args.parse_pid,
                                 args.max_str_len,
                                 None,
+                                args.compact,
                             ) {
                                 write_error = Some(error);
                             }
@@ -2499,6 +2531,7 @@ fn run() -> Result<(), String> {
                                 &mut writer,
                                 &mut json_count,
                                 json_layout,
+                                !args.entropy_no_data,
                             ) {
                                 write_error = Some(error);
                             }
@@ -2510,11 +2543,17 @@ fn run() -> Result<(), String> {
             if let Some(error) = write_error {
                 return Err(format!("write failed: {error}"));
             }
-            if args.format == Format::Ndjson {
-                write_ndjson_metadata(&mut writer, json_count, truncated, last_offset)
-                    .map_err(|e| format!("write failed: {e}"))?;
-            } else {
-                writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
+            match json_layout {
+                JsonLayout::Lines => {
+                    write_ndjson_metadata(&mut writer, json_count, truncated, last_offset)
+                        .map_err(|e| format!("write failed: {e}"))?
+                }
+                JsonLayout::Array => {
+                    writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?
+                }
+                JsonLayout::ArrayCompact => {
+                    writeln!(writer, "]").map_err(|e| format!("write failed: {e}"))?
+                }
             }
         } else {
             for matched in &yara_matches {
@@ -2537,7 +2576,9 @@ fn run() -> Result<(), String> {
                     ENTROPY_THRESHOLD,
                     |region, data| {
                         if write_error.is_none() {
-                            if let Err(error) = write_entropy_text(region, data, &mut writer) {
+                            if let Err(error) =
+                                write_entropy_text(region, data, &mut writer, !args.entropy_no_data)
+                            {
                                 write_error = Some(error);
                             }
                         }
@@ -2664,15 +2705,22 @@ fn run() -> Result<(), String> {
                 &mut result_count,
                 args.max_str_len,
                 if args.dedupe { Some(*count) } else { None },
+                args.compact,
             )
             .map_err(|e| format!("write failed: {e}"))?;
         }
-        if json_layout == JsonLayout::Lines {
-            let last_offset = raw_results.iter().map(|r| r.offset).max().unwrap_or(0);
-            write_ndjson_metadata(&mut writer, result_count, truncated, last_offset)
-                .map_err(|e| format!("write failed: {e}"))?;
-        } else if args.format == Format::Json {
-            writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
+        match json_layout {
+            JsonLayout::Lines => {
+                let last_offset = raw_results.iter().map(|r| r.offset).max().unwrap_or(0);
+                write_ndjson_metadata(&mut writer, result_count, truncated, last_offset)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
+            JsonLayout::Array => {
+                writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?
+            }
+            JsonLayout::ArrayCompact => {
+                writeln!(writer, "]").map_err(|e| format!("write failed: {e}"))?
+            }
         }
         writer.finish().map_err(|e| format!("write failed: {e}"))?;
         if let Some(path) = args.output {
@@ -2734,22 +2782,29 @@ fn run() -> Result<(), String> {
             };
             groups.entry((g, t)).or_default().push(r);
         }
-        let mut out = String::from("{\"groups\":[\n");
+        // Pretty output keeps the readable tree; `--compact` emits the same
+        // structure on one line for smaller files.
+        let (sep, item_indent, group_indent, nl) = if args.compact {
+            (",", "", "", "")
+        } else {
+            (",\n", "    ", "  ", "\n")
+        };
+        let mut out = format!("{{\"groups\":[{nl}");
         let mut first_group = true;
         for ((g, t), items) in &groups {
             if !first_group {
-                out.push_str(",\n");
+                out.push_str(sep);
             }
             first_group = false;
             out.push_str(&format!(
-                "  {{\"group\":{},\"type\":{},\"items\":[\n",
+                "{group_indent}{{\"group\":{},\"type\":{},\"items\":[{nl}",
                 json_escape(g),
                 json_escape(t)
             ));
             let mut first_item = true;
             for r in items {
                 if !first_item {
-                    out.push_str(",\n");
+                    out.push_str(sep);
                 }
                 first_item = false;
                 let ent = bxmap::classifier::entropy_of(&r.text);
@@ -2772,7 +2827,7 @@ fn run() -> Result<(), String> {
                     .map(|count| format!(",\"count\":{count}"))
                     .unwrap_or_default();
                 out.push_str(&format!(
-                    "    {{\"text\":{},\"offset\":{},\"entropy\":{:.4}{}{}}}",
+                    "{item_indent}{{\"text\":{},\"offset\":{},\"entropy\":{:.4}{}{}}}",
                     json_escape(&r.text),
                     r.offset,
                     ent,
@@ -2780,15 +2835,18 @@ fn run() -> Result<(), String> {
                     count_part
                 ));
             }
-            out.push_str("\n  ]}");
+            out.push_str(&format!("{nl}{group_indent}]}}"));
         }
         let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
         out.push_str(&format!(
-            "\n],\"metadata\":{{\"total_strings\":{},\"truncated\":{},\"scanned_until\":{}}}\n}}\n",
+            "{nl}],\"metadata\":{{\"total_strings\":{},\"truncated\":{},\"scanned_until\":{}}}{nl}}}{nl}",
             results.len(),
             truncated,
             last_offset
         ));
+        if args.compact {
+            out.push('\n');
+        }
         write!(writer, "{}", out).map_err(|e| format!("write failed: {e}"))?;
         writer.finish().map_err(|e| format!("write failed: {e}"))?;
         if let Some(path) = output_path.clone() {
@@ -2813,13 +2871,13 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if args.format == Format::Json || args.format == Format::Ndjson {
-        let json_layout = if args.format == Format::Ndjson {
-            JsonLayout::Lines
-        } else {
-            JsonLayout::Array
-        };
-        if json_layout == JsonLayout::Array {
-            writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
+        let json_layout = json_layout_for(args.format, args.compact);
+        match json_layout {
+            JsonLayout::Array => writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?,
+            JsonLayout::ArrayCompact => {
+                write!(writer, "[").map_err(|e| format!("write failed: {e}"))?
+            }
+            JsonLayout::Lines => {}
         }
         let mut json_count = 0;
         for result in &results {
@@ -2863,9 +2921,14 @@ fn run() -> Result<(), String> {
                     {
                         return;
                     }
-                    if let Err(error) =
-                        write_entropy_json(region, data, &mut writer, &mut json_count, json_layout)
-                    {
+                    if let Err(error) = write_entropy_json(
+                        region,
+                        data,
+                        &mut writer,
+                        &mut json_count,
+                        json_layout,
+                        !args.entropy_no_data,
+                    ) {
                         entropy_write_error = Some(error);
                     }
                 },
@@ -2875,12 +2938,18 @@ fn run() -> Result<(), String> {
                 return Err(format!("write failed: {error}"));
             }
         }
-        if json_layout == JsonLayout::Lines {
-            let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
-            write_ndjson_metadata(&mut writer, results.len(), truncated, last_offset)
-                .map_err(|e| format!("write failed: {e}"))?;
-        } else {
-            writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
+        match json_layout {
+            JsonLayout::Lines => {
+                let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
+                write_ndjson_metadata(&mut writer, results.len(), truncated, last_offset)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
+            JsonLayout::Array => {
+                writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?
+            }
+            JsonLayout::ArrayCompact => {
+                writeln!(writer, "]").map_err(|e| format!("write failed: {e}"))?
+            }
         }
     } else {
         write_results(
@@ -2890,6 +2959,7 @@ fn run() -> Result<(), String> {
             args.parse_pid,
             args.max_str_len,
             counts.as_ref(),
+            args.compact,
         )
         .map_err(|e| format!("write failed: {e}"))?;
         for matched in &yara_matches {
@@ -2916,7 +2986,9 @@ fn run() -> Result<(), String> {
                     {
                         return;
                     }
-                    if let Err(error) = write_entropy_text(region, data, &mut writer) {
+                    if let Err(error) =
+                        write_entropy_text(region, data, &mut writer, !args.entropy_no_data)
+                    {
                         entropy_write_error = Some(error);
                     }
                 },

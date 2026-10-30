@@ -93,13 +93,13 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 - [ ] Mở rộng noise filter ngoài chu kỳ 1–2: chu kỳ N, độ đa dạng ký tự thấp, điểm n-gram để loại chuỗi rác/ngẫu nhiên.
 - [x] `--dedupe`: chuỗi duy nhất kèm số lần xuất hiện + offset đầu tiên. Áp dụng cho `text`/`json`/`json-tree`; với `--detect-format rich` thì gộp theo `(rule, value)`.
 - [ ] **Lọc rác nhị phân/bảng hệ thống** (Lab 4: 820 nghìn chuỗi ASCII, phần lớn là bảng ACPI `FACP`/`DSDT`/`VBOXBIOS` và dữ liệu nhị phân ở đầu dump): điểm "độ giống văn bản", loại chuỗi có tỉ lệ ký tự không in cao hoặc entropy ký tự lạ.
-- [~] **Output gọn:** JSON pretty-print của 1,9 triệu bản ghi nặng 160 MB. Đã có `--format ndjson` (một record/dòng, có `type` + dòng `metadata`) và nén gzip tự động khi `-o` kết thúc bằng `.gz`. Còn lại: `--compact`, `.zst`, và tùy chọn bỏ trường không cần.
+- [~] **Output gọn:** JSON pretty-print của 1,9 triệu bản ghi nặng 160 MB. Đã có `--format ndjson` (một record/dòng, có `type` + dòng `metadata`), `--compact` (json/json-tree một dòng) và nén gzip tự động khi `-o` kết thúc bằng `.gz`. Còn lại: `.zst`, và tùy chọn bỏ trường không cần.
 - [ ] Giữ mặc định bảo thủ (không làm mất bằng chứng ngắn như `0000`); mọi bộ lọc mới đều opt-in hoặc có cờ tắt.
 
 ### 4.2 Entropy
 - [ ] Kích thước cửa sổ và ngưỡng cấu hình được.
 - [ ] Gộp các vùng entropy cao liền kề thành một record.
-- [ ] `--entropy-no-data` / giới hạn kích thước `data_hex` để output không phình.
+- [~] `--entropy-no-data` / giới hạn kích thước `data_hex` để output không phình. (`--entropy-no-data` đã xong; còn giới hạn kích thước `data_hex`.)
 
 ### 4.3 IOC / secret
 - [ ] Validate để giảm false positive: checksum Base58Check/Bech32 (ví crypto), Luhn, cấu trúc JWT (decode header/payload), độ dài và prefix theo từng nhà cung cấp.

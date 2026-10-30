@@ -44,6 +44,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`type,offset,encoding,text,rule,value,severity,confidence,context,count,pid`).
   Strings and rich findings are supported; combining it with `--magic-bytes`,
   `--yar`, `--brute-xor` or `--entropy` is rejected, use json/ndjson for those.
+- `--compact` minifies `--format json` / `json-tree` output (no indentation or
+  newlines), which keeps large exports smaller and easier to pipe.
+- `--entropy-no-data` omits the `data_hex` payload from `--entropy` records, so
+  the report stays small when only offsets/lengths/entropy are needed.
 - Errors are printed as `Error: <message>` without the `Debug` quoting.
 - `-o out.json.gz` gzip-compresses output on the fly (any `--format`). The
   gzip trailer is written even when the scan exits early with truncation.
