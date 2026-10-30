@@ -1,7 +1,7 @@
 use bxmap::{
-    extract_strings_from_file_parallel, extract_strings_from_file_parallel_with_encodings,
-    extract_strings_from_file_streaming, extract_strings_from_file_streaming_with_encodings,
-    extract_strings_from_file_with_noise_config,
+    extract_strings_from_file_parallel_with_encodings,
+    extract_strings_from_file_streaming_range_with_encodings,
+    extract_strings_from_file_streaming_with_encodings,
     extract_strings_from_file_with_noise_config_and_encodings,
     scan_entropy_from_file_streaming_with_data, scan_yara_from_file_streaming, EncodingFilter,
     EntropyRegion, ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
@@ -102,6 +102,8 @@ enum DetectFormat {
 
 struct Args {
     path: String,
+    start: Option<u64>,
+    end: Option<u64>,
     min_len: usize,
     max_str_len: usize,
     max_strings: usize,
@@ -163,6 +165,11 @@ OPTIONS:
     --max-str-len <N>    Truncate very long strings to N chars in output (default unlimited)
     --max-strings <N>    Maximum results (default 200000; 0 = unlimited)
                            Exits 3 with a warning when the limit truncates the scan.
+    --start <OFFSET>     Only emit strings that start at or after this byte
+                           offset (decimal or 0x hex). Forces the sequential
+                           streaming scanner.
+    --end <OFFSET>       Only emit strings that start before this byte offset
+                           (decimal or 0x hex).
     --format <text|json|json-tree>
                            Output format (default text). json-tree emits
                            grouped classification tree.
@@ -198,6 +205,19 @@ OPTIONS:
     -h, --help           Show this help
 ";
 
+fn parse_offset(value: &str, flag: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else {
+        trimmed.parse::<u64>()
+    };
+    parsed.map_err(|_| format!("invalid {flag} offset '{value}' (use decimal or 0x hex)"))
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut values = std::env::args().skip(1).collect::<Vec<_>>();
     if values.is_empty() || values.iter().any(|v| v == "-h" || v == "--help") {
@@ -207,6 +227,8 @@ fn parse_args() -> Result<Args, String> {
     let path = values.remove(0);
     let mut args = Args {
         path,
+        start: None,
+        end: None,
         min_len: MIN_STRING_LEN,
         max_str_len: 0,
         max_strings: MAX_STRINGS,
@@ -248,6 +270,8 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "invalid --min-len".to_string())?
             }
+            "--start" => args.start = Some(parse_offset(&next(&mut i)?, "--start")?),
+            "--end" => args.end = Some(parse_offset(&next(&mut i)?, "--end")?),
             "--max-str-len" => {
                 args.max_str_len = next(&mut i)?
                     .parse()
@@ -364,6 +388,13 @@ fn parse_args() -> Result<Args, String> {
     if args.max_strings == 0 {
         // 0 means "no limit"; internal code uses usize::MAX as the sentinel.
         args.max_strings = usize::MAX;
+    }
+    if let (Some(start), Some(end)) = (args.start, args.end) {
+        if start >= end {
+            return Err(format!(
+                "--start ({start:#x}) must be less than --end ({end:#x})"
+            ));
+        }
     }
     Ok(args)
 }
@@ -1420,13 +1451,12 @@ mod tests {
     }
 
     #[test]
-    fn truncation_info_only_reports_early_stops() {
-        assert!(super::truncation_info(10, 10, 50, 1000).is_some());
-        assert!(super::truncation_info(11, 10, 50, 1000).is_some());
-        assert!(super::truncation_info(9, 10, 50, 1000).is_none());
-        assert!(super::truncation_info(10, 10, 999, 1000).is_none());
-        assert!(super::truncation_info(10, usize::MAX, 50, 1000).is_none());
-        assert!(super::truncation_info(10, 10, 50, 0).is_none());
+    fn result_limit_only_fires_when_the_probe_result_is_returned() {
+        // Scanner asked for max+1: exactly max means EOF was reached.
+        assert!(!super::hit_result_limit(10, 10));
+        assert!(super::hit_result_limit(11, 10));
+        assert!(!super::hit_result_limit(9, 10));
+        assert!(!super::hit_result_limit(usize::MAX, usize::MAX));
     }
 
     #[test]
@@ -1483,42 +1513,31 @@ fn print_banner(path: &str, size: u64, format: Format) {
     eprintln!("  \x1b[1;34m[..] scanning\x1b[0m");
 }
 
-fn truncation_info(
-    result_count: usize,
-    max_strings: usize,
-    last_offset: u64,
-    size: u64,
-) -> Option<f64> {
-    if max_strings == 0 || max_strings == usize::MAX || result_count < max_strings || size == 0 {
-        return None;
-    }
-    // Reaching the limit at the very end of the file is not truncation.
-    if last_offset.saturating_add(1) >= size {
-        return None;
-    }
-    let pct = last_offset as f64 * 100.0 / size as f64;
-    Some(pct)
-}
-
 /// Print a truncation warning when the result limit stopped the scan early.
-/// Returns true when the output is incomplete.
-fn print_truncation_notice(
-    result_count: usize,
-    max_strings: usize,
-    last_offset: u64,
-    size: u64,
-) -> bool {
-    let Some(pct) = truncation_info(result_count, max_strings, last_offset, size) else {
-        return false;
+///
+/// `last_absolute` is the absolute offset of the last emitted string and
+/// `range_start`/`span` describe the scanned window (the whole file when no
+/// `--start`/`--end` was given).
+fn print_truncation_notice(max_strings: usize, last_absolute: u64, range_start: u64, span: u64) {
+    let relative = last_absolute.saturating_sub(range_start);
+    let pct = if span == 0 {
+        100.0
+    } else {
+        relative as f64 * 100.0 / span as f64
     };
     eprintln!(
-        "  [!] TRUNCATED: reached --max-strings {max_strings} near offset {last_offset:#x} (~{pct:.1}% of the file)."
+        "  [!] TRUNCATED: reached --max-strings {max_strings} near offset {last_absolute:#x} (~{pct:.1}% of the scanned range)."
     );
     eprintln!("      The remaining data was NOT scanned; results are incomplete.");
     eprintln!(
         "      Re-run with a larger --max-strings (0 = unlimited) to cover the entire input."
     );
-    true
+}
+
+/// True when the scanner returned one more result than requested, which means
+/// the `--max-strings` cap (not EOF) stopped the scan.
+fn hit_result_limit(result_count: usize, max_strings: usize) -> bool {
+    max_strings != usize::MAX && result_count > max_strings
 }
 
 fn print_report(
@@ -1841,6 +1860,24 @@ fn main() -> Result<(), String> {
     let file_size = std::fs::metadata(&args.path)
         .map_err(|e| format!("cannot inspect '{}': {e}", args.path))?
         .len();
+    let range_active = args.start.is_some() || args.end.is_some();
+    let range_start = args.start.unwrap_or(0);
+    let range_end = args.end.unwrap_or(file_size);
+    if range_active && range_start >= file_size {
+        return Err(format!(
+            "--start ({range_start:#x}) is beyond the end of the input ({file_size:#x})"
+        ));
+    }
+    if range_start >= range_end {
+        return Err(format!(
+            "--start ({range_start:#x}) must be less than --end ({range_end:#x})"
+        ));
+    }
+    let range_end = range_end.min(file_size);
+    let scan_span = range_end.saturating_sub(range_start);
+    // Ask the scanner for one extra result so we can tell "hit the cap" from
+    // "finished the file at exactly the cap".
+    let internal_limit = args.max_strings.saturating_add(1);
     print_banner(&args.path, file_size, args.format);
     let threads = if args.auto_tune {
         let cpus = std::thread::available_parallelism()
@@ -1911,7 +1948,7 @@ fn main() -> Result<(), String> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    if threads == 1 && args.format != Format::JsonTree {
+    if (threads == 1 || range_active) && args.format != Format::JsonTree {
         let mut writer: Box<dyn Write> = match args.output.as_ref() {
             Some(path) => Box::new(BufWriter::new(
                 File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
@@ -1928,62 +1965,83 @@ fn main() -> Result<(), String> {
         let mut important = Vec::new();
         let mut write_error = None;
         let mut last_offset = 0u64;
-        extract_strings_from_file_streaming_with_encodings(
-            &args.path,
-            args.min_len,
-            args.max_strings,
-            noise,
-            enc_filter,
-            |result| {
-                if write_error.is_some() {
-                    return;
-                }
-                last_offset = last_offset.max(result.offset);
-                if matches!(args.encoding, Encoding::All)
-                    || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
-                    || (args.encoding == Encoding::Utf16
-                        && (result.encoding == "utf16le" || result.encoding == "utf16be"))
-                    || (args.encoding == Encoding::Utf32
-                        && (result.encoding == "utf32le" || result.encoding == "utf32be"))
-                {
-                    if args.detect_format == DetectFormat::Rich {
-                        let findings = detect_findings(&result, &args.detectors);
-                        for finding in &findings {
-                            if let Err(error) = record_finding(
-                                finding,
+        let mut raw_count = 0usize;
+        let mut truncated = false;
+        let mut handle = |result: ExtractedString| {
+            if write_error.is_some() {
+                return;
+            }
+            raw_count += 1;
+            if raw_count > args.max_strings {
+                truncated = true;
+                return;
+            }
+            last_offset = last_offset.max(result.offset);
+            if matches!(args.encoding, Encoding::All)
+                || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
+                || (args.encoding == Encoding::Utf16
+                    && (result.encoding == "utf16le" || result.encoding == "utf16be"))
+                || (args.encoding == Encoding::Utf32
+                    && (result.encoding == "utf32le" || result.encoding == "utf32be"))
+            {
+                if args.detect_format == DetectFormat::Rich {
+                    let findings = detect_findings(&result, &args.detectors);
+                    for finding in &findings {
+                        if let Err(error) = record_finding(
+                            finding,
+                            &mut writer,
+                            args.format,
+                            &mut result_count,
+                            args.max_str_len,
+                        ) {
+                            write_error = Some(error);
+                        }
+                    }
+                    update_stats(&result, &mut short, &mut medium, &mut long, &mut important);
+                } else {
+                    for result in apply_detectors(result, &args.detectors) {
+                        if matches_filter(filter_regex.as_ref(), &result.text) {
+                            if let Err(error) = record_result(
+                                result,
                                 &mut writer,
                                 args.format,
                                 &mut result_count,
+                                &mut short,
+                                &mut medium,
+                                &mut long,
+                                &mut important,
+                                args.parse_pid,
                                 args.max_str_len,
                             ) {
                                 write_error = Some(error);
                             }
                         }
-                        update_stats(&result, &mut short, &mut medium, &mut long, &mut important);
-                    } else {
-                        for result in apply_detectors(result, &args.detectors) {
-                            if matches_filter(filter_regex.as_ref(), &result.text) {
-                                if let Err(error) = record_result(
-                                    result,
-                                    &mut writer,
-                                    args.format,
-                                    &mut result_count,
-                                    &mut short,
-                                    &mut medium,
-                                    &mut long,
-                                    &mut important,
-                                    args.parse_pid,
-                                    args.max_str_len,
-                                ) {
-                                    write_error = Some(error);
-                                }
-                            }
-                        }
                     }
                 }
-            },
-        )
-        .map_err(|e| format!("scan failed: {e}"))?;
+            }
+        };
+        let scan_result = if range_active {
+            extract_strings_from_file_streaming_range_with_encodings(
+                &args.path,
+                range_start,
+                range_end,
+                args.min_len,
+                internal_limit,
+                noise,
+                enc_filter,
+                &mut handle,
+            )
+        } else {
+            extract_strings_from_file_streaming_with_encodings(
+                &args.path,
+                args.min_len,
+                internal_limit,
+                noise,
+                enc_filter,
+                &mut handle,
+            )
+        };
+        scan_result.map_err(|e| format!("scan failed: {e}"))?;
         if let Some(error) = write_error {
             return Err(format!("write failed: {error}"));
         }
@@ -2073,13 +2131,29 @@ fn main() -> Result<(), String> {
             start.elapsed().as_secs_f64(),
             threads,
         );
-        if print_truncation_notice(result_count, args.max_strings, last_offset, file_size) {
+        if truncated {
+            print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
         }
         return Ok(());
     }
 
-    let results = if threads > 1 {
+    let mut results = if range_active {
+        // Ranges always use the sequential range scanner; collect into a Vec
+        // because the json-tree / buffered paths need the full result set.
+        let mut collected: Vec<ExtractedString> = Vec::new();
+        extract_strings_from_file_streaming_range_with_encodings(
+            &args.path,
+            range_start,
+            range_end,
+            args.min_len,
+            internal_limit,
+            noise,
+            enc_filter,
+            |result| collected.push(result),
+        )
+        .map(|_| collected)
+    } else if threads > 1 {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -2088,7 +2162,7 @@ fn main() -> Result<(), String> {
             extract_strings_from_file_parallel_with_encodings(
                 &args.path,
                 args.min_len,
-                args.max_strings,
+                internal_limit,
                 noise,
                 enc_filter,
             )
@@ -2097,12 +2171,17 @@ fn main() -> Result<(), String> {
         extract_strings_from_file_with_noise_config_and_encodings(
             &args.path,
             args.min_len,
-            args.max_strings,
+            internal_limit,
             noise,
             enc_filter,
         )
     }
     .map_err(|e| format!("scan failed: {e}"))?;
+    let truncated = hit_result_limit(results.len(), args.max_strings);
+    if truncated {
+        // Drop the probe result that told us the cap was hit.
+        results.truncate(args.max_strings);
+    }
     let raw_results: Vec<ExtractedString> = results
         .into_iter()
         .filter(|result| match args.encoding {
@@ -2171,12 +2250,9 @@ fn main() -> Result<(), String> {
             start.elapsed().as_secs_f64(),
             threads,
         );
-        if print_truncation_notice(
-            raw_results.len(),
-            args.max_strings,
-            raw_results.iter().map(|r| r.offset).max().unwrap_or(0),
-            file_size,
-        ) {
+        if truncated {
+            let last_offset = raw_results.iter().map(|r| r.offset).max().unwrap_or(0);
+            print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
         }
         return Ok(());
@@ -2253,8 +2329,6 @@ fn main() -> Result<(), String> {
             out.push_str("\n  ]}");
         }
         let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
-        let truncated =
-            truncation_info(results.len(), args.max_strings, last_offset, file_size).is_some();
         out.push_str(&format!(
             "\n],\"metadata\":{{\"total_strings\":{},\"truncated\":{},\"scanned_until\":{}}}\n}}\n",
             results.len(),
@@ -2278,12 +2352,8 @@ fn main() -> Result<(), String> {
             start.elapsed().as_secs_f64(),
             threads,
         );
-        if print_truncation_notice(
-            results.len(),
-            args.max_strings,
-            results.iter().map(|r| r.offset).max().unwrap_or(0),
-            file_size,
-        ) {
+        if truncated {
+            print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
         }
         return Ok(());
@@ -2403,12 +2473,9 @@ fn main() -> Result<(), String> {
         start.elapsed().as_secs_f64(),
         threads,
     );
-    if print_truncation_notice(
-        results.len(),
-        args.max_strings,
-        results.iter().map(|r| r.offset).max().unwrap_or(0),
-        file_size,
-    ) {
+    if truncated {
+        let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
+        print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
         std::process::exit(3);
     }
     Ok(())

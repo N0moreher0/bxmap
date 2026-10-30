@@ -23,10 +23,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Generic-secret false positives are filtered: identifiers (`GetTokenInformation`,
   `Malloc`, `DigiCert`), keywords (`true`/`false`/`undefined`), JavaScript
   fragments and known .NET `publicKeyToken` values are no longer reported.
+- `--start <offset>` / `--end <offset>` to scan only a byte range (decimal or
+  `0x` hex). The new `extract_strings_from_file_streaming_range_with_encodings`
+  API reads `MAX_RUN_CHARS` of overlap on each side so strings crossing a
+  boundary stay intact, and only emits strings that start inside the range.
+- Truncation detection now asks the scanner for one extra result, so a scan that
+  ends exactly at `--max-strings` is no longer reported as truncated.
 
 ### Changed
 - `apply_detectors` allocates output capacity up front and clones lazily.
 - Flat detector output (`--detect-format flat`, default) is unchanged.
+- `--start`/`--end` force the sequential streaming scanner even when
+  `--threads` is greater than 1.
 
 ## [1.0.14] - 2026-10-30 (`bxmap-cli`)
 

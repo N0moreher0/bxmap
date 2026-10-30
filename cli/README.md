@@ -26,6 +26,12 @@ bxmap --help
 - `--max-str-len <N>` — truncate very long strings in output.
 - `--max-strings <N>` — maximum results (default 200000; `0` = unlimited).
   When the limit stops the scan early the CLI warns and exits with code `3`.
+- `--start <OFFSET>` / `--end <OFFSET>` — scan only the byte range
+  `[start, end)` (decimal or `0x` hex). Use this to split a large dump across
+  several processes. Strings that cross a boundary are still read in full
+  (the scanner overlaps by `MAX_RUN_CHARS` on each side), but only strings
+  whose start offset falls inside the range are emitted. A range forces the
+  sequential streaming scanner even with `--threads`.
 - `--format <text|json|json-tree>` — output format.
 - `--detect <list>` — IOC / credential triage.
 - `--detect-format <flat|rich>` — `rich` keeps the original text and adds
