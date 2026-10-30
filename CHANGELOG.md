@@ -16,6 +16,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `confidence`, `severity`, `context` and the original `text` preserved.
 - `classifier::DetectedFinding`, `SecretFinding` and `detect_secrets_detailed`
   for library users that need match spans and provenance.
+- `--max-strings 0` now means unlimited.
+- Truncation is no longer silent: the CLI prints a clear warning and exits with
+  code `3` when `--max-strings` stops the scan early; `json-tree` metadata also
+  reports `truncated` and `scanned_until`.
 
 ### Changed
 - `apply_detectors` allocates output capacity up front and clones lazily.

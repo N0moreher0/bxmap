@@ -24,6 +24,8 @@ bxmap --help
 - `--encoding <all|ascii|utf16|utf32>` — restrict extracted strings by encoding.
 - `--min-len <N>` — minimum string length.
 - `--max-str-len <N>` — truncate very long strings in output.
+- `--max-strings <N>` — maximum results (default 200000; `0` = unlimited).
+  When the limit stops the scan early the CLI warns and exits with code `3`.
 - `--format <text|json|json-tree>` — output format.
 - `--detect <list>` — IOC / credential triage.
 - `--detect-format <flat|rich>` — `rich` keeps the original text and adds

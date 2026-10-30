@@ -185,3 +185,56 @@ fn golden_rich_detector_text_is_one_line_per_finding() {
     assert!(stdout.contains("sev=high"), "{stdout}");
     assert!(stdout.contains("value=AKIAIOSFODNN7EXAMPLE"), "{stdout}");
 }
+
+#[test]
+fn golden_max_strings_truncation_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00cccc\x00dddd\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--max-strings",
+            "1",
+            "--encoding",
+            "ascii",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("TRUNCATED"), "{stderr}");
+    assert!(stderr.contains("--max-strings (0 = unlimited)"), "{stderr}");
+}
+
+#[test]
+fn golden_max_strings_zero_means_unlimited() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00cccc\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--max-strings",
+            "0",
+            "--encoding",
+            "ascii",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().count(), 3, "{stdout}");
+}

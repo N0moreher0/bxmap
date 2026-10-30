@@ -161,7 +161,8 @@ USAGE:
 OPTIONS:
     --min-len <N>        Minimum string length (default 4)
     --max-str-len <N>    Truncate very long strings to N chars in output (default unlimited)
-    --max-strings <N>    Maximum results (default 200000)
+    --max-strings <N>    Maximum results (default 200000; 0 = unlimited)
+                           Exits 3 with a warning when the limit truncates the scan.
     --format <text|json|json-tree>
                            Output format (default text). json-tree emits
                            grouped classification tree.
@@ -359,6 +360,10 @@ fn parse_args() -> Result<Args, String> {
             Ok(())
         }
         i += 1;
+    }
+    if args.max_strings == 0 {
+        // 0 means "no limit"; internal code uses usize::MAX as the sentinel.
+        args.max_strings = usize::MAX;
     }
     Ok(args)
 }
@@ -1415,6 +1420,16 @@ mod tests {
     }
 
     #[test]
+    fn truncation_info_only_reports_early_stops() {
+        assert!(super::truncation_info(10, 10, 50, 1000).is_some());
+        assert!(super::truncation_info(11, 10, 50, 1000).is_some());
+        assert!(super::truncation_info(9, 10, 50, 1000).is_none());
+        assert!(super::truncation_info(10, 10, 999, 1000).is_none());
+        assert!(super::truncation_info(10, usize::MAX, 50, 1000).is_none());
+        assert!(super::truncation_info(10, 10, 50, 0).is_none());
+    }
+
+    #[test]
     fn magic_scan_handles_chunk_boundaries_without_duplicates() {
         let path =
             std::env::temp_dir().join(format!("bxmap-magic-test-{}.dmp", std::process::id()));
@@ -1468,20 +1483,42 @@ fn print_banner(path: &str, size: u64, format: Format) {
     eprintln!("  \x1b[1;34m[..] scanning\x1b[0m");
 }
 
-fn print_truncation_notice(result_count: usize, max_strings: usize, last_offset: u64, size: u64) {
-    if max_strings == 0 || result_count < max_strings {
-        return;
+fn truncation_info(
+    result_count: usize,
+    max_strings: usize,
+    last_offset: u64,
+    size: u64,
+) -> Option<f64> {
+    if max_strings == 0 || max_strings == usize::MAX || result_count < max_strings || size == 0 {
+        return None;
     }
-    let pct = if size == 0 {
-        100.0
-    } else {
-        last_offset as f64 * 100.0 / size as f64
+    // Reaching the limit at the very end of the file is not truncation.
+    if last_offset.saturating_add(1) >= size {
+        return None;
+    }
+    let pct = last_offset as f64 * 100.0 / size as f64;
+    Some(pct)
+}
+
+/// Print a truncation warning when the result limit stopped the scan early.
+/// Returns true when the output is incomplete.
+fn print_truncation_notice(
+    result_count: usize,
+    max_strings: usize,
+    last_offset: u64,
+    size: u64,
+) -> bool {
+    let Some(pct) = truncation_info(result_count, max_strings, last_offset, size) else {
+        return false;
     };
     eprintln!(
-        "  [!] TRUNCATED: reached --max-strings {max_strings}; scan stopped near offset {last_offset:#x} (~{pct:.1}% of the file)."
+        "  [!] TRUNCATED: reached --max-strings {max_strings} near offset {last_offset:#x} (~{pct:.1}% of the file)."
     );
-    eprintln!("      The remaining data was NOT scanned and the throughput above is computed on the whole file size.");
-    eprintln!("      Re-run with a larger --max-strings to cover the entire input.");
+    eprintln!("      The remaining data was NOT scanned; results are incomplete.");
+    eprintln!(
+        "      Re-run with a larger --max-strings (0 = unlimited) to cover the entire input."
+    );
+    true
 }
 
 fn print_report(
@@ -2036,7 +2073,9 @@ fn main() -> Result<(), String> {
             start.elapsed().as_secs_f64(),
             threads,
         );
-        print_truncation_notice(result_count, args.max_strings, last_offset, file_size);
+        if print_truncation_notice(result_count, args.max_strings, last_offset, file_size) {
+            std::process::exit(3);
+        }
         return Ok(());
     }
 
@@ -2132,6 +2171,14 @@ fn main() -> Result<(), String> {
             start.elapsed().as_secs_f64(),
             threads,
         );
+        if print_truncation_notice(
+            raw_results.len(),
+            args.max_strings,
+            raw_results.iter().map(|r| r.offset).max().unwrap_or(0),
+            file_size,
+        ) {
+            std::process::exit(3);
+        }
         return Ok(());
     }
 
@@ -2205,9 +2252,14 @@ fn main() -> Result<(), String> {
             }
             out.push_str("\n  ]}");
         }
+        let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
+        let truncated =
+            truncation_info(results.len(), args.max_strings, last_offset, file_size).is_some();
         out.push_str(&format!(
-            "\n],\"metadata\":{{\"total_strings\":{}}}\n}}\n",
-            results.len()
+            "\n],\"metadata\":{{\"total_strings\":{},\"truncated\":{},\"scanned_until\":{}}}\n}}\n",
+            results.len(),
+            truncated,
+            last_offset
         ));
         write!(writer, "{}", out).map_err(|e| format!("write failed: {e}"))?;
         writer.flush().map_err(|e| format!("write failed: {e}"))?;
@@ -2226,12 +2278,14 @@ fn main() -> Result<(), String> {
             start.elapsed().as_secs_f64(),
             threads,
         );
-        print_truncation_notice(
+        if print_truncation_notice(
             results.len(),
             args.max_strings,
             results.iter().map(|r| r.offset).max().unwrap_or(0),
             file_size,
-        );
+        ) {
+            std::process::exit(3);
+        }
         return Ok(());
     }
     if args.format == Format::Json {
@@ -2349,11 +2403,13 @@ fn main() -> Result<(), String> {
         start.elapsed().as_secs_f64(),
         threads,
     );
-    print_truncation_notice(
+    if print_truncation_notice(
         results.len(),
         args.max_strings,
         results.iter().map(|r| r.offset).max().unwrap_or(0),
         file_size,
-    );
+    ) {
+        std::process::exit(3);
+    }
     Ok(())
 }
