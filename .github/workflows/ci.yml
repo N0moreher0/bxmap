@@ -58,4 +58,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo package --locked -p bxmap
       - run: cargo package --locked -p bxmap-cli
-PY
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
