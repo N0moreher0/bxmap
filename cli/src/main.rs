@@ -22,7 +22,7 @@ fn va_annotation(offset: u64) -> Option<(u64, String)> {
     let label = match dump.module_for_va(va) {
         Some(m) => m
             .name
-            .rsplit(|c| c == '\\' || c == '/')
+            .rsplit(['\\', '/'])
             .next()
             .unwrap_or(&m.name)
             .to_string(),
@@ -108,6 +108,7 @@ struct Args {
     max_str_len: usize,
     max_strings: usize,
     progress: Option<bool>,
+    dedupe: bool,
     format: Format,
     detect_format: DetectFormat,
     encoding: Encoding,
@@ -174,6 +175,8 @@ OPTIONS:
     --progress           Show a progress line on stderr (auto when stderr is a
                            terminal and results are not going to the terminal).
     --no-progress        Disable the progress line.
+    --dedupe             Emit each unique string once with `count=` and the
+                           first offset. Buffers results in memory.
     --format <text|json|json-tree>
                            Output format (default text). json-tree emits
                            grouped classification tree.
@@ -237,6 +240,7 @@ fn parse_args() -> Result<Args, String> {
         max_str_len: 0,
         max_strings: MAX_STRINGS,
         progress: None,
+        dedupe: false,
         format: Format::Text,
         detect_format: DetectFormat::Flat,
         encoding: Encoding::All,
@@ -279,6 +283,7 @@ fn parse_args() -> Result<Args, String> {
             "--end" => args.end = Some(parse_offset(&next(&mut i)?, "--end")?),
             "--progress" => args.progress = Some(true),
             "--no-progress" => args.progress = Some(false),
+            "--dedupe" => args.dedupe = true,
             "--max-str-len" => {
                 args.max_str_len = next(&mut i)?
                     .parse()
@@ -741,7 +746,7 @@ fn write_entropy_json(
     result_count: &mut usize,
 ) -> io::Result<()> {
     if *result_count > 0 {
-        write!(writer, ",\n")?;
+        writeln!(writer, ",")?;
     }
     write!(
         writer,
@@ -753,6 +758,21 @@ fn write_entropy_json(
     )?;
     *result_count += 1;
     Ok(())
+}
+
+/// True when an entropy region overlaps the requested byte range (or no range
+/// was requested).
+fn entropy_region_in_range(
+    region: &EntropyRegion,
+    range_active: bool,
+    range_start: u64,
+    range_end: u64,
+) -> bool {
+    if !range_active {
+        return true;
+    }
+    let region_end = region.offset.saturating_add(region.length as u64);
+    region.offset < range_end && region_end > range_start
 }
 
 fn write_entropy_text(
@@ -784,7 +804,7 @@ fn write_yara_json(
     result_count: &mut usize,
 ) -> io::Result<()> {
     if *result_count > 0 {
-        write!(writer, ",\n")?;
+        writeln!(writer, ",")?;
     }
     write!(
         writer,
@@ -807,7 +827,7 @@ fn write_magic_json(
     result_count: &mut usize,
 ) -> io::Result<()> {
     if *result_count > 0 {
-        write!(writer, ",\n")?;
+        writeln!(writer, ",")?;
     }
     write!(
         writer,
@@ -1078,7 +1098,7 @@ fn write_xor_json(
     result_count: &mut usize,
 ) -> io::Result<()> {
     if *result_count > 0 {
-        write!(writer, ",\n")?;
+        writeln!(writer, ",")?;
     }
     write!(
         writer,
@@ -1097,9 +1117,10 @@ fn write_string_json(
     writer: &mut dyn Write,
     result_count: &mut usize,
     parse_pid: bool,
+    count: Option<usize>,
 ) -> io::Result<()> {
     if *result_count > 0 {
-        write!(writer, ",\n")?;
+        writeln!(writer, ",")?;
     }
     write!(
         writer,
@@ -1108,6 +1129,9 @@ fn write_string_json(
         json_escape(result.encoding),
         json_escape(&result.text)
     )?;
+    if let Some(count) = count {
+        write!(writer, ",\"count\":{count}")?;
+    }
     if parse_pid {
         match parse_pid_marker(&result.text) {
             Some(pid) => write!(writer, ",\"pid\":{pid}")?,
@@ -1466,6 +1490,44 @@ mod tests {
         assert!(!super::hit_result_limit(usize::MAX, usize::MAX));
     }
 
+    fn sample_string(offset: u64, text: &str) -> ExtractedString {
+        ExtractedString {
+            offset,
+            encoding: "ascii",
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn dedupe_keeps_first_offset_and_counts_repeats() {
+        let input = vec![
+            sample_string(0, "aaaa"),
+            sample_string(5, "bbbb"),
+            sample_string(10, "aaaa"),
+            sample_string(15, "aaaa"),
+        ];
+        let (unique, counts) = super::dedupe_strings(input);
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique[0].offset, 0);
+        assert_eq!(unique[0].text, "aaaa");
+        assert_eq!(counts["aaaa"], 3);
+        assert_eq!(counts["bbbb"], 1);
+    }
+
+    #[test]
+    fn dedupe_findings_groups_by_rule_and_value() {
+        let result = sample_string(0, "key AKIAIOSFODNN7EXAMPLE");
+        let mut findings = super::detect_findings(&result, &[super::Detector::Secret]);
+        findings.extend(super::detect_findings(
+            &sample_string(30, "again AKIAIOSFODNN7EXAMPLE"),
+            &[super::Detector::Secret],
+        ));
+        let deduped = super::dedupe_findings(findings);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].0.rule, "AWS_ACCESS_KEY");
+        assert_eq!(deduped[0].1, 2);
+    }
+
     #[test]
     fn magic_scan_handles_chunk_boundaries_without_duplicates() {
         let path =
@@ -1547,6 +1609,50 @@ fn hit_result_limit(result_count: usize, max_strings: usize) -> bool {
     max_strings != usize::MAX && result_count > max_strings
 }
 
+/// Collapse identical strings, keeping the first occurrence (lowest offset)
+/// and the number of times each text appeared.
+fn dedupe_strings(
+    results: Vec<ExtractedString>,
+) -> (
+    Vec<ExtractedString>,
+    std::collections::HashMap<String, usize>,
+) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut unique: Vec<ExtractedString> = Vec::new();
+    for result in results {
+        if counts.contains_key(&result.text) {
+            if let Some(count) = counts.get_mut(&result.text) {
+                *count += 1;
+            }
+        } else {
+            counts.insert(result.text.clone(), 1);
+            unique.push(result);
+        }
+    }
+    (unique, counts)
+}
+
+/// Collapse identical detector findings by `(rule, value)`, keeping the first
+/// occurrence and the number of times the pair appeared.
+fn dedupe_findings(
+    findings: Vec<bxmap::classifier::DetectedFinding>,
+) -> Vec<(bxmap::classifier::DetectedFinding, usize)> {
+    let mut index: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    let mut unique: Vec<(bxmap::classifier::DetectedFinding, usize)> = Vec::new();
+    for finding in findings {
+        let key = (finding.rule.to_string(), finding.value.clone());
+        if let Some(&slot) = index.get(&key) {
+            unique[slot].1 += 1;
+        } else {
+            index.insert(key, unique.len());
+            unique.push((finding, 1));
+        }
+    }
+    unique
+}
+
+#[allow(clippy::too_many_arguments)]
 fn print_report(
     result_count: usize,
     short: usize,
@@ -1638,6 +1744,7 @@ fn update_stats(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_result(
     result: ExtractedString,
     writer: &mut dyn Write,
@@ -1649,6 +1756,7 @@ fn record_result(
     important: &mut Vec<ExtractedString>,
     parse_pid: bool,
     max_str_len: usize,
+    count: Option<usize>,
 ) -> io::Result<()> {
     match format {
         Format::Text => {
@@ -1659,6 +1767,9 @@ fn record_result(
                 result.encoding,
                 display_text(&result.text, max_str_len)
             )?;
+            if let Some(count) = count {
+                write!(writer, "\tcount={count}")?;
+            }
             if parse_pid {
                 match parse_pid_marker(&result.text) {
                     Some(pid) => write!(writer, "\tpid={pid}")?,
@@ -1668,7 +1779,7 @@ fn record_result(
             writeln!(writer)?;
         }
         Format::Json => {
-            write_string_json(&result, writer, result_count, parse_pid)?;
+            write_string_json(&result, writer, result_count, parse_pid, count)?;
         }
         Format::JsonTree => {
             // handled separately in main(); no-op here
@@ -1685,10 +1796,11 @@ fn record_finding(
     format: Format,
     result_count: &mut usize,
     max_str_len: usize,
+    count: Option<usize>,
 ) -> io::Result<()> {
     match format {
         Format::Text => {
-            writeln!(
+            write!(
                 writer,
                 "{:#010x}\t{}\trule={}\tconf={:.2}\tsev={}\tvalue={}\tcontext={}\ttext={}",
                 finding.offset,
@@ -1700,14 +1812,18 @@ fn record_finding(
                 display_text(&finding.context, max_str_len),
                 display_text(&finding.text, max_str_len)
             )?;
+            if let Some(count) = count {
+                write!(writer, "\tcount={count}")?;
+            }
+            writeln!(writer)?;
         }
         Format::Json => {
             if *result_count > 0 {
-                write!(writer, ",\n")?;
+                writeln!(writer, ",")?;
             }
             write!(
                 writer,
-                "  {{\"offset\":{},\"encoding\":{},\"rule\":{},\"value\":{},\"confidence\":{:.4},\"severity\":{},\"context\":{},\"text\":{}}}",
+                "  {{\"offset\":{},\"encoding\":{},\"rule\":{},\"value\":{},\"confidence\":{:.4},\"severity\":{},\"context\":{},\"text\":{}",
                 finding.offset,
                 json_escape(finding.encoding),
                 json_escape(finding.rule),
@@ -1717,6 +1833,10 @@ fn record_finding(
                 json_escape(&finding.context),
                 json_escape(&finding.text)
             )?;
+            if let Some(count) = count {
+                write!(writer, ",\"count\":{count}")?;
+            }
+            write!(writer, "}}")?;
         }
         Format::JsonTree => {
             // rejected during argument validation
@@ -1732,6 +1852,7 @@ fn write_results(
     writer: &mut dyn Write,
     parse_pid: bool,
     max_str_len: usize,
+    counts: Option<&std::collections::HashMap<String, usize>>,
 ) -> io::Result<()> {
     match format {
         Format::Text => {
@@ -1743,6 +1864,9 @@ fn write_results(
                     result.encoding,
                     display_text(&result.text, max_str_len)
                 )?;
+                if let Some(count) = counts.and_then(|map| map.get(&result.text)) {
+                    write!(writer, "\tcount={count}")?;
+                }
                 if parse_pid {
                     match parse_pid_marker(&result.text) {
                         Some(pid) => write!(writer, "\tpid={pid}")?,
@@ -1762,7 +1886,8 @@ fn write_results(
             writeln!(writer, "[")?;
             let mut result_count = 0;
             for result in results {
-                write_string_json(result, writer, &mut result_count, parse_pid)?;
+                let count = counts.and_then(|map| map.get(&result.text).copied());
+                write_string_json(result, writer, &mut result_count, parse_pid, count)?;
             }
             writeln!(writer, "]")?;
         }
@@ -1911,7 +2036,7 @@ fn main() -> Result<(), String> {
         Encoding::Utf16 => EncodingFilter::utf16(),
         Encoding::Utf32 => EncodingFilter::utf32(),
     };
-    let magic_matches = if args.magic_bytes {
+    let mut magic_matches = if args.magic_bytes {
         scan_magic_bytes(&args.path).map_err(|error| format!("magic-byte scan failed: {error}"))?
     } else {
         Vec::new()
@@ -1958,7 +2083,16 @@ fn main() -> Result<(), String> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    if (threads == 1 || range_active) && args.format != Format::JsonTree {
+    if range_active {
+        // Auxiliary stages still read the whole file (their APIs are not
+        // range-aware yet), but only report hits inside the requested window.
+        magic_matches.retain(|matched| matched.offset >= range_start && matched.offset < range_end);
+        yara_matches.retain(|matched| matched.offset >= range_start && matched.offset < range_end);
+        xor_results.retain(|result| result.offset >= range_start && result.offset < range_end);
+        entropy_regions
+            .retain(|region| entropy_region_in_range(region, range_active, range_start, range_end));
+    }
+    if (threads == 1 || range_active) && args.format != Format::JsonTree && !args.dedupe {
         let mut writer: Box<dyn Write> = match args.output.as_ref() {
             Some(path) => Box::new(BufWriter::new(
                 File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
@@ -1966,7 +2100,7 @@ fn main() -> Result<(), String> {
             None => Box::new(BufWriter::new(io::stdout().lock())),
         };
         if args.format == Format::Json {
-            write!(writer, "[\n").map_err(|e| format!("write failed: {e}"))?;
+            writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
         }
         let mut result_count = 0;
         let mut short = 0;
@@ -2005,6 +2139,7 @@ fn main() -> Result<(), String> {
                             args.format,
                             &mut result_count,
                             args.max_str_len,
+                            None,
                         ) {
                             write_error = Some(error);
                         }
@@ -2024,6 +2159,7 @@ fn main() -> Result<(), String> {
                                 &mut important,
                                 args.parse_pid,
                                 args.max_str_len,
+                                None,
                             ) {
                                 write_error = Some(error);
                             }
@@ -2112,7 +2248,7 @@ fn main() -> Result<(), String> {
             if let Some(error) = write_error {
                 return Err(format!("write failed: {error}"));
             }
-            write!(writer, "\n]\n").map_err(|e| format!("write failed: {e}"))?;
+            writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
         } else {
             for matched in &yara_matches {
                 write_yara_text(matched, &mut writer).map_err(|e| format!("write failed: {e}"))?;
@@ -2235,6 +2371,11 @@ fn main() -> Result<(), String> {
             .iter()
             .flat_map(|result| detect_findings(result, &args.detectors))
             .collect();
+        let findings: Vec<(bxmap::classifier::DetectedFinding, usize)> = if args.dedupe {
+            dedupe_findings(findings)
+        } else {
+            findings.into_iter().map(|finding| (finding, 1)).collect()
+        };
         let mut writer: Box<dyn Write> = match args.output.as_ref() {
             Some(path) => Box::new(BufWriter::new(
                 File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
@@ -2242,21 +2383,22 @@ fn main() -> Result<(), String> {
             None => Box::new(BufWriter::new(io::stdout().lock())),
         };
         if args.format == Format::Json {
-            write!(writer, "[\n").map_err(|e| format!("write failed: {e}"))?;
+            writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
         }
         let mut result_count = 0;
-        for finding in &findings {
+        for (finding, count) in &findings {
             record_finding(
                 finding,
                 &mut writer,
                 args.format,
                 &mut result_count,
                 args.max_str_len,
+                if args.dedupe { Some(*count) } else { None },
             )
             .map_err(|e| format!("write failed: {e}"))?;
         }
         if args.format == Format::Json {
-            write!(writer, "\n]\n").map_err(|e| format!("write failed: {e}"))?;
+            writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
         }
         writer.flush().map_err(|e| format!("write failed: {e}"))?;
         if let Some(path) = args.output {
@@ -2288,7 +2430,7 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
-    let results: Vec<ExtractedString> = raw_results
+    let mut results: Vec<ExtractedString> = raw_results
         .into_iter()
         .flat_map(|result| apply_detectors(result, &args.detectors))
         .filter(|result| {
@@ -2297,6 +2439,13 @@ fn main() -> Result<(), String> {
                 .map_or(true, |regex| regex.is_match(&result.text))
         })
         .collect();
+    let counts = if args.dedupe {
+        let (unique, counts) = dedupe_strings(results);
+        results = unique;
+        Some(counts)
+    } else {
+        None
+    };
 
     let output_path = args.output.clone();
     let mut writer: Box<dyn Write> = match output_path.as_ref() {
@@ -2348,12 +2497,18 @@ fn main() -> Result<(), String> {
                 } else {
                     String::new()
                 };
+                let count_part = counts
+                    .as_ref()
+                    .and_then(|map| map.get(&r.text))
+                    .map(|count| format!(",\"count\":{count}"))
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    "    {{\"text\":{},\"offset\":{},\"entropy\":{:.4}{}}}",
+                    "    {{\"text\":{},\"offset\":{},\"entropy\":{:.4}{}{}}}",
                     json_escape(&r.text),
                     r.offset,
                     ent,
-                    ts_part
+                    ts_part,
+                    count_part
                 ));
             }
             out.push_str("\n  ]}");
@@ -2389,10 +2544,13 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     if args.format == Format::Json {
-        write!(writer, "[\n").map_err(|e| format!("write failed: {e}"))?;
+        writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
         let mut json_count = 0;
         for result in &results {
-            write_string_json(result, &mut writer, &mut json_count, args.parse_pid)
+            let count = counts
+                .as_ref()
+                .and_then(|map| map.get(&result.text).copied());
+            write_string_json(result, &mut writer, &mut json_count, args.parse_pid, count)
                 .map_err(|e| format!("write failed: {e}"))?;
         }
         for matched in &yara_matches {
@@ -2417,12 +2575,15 @@ fn main() -> Result<(), String> {
                 &args.path,
                 ENTROPY_THRESHOLD,
                 |region, data| {
-                    if entropy_write_error.is_none() {
-                        if let Err(error) =
-                            write_entropy_json(region, data, &mut writer, &mut json_count)
-                        {
-                            entropy_write_error = Some(error);
-                        }
+                    if entropy_write_error.is_some()
+                        || !entropy_region_in_range(&region, range_active, range_start, range_end)
+                    {
+                        return;
+                    }
+                    if let Err(error) =
+                        write_entropy_json(region, data, &mut writer, &mut json_count)
+                    {
+                        entropy_write_error = Some(error);
                     }
                 },
             )
@@ -2439,6 +2600,7 @@ fn main() -> Result<(), String> {
             &mut writer,
             args.parse_pid,
             args.max_str_len,
+            counts.as_ref(),
         )
         .map_err(|e| format!("write failed: {e}"))?;
         for matched in &yara_matches {
@@ -2460,10 +2622,13 @@ fn main() -> Result<(), String> {
                 &args.path,
                 ENTROPY_THRESHOLD,
                 |region, data| {
-                    if entropy_write_error.is_none() {
-                        if let Err(error) = write_entropy_text(region, data, &mut writer) {
-                            entropy_write_error = Some(error);
-                        }
+                    if entropy_write_error.is_some()
+                        || !entropy_region_in_range(&region, range_active, range_start, range_end)
+                    {
+                        return;
+                    }
+                    if let Err(error) = write_entropy_text(region, data, &mut writer) {
+                        entropy_write_error = Some(error);
                     }
                 },
             )

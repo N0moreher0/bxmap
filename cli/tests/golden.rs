@@ -402,3 +402,103 @@ fn golden_no_progress_suppresses_status_line() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("[..]"), "{stderr}");
 }
+
+#[test]
+fn golden_dedupe_reports_count_and_first_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00aaaa\x00cccc\x00aaaa\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--dedupe",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0x00000000\tascii\taaaa\tcount=3"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("0x00000005\tascii\tbbbb\tcount=1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("0x0000000f\tascii\tcccc\tcount=1"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.lines().count(), 3, "{stdout}");
+}
+
+#[test]
+fn golden_dedupe_json_adds_count_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00aaaa\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--dedupe",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"text\":\"aaaa\",\"count\":2"), "{stdout}");
+    assert!(stdout.contains("\"text\":\"bbbb\",\"count\":1"), "{stdout}");
+}
+
+#[test]
+fn golden_dedupe_rich_findings_groups_by_rule_and_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(
+        &path,
+        b"key AKIAIOSFODNN7EXAMPLE x\x00other AKIAIOSFODNN7EXAMPLE y\x00",
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--detect",
+            "secret",
+            "--detect-format",
+            "rich",
+            "--dedupe",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"rule\":\"AWS_ACCESS_KEY\""), "{stdout}");
+    assert!(stdout.contains("\"count\":2"), "{stdout}");
+    assert_eq!(stdout.matches("\"rule\":").count(), 1, "{stdout}");
+}

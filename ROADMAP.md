@@ -91,7 +91,7 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 
 ### 4.1 Lọc nhiễu
 - [ ] Mở rộng noise filter ngoài chu kỳ 1–2: chu kỳ N, độ đa dạng ký tự thấp, điểm n-gram để loại chuỗi rác/ngẫu nhiên.
-- [ ] `--dedupe`: chuỗi duy nhất kèm số lần xuất hiện + offset đầu tiên.
+- [x] `--dedupe`: chuỗi duy nhất kèm số lần xuất hiện + offset đầu tiên. Áp dụng cho `text`/`json`/`json-tree`; với `--detect-format rich` thì gộp theo `(rule, value)`.
 - [ ] **Lọc rác nhị phân/bảng hệ thống** (Lab 4: 820 nghìn chuỗi ASCII, phần lớn là bảng ACPI `FACP`/`DSDT`/`VBOXBIOS` và dữ liệu nhị phân ở đầu dump): điểm "độ giống văn bản", loại chuỗi có tỉ lệ ký tự không in cao hoặc entropy ký tự lạ.
 - [ ] **Output gọn:** JSON pretty-print của 1,9 triệu bản ghi nặng 160 MB. Thêm `--format ndjson`/`--compact`, nén (`.gz`/`.zst`) khi `-o`, và tùy chọn bỏ trường không cần.
 - [ ] Giữ mặc định bảo thủ (không làm mất bằng chứng ngắn như `0000`); mọi bộ lọc mới đều opt-in hoặc có cờ tắt.
@@ -112,7 +112,7 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 - [ ] **Phân loại key công khai phía client**: `AIza...` trong request trình duyệt (vd. tới `*.clients6.google.com`) gắn nhãn `public-client-key`, confidence thấp; khác với secret phía server/người dùng.
 - [x] **Output có cấu trúc cho mọi finding:** thêm `rule` (vd. `google_api_key`, `generic_password`), `confidence`/`severity`, và `context` (vài chục byte quanh match). Hiện `--detect secret` chỉ có `offset`, `encoding`, `text`.
 - [ ] **Nhận diện khối biến môi trường** (`NAME=value\0NAME=value\0` trong UTF-16): `password=`/`key=` trong env block xếp ưu tiên cao (case thật: `RAR password=easypeasyvirus` trong dump Lab 6).
-- [ ] `--dedupe` mặc định cho detector: cùng một key lặp nhiều lần chỉ hiện một dòng kèm `count` và danh sách offset.
+- [ ] `--dedupe` mặc định cho detector: cùng một key lặp nhiều lần chỉ hiện một dòng kèm `count` và danh sách offset. (`--dedupe` đã gộp theo `(rule, value)` kèm `count`; còn thiếu danh sách offset và việc bật mặc định.)
 
 ### 4.4 Trích xuất artifact có cấu trúc
 Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì bắt analyst tự lọc (case Lab 4).

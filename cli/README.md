@@ -31,7 +31,13 @@ bxmap --help
   several processes. Strings that cross a boundary are still read in full
   (the scanner overlaps by `MAX_RUN_CHARS` on each side), but only strings
   whose start offset falls inside the range are emitted. A range forces the
-  sequential streaming scanner even with `--threads`.
+  sequential streaming scanner even with `--threads`. Auxiliary stages
+  (`--magic-bytes`, `--yar`, `--brute-xor`, `--entropy`) still scan the whole
+  file but only report hits that overlap the requested range.
+- `--dedupe` — emit each unique string once, with `count=<N>` and the first
+  (lowest) offset. With `--detect-format rich` findings are grouped by
+  `(rule, value)` instead. Buffers results in memory, so it disables the
+  streaming output path.
 - `--progress` / `--no-progress` — show or hide a live status line on stderr
   (percent, MiB/s, scanned offset). Auto-enabled when stderr is a terminal and
   results are not going to the terminal.
