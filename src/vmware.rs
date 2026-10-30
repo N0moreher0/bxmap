@@ -71,7 +71,11 @@ impl VmwareState {
                 tags_offset: u64::from_le_bytes(off),
             });
         }
-        Ok(Self { path, magic, groups })
+        Ok(Self {
+            path,
+            magic,
+            groups,
+        })
     }
 
     pub fn group(&self, name: &str) -> Option<&Group> {
@@ -94,9 +98,18 @@ impl VmwareState {
             if flags == 0 {
                 break;
             }
+            if name_len > 4096 {
+                break;
+            }
             pos += 2;
             let n_idx = ((flags >> 6) & 3) as u64;
-            if pos + name_len + n_idx * 4 > len {
+            let need = match (name_len
+                .checked_add(n_idx.checked_mul(4).ok_or_else(|| bad("tag index count overflow"))?))
+            {
+                Some(v) => v,
+                None => break,
+            };
+            if pos.checked_add(need).map_or(true, |v| v > len) {
                 break;
             }
             let name = read_exact_at(&mut f, pos, name_len as usize)?;
@@ -116,11 +129,14 @@ impl VmwareState {
                 let l = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
                 let pad = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as u64;
                 pos += 8;
-                (pos + pad, l)
+                match pos.checked_add(pad) {
+                    Some(v) => (v, l),
+                    None => break,
+                }
             } else {
                 (pos, small)
             };
-            if data_offset + data_len > len {
+            if data_offset.checked_add(data_len).map_or(true, |v| v > len) {
                 break;
             }
             out.push(Tag {
@@ -129,7 +145,10 @@ impl VmwareState {
                 data_offset,
                 data_len,
             });
-            pos = data_offset + data_len;
+            pos = match data_offset.checked_add(data_len) {
+                Some(v) => v,
+                None => break,
+            };
         }
         Ok(out)
     }
@@ -156,24 +175,41 @@ impl VmwareState {
         use std::fmt::Write as _;
         let mut o = String::new();
         let _ = writeln!(o, "VMware state file: {}", self.path.display());
-        let _ = writeln!(o, "|- magic {:#010x}, {} groups", self.magic, self.groups.len());
+        let _ = writeln!(
+            o,
+            "|- magic {:#010x}, {} groups",
+            self.magic,
+            self.groups.len()
+        );
         for g in &self.groups {
             let _ = writeln!(o, "|  |- {:<24} tags@{:#x}", g.name, g.tags_offset);
         }
         match self.sibling_vmem() {
             Some(p) => {
                 let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                let _ = writeln!(o, "|- RAM image: {} ({:.1} MiB, flat physical memory)", p.display(), size as f64 / 1_048_576.0);
+                let _ = writeln!(
+                    o,
+                    "|- RAM image: {} ({:.1} MiB, flat physical memory)",
+                    p.display(),
+                    size as f64 / 1_048_576.0
+                );
             }
             None => {
-                let _ = writeln!(o, "|- RAM image: no sibling .vmem (memory is probably inside this file)");
+                let _ = writeln!(
+                    o,
+                    "|- RAM image: no sibling .vmem (memory is probably inside this file)"
+                );
             }
         }
         if let Some(g) = self.group("memory") {
             if let Ok(tags) = self.tags(g, 40) {
                 let _ = writeln!(o, "|- memory tags ({} shown)", tags.len());
                 for t in &tags {
-                    let _ = writeln!(o, "|  |- {} {:?} len={} @{:#x}", t.name, t.indices, t.data_len, t.data_offset);
+                    let _ = writeln!(
+                        o,
+                        "|  |- {} {:?} len={} @{:#x}",
+                        t.name, t.indices, t.data_len, t.data_offset
+                    );
                 }
             }
         }
@@ -233,4 +269,34 @@ mod tests {
         assert!(VmwareState::open(&dir).is_err());
         let _ = std::fs::remove_file(&dir);
     }
+    #[test]
+    fn truncated_and_random_inputs_do_not_panic() {
+        let mut state = 0x243f6a8885a308d3u64;
+        let dir = std::env::temp_dir().join("bxmap_vmware_fuzz.vmss");
+        for len in [0, 1, 4, 11, 12, 13, 64, 512] {
+            for _ in 0..300 {
+                state = state.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                let mut buf = vec![0u8; len];
+                for b in buf.iter_mut() {
+                    state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                    *b = (state & 0xFF) as u8;
+                }
+                if len >= 4 {
+                    // Give some a plausible magic to exercise deeper parsing.
+                    let magics = [0xbed2_bed0u32, 0xbad1_bad1, 0xbed2_bed2, 0xbed3_bed3];
+                    let m = magics[(state % magics.len() as u64) as usize];
+                    buf[0..4].copy_from_slice(&m.to_le_bytes());
+                }
+                let _ = std::fs::write(&dir, &buf);
+                if let Ok(st) = VmwareState::open(&dir) {
+                    for g in &st.groups {
+                        let _ = st.tags(g, 4);
+                    }
+                    let _ = st.render_info();
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&dir);
+    }
+
 }
