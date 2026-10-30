@@ -4,6 +4,8 @@ Mục tiêu: biến bxmap thành công cụ trích xuất chuỗi / triage cho m
 
 Ký hiệu: `[ ]` chưa làm · `[~]` đang làm · `[x]` xong. Độ ưu tiên: **P0** làm trước · **P1** quan trọng · **P2** nên có.
 
+Phiên bản hiện tại: `bxmap` **1.0.4**, `bxmap-cli` **1.0.14** (Phase 4.4 gần xong). Các mốc ở cuối tài liệu tính từ bản kế tiếp.
+
 ---
 
 ## Phase 1 — Dọn nền (tài liệu, giấy phép, release) · P0
@@ -37,7 +39,7 @@ Chi phí thấp, hiệu quả cao nhất. Làm trước khi thêm tính năng.
 Dump đến từ máy nhiễm mã độc, parser phải chịu được input thù địch.
 
 ### 2.1 Fuzzing và hardening
-- [ ] `cargo-fuzz` cho: parser minidump, parser `.vmss`, reader chunk/overlap, các detector regex.
+- [ ] `cargo-fuzz` cho: parser minidump, parser `.vmss`, reader chunk/overlap, các detector regex, **validator carve (Phase 8)**.
 - [ ] Giới hạn cấp phát: header khai báo số stream/region/size quá lớn không được gây OOM.
 - [~] Kiểm tra bounds, tránh `unwrap`/panic trên đường parse (minidump + VMware hardened + mini-fuzz no-panic); vẫn tiếp tục các parser khác.
 - [ ] Chạy `clippy -D warnings`, `cargo audit`, `cargo deny` trong CI.
@@ -111,8 +113,8 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 - [x] Loại hoặc hạ điểm các mẫu biết trước là không phải secret: `publicKeyToken="..."` trong manifest assembly (`6595b64144ccf1df`, `31bf3856ad364e35`, `1122334455667788`).
 - [ ] **Phân loại key công khai phía client**: `AIza...` trong request trình duyệt (vd. tới `*.clients6.google.com`) gắn nhãn `public-client-key`, confidence thấp; khác với secret phía server/người dùng.
 - [x] **Output có cấu trúc cho mọi finding:** thêm `rule` (vd. `google_api_key`, `generic_password`), `confidence`/`severity`, và `context` (vài chục byte quanh match). Hiện `--detect secret` chỉ có `offset`, `encoding`, `text`.
-- [ ] **Nhận diện khối biến môi trường** (`NAME=value\0NAME=value\0` trong UTF-16): `password=`/`key=` trong env block xếp ưu tiên cao (case thật: `RAR password=easypeasyvirus` trong dump Lab 6).
-- [ ] `--dedupe` mặc định cho detector: cùng một key lặp nhiều lần chỉ hiện một dòng kèm `count` và danh sách offset. (`--dedupe` đã gộp theo `(rule, value)` kèm `count`; còn thiếu danh sách offset và việc bật mặc định.)
+- [~] **Nhận diện khối biến môi trường** (`NAME=value\0NAME=value\0` trong UTF-16): `password=`/`key=` trong env block xếp ưu tiên cao (case thật: `RAR password=easypeasyvirus` trong dump Lab 6). Đã có `--extract env` (gắn `sensitive=true`) nhưng chưa đẩy các env nhạy cảm lên nhóm priority findings.
+- [~] `--dedupe` mặc định cho detector: cùng một key lặp nhiều lần chỉ hiện một dòng kèm `count` và danh sách offset. (`--dedupe` đã gộp theo `(rule, value)` kèm `count`; còn thiếu danh sách offset và việc bật mặc định.)
 
 ### 4.4 Trích xuất artifact có cấu trúc
 Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì bắt analyst tự lọc (case Lab 4).
@@ -132,13 +134,13 @@ Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì b
 - [ ] Đổi `encoding: &'static str` thành enum `Encoding` (`#[non_exhaustive]`), kèm `Display`.
 - [ ] API hỗ trợ đủ UTF-16BE/UTF-32 ở mức library, không chỉ CLI.
 - [ ] Iterator/callback streaming (không bắt buộc gom `Vec`), hỗ trợ hủy (cancellation) và báo tiến độ.
-- [ ] Ổn định API trước `1.0`: tài liệu hóa quy ước semver, đánh dấu phần chưa ổn định bằng feature flag.
+- [ ] Ổn định API trước `1.0`: tài liệu hóa quy ước semver, đánh dấu phần chưa ổn định bằng feature flag. (Thực tế đã ở 1.0.x — cần chốt semver cho các API mới như `artifacts`/`carve`.)
 
 ### 5.2 CLI
 - [x] Output `ndjson` và `csv` (ndjson kèm `type` + dòng `metadata`; csv có header cố định, hỗ trợ string/finding, không đi cùng stage phụ).
-- [ ] Thanh tiến độ trên stderr (tắt được khi pipe).
+- [x] Thanh tiến độ trên stderr (tắt được khi pipe) — xem Phase 3.
 - [ ] Shell completions (bash/zsh/fish/pwsh), man page, `--version` chi tiết (commit, feature build: full/lite).
-- [ ] Exit code rõ ràng (0 sạch, 1 lỗi, 2 có phát hiện nghiêm trọng nếu bật cờ).
+- [~] Exit code rõ ràng (0 sạch, 1 lỗi, 2 có phát hiện nghiêm trọng nếu bật cờ). Đã dùng và ghi trong `cli/README.md`: 0, 1, 3 (kết quả bị cắt); còn thiếu code 2 cho "có phát hiện nghiêm trọng".
 - [ ] File cấu hình (`bxmap.toml`) cho các tùy chọn lặp lại.
 
 ---
@@ -150,7 +152,7 @@ Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì b
 - [ ] Mở rộng `.vmss`/`.vmem`: ánh xạ địa chỉ vật lý, thêm các định dạng VM snapshot khác.
 - [ ] Ánh xạ VA → module/section/export cho thêm kiến trúc; hiển thị cây tiến trình đầy đủ hơn.
 - [ ] **`--magic-bytes` mở rộng:** RAR4/RAR5 (`Rar!\x1a\x07\x00` / `...\x01\x00`), 7z, GZIP, JPEG, SQLite, ngoài PE/ELF/ZIP/PDF/PNG hiện có.
-- [ ] **Carving cơ bản (`--carve <type> --out-dir`)**: cắt file theo chữ ký ra đĩa (RAR, ZIP, PNG, JPEG...) để phân tích tiếp (Lab 6 có 6 chữ ký RAR trong dump). Ưu tiên JPEG (`FF D8 FF`), PNG, BMP (`BM`), ZIP (`PK`), RAR, 7z; ghi kèm offset và kích thước ước lượng (đọc footer/chiều dài header). Lab 4 tìm được tên `galf.jpeg`, `FLAG NOT HERE.BMP`, `DumpIt.zip` nhưng chưa lấy được nội dung file.
+- [ ] **Carving file theo chữ ký** → xem **Phase 8 — Module `--carve`**.
 - [ ] Xuất báo cáo HTML/Markdown tự đóng gói cho case management.
 - [ ] Binding Python (PyO3) để dùng trong notebook và pipeline.
 
@@ -161,7 +163,7 @@ Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì b
 Mục tiêu: có vài case thật cho thấy bxmap tìm ra thứ có ý nghĩa nhanh hơn `strings | grep`.
 
 - [ ] Bộ demo MemLabs (Lab 1, 2, 6): mỗi lab một mục "đáp án nói cần tìm X → `strings` ra N dòng → bxmap ra X trong M dòng", kèm thời gian và RAM.
-- [ ] Case Lab 6: bxmap `--detect` bắt `RAR password=...` trong env block (UTF-16) → dẫn tới file RAR; ghi rõ bước còn lại (carve RAR, mở bằng mật khẩu).
+- [ ] Case Lab 6: bxmap `--extract env` bắt `RAR password=...` trong env block (UTF-16) → dẫn tới file RAR; ghi rõ bước còn lại (carve RAR, mở bằng mật khẩu).
 - [ ] Trình bày trung thực: so sánh công bằng với `strings -el | grep`, nêu rõ điểm thắng là một lần quét đủ encoding + phân loại + tốc độ, không phải "chỉ bxmap tìm được".
 - [ ] Một bài viết ngắn kể case + GIF/asciinema ở đầu README; đăng r/computerforensics, r/netsec, Show HN, This Week in Rust.
 - [ ] Case Lab 4: quét 1 GiB, lọc ra user `eminem`, công cụ DumpIt và các file đáng ngờ trên Desktop bằng một lệnh; ghi rõ giới hạn (chỉ tên file/metadata, chưa lấy nội dung — cần `--carve`).
@@ -171,16 +173,82 @@ Mục tiêu: có vài case thật cho thấy bxmap tìm ra thứ có ý nghĩa n
 
 ---
 
+## Phase 8 — Module `--carve` (phục hồi file từ dump) · P1
+
+Mục tiêu: từ dump thô, cắt ra các file có cấu trúc (JPEG, PNG, ZIP, RAR...) và **khoanh vùng** dữ liệu mã hoá, để analyst lấy được nội dung thay vì chỉ thấy tên file (case Lab 4: `galf.jpeg`, `FLAG NOT HERE.BMP`, `DumpIt.zip`; case Lab 6: 6 chữ ký RAR).
+
+Nguyên tắc phạm vi:
+- Carve theo chữ ký + xác thực cấu trúc; **không giải mã, không crack mật khẩu**.
+- File trong RAM thường phân mảnh theo trang 4 KB: bản đầu chỉ carve phần liền kề và đánh dấu `complete`.
+- Mọi parser header là input không tin cậy → bắt buộc có giới hạn và fuzz (Phase 2).
+
+Thiết kế module (giữ đồng bộ với `bxmap::artifacts`):
+- `bxmap::carve`: `CarveOptions` (types, min/max size, trần tổng), `Carver` (nạp dữ liệu theo chunk, gọi validator), `CarvedFile { offset, kind, size, sha256, entropy, complete, notes, path }`.
+- Chữ ký dùng chung với `--magic-bytes` (một bảng `Signature` duy nhất) để không có hai nguồn sự thật.
+- Đọc file qua `bxmap::chunk` (thêm ở 8.0) thay vì viết reader riêng; overlap nhỏ vì header ngắn.
+
+### 8.0 Chuẩn bị (dọn đường trước khi viết carver)
+- [x] Tách bảng chữ ký khỏi `cli/src/main.rs` thành `bxmap::magic::{Signature, SIGNATURES, MagicMatch, scan_file}` dùng aho-corasick; `--magic-bytes` giờ chỉ là wrapper mỏng và `--carve` sẽ gọi cùng hàm.
+- [x] Chuẩn hóa reader chunk: thêm `bxmap::chunk::{Chunk, for_each_chunk}` (cửa sổ có overlap, offset tuyệt đối, `spans_new_bytes` để không báo trùng). Carver dùng lại với overlap ≈ header dài nhất (≤ 64 byte); ba reader cũ (`MAX_RUN_CHARS`, magic 16 byte, `YARA_OVERLAP_SIZE`) chưa gộp vì đã ổn định, sẽ gộp khi có nhu cầu.
+- [x] Chốt quy ước exit code: dùng chung code `3` cho mọi trường hợp "kết quả không đầy đủ" (`--max-strings`, sau này là `--carve-max-total`); cảnh báo trên stderr phải nêu rõ nguồn gây cắt. Đã ghi trong `cli/README.md`.
+
+### 8.1 Lõi carver
+- [ ] Cờ CLI: `--carve <types>` (vd. `jpeg,png,zip,rar`), `--carve-out <dir>`, `--carve-index <file>`, `--carve-min-size`, `--carve-max-size`, `--carve-max-total`.
+- [ ] Quét streaming tái dùng reader chunk có gối (overlap ≥ độ dài header dài nhất); hỗ trợ `--start/--end` (Phase 3); chạy song song, kết quả ổn định theo offset.
+- [ ] Tìm chữ ký nhanh bằng `memchr`/aho-corasick (dùng lại prefilter đã có ở classifier); không đọc lại toàn dump cho từng loại.
+- [ ] Trần an toàn: dừng khi chạm `--carve-max-total`, in cảnh báo rõ (không im lặng như `--max-strings`), exit code riêng.
+
+### 8.2 Bộ validator theo định dạng
+- [ ] **JPEG:** `FF D8 FF` … `FF D9`, đi theo marker (SOI/APPn/DQT/SOF/DHT/SOS), loại false positive; xử lý thumbnail nhúng (EXIF) để không tạo bản trùng lồng nhau.
+- [ ] **PNG:** đi theo chunk, kiểm CRC, kết thúc ở `IEND`.
+- [ ] **ZIP:** `PK\x03\x04` … end-of-central-directory; nhận biết ZIP mã hoá (cờ bit 0) và OOXML/JAR (docx, xlsx, apk...).
+- [ ] **RAR4/RAR5, 7z:** theo chiều dài header; nhận biết archive mã hoá header.
+- [ ] **PDF, GZIP:** theo footer/độ dài; BMP và SQLite ở bước sau (BMP: `BM` + kích thước header; SQLite: page size × số trang).
+- [ ] Luôn chặn kích thước khai trong header bằng `--carve-max-size` và kích thước dump còn lại; không tin header.
+- [ ] Mỗi validator trả về `complete: true|false`, `truncated`, `reason` (vì sao dừng).
+
+### 8.3 Đầu ra và an toàn
+- [ ] Index JSON/NDJSON: `offset`, `type`, `size`, `sha256`, `entropy`, `complete`, `notes`, đường dẫn file đã ghi.
+- [ ] Dedupe theo SHA256; gom các bản trùng thành một dòng kèm danh sách offset.
+- [ ] File ghi ra có đuôi trung tính (`.carved`), tên theo `offset-type-hash`; không mở, không chạy, không giải nén.
+- [ ] Cảnh báo trong README: file carve có thể là mã độc, chỉ xem trong môi trường cô lập.
+- [ ] `--carve-out` là **bắt buộc**: không có thư mục đích thì dừng với lỗi rõ ràng thay vì ghi vào cwd.
+- [ ] Ghi đè an toàn: không ghi ra ngoài `--carve-out`, chống path traversal ở tên file, từ chối ghi đè file đã tồn tại.
+- [ ] Index là kênh riêng (`--carve-index`), không trộn vào `--format` chính; thêm dòng tóm tắt vào `--report summary` (số file, số `complete`, tổng byte).
+
+### 8.4 Nhận diện vỏ mã hoá (chỉ khoanh vùng)
+- [ ] Chữ ký container: BitLocker (`-FVE-FS-`), LUKS, OpenSSL (`Salted__`), PGP, VeraCrypt/TrueCrypt (nếu nhận diện được), ZIP/7z/RAR có mã hoá.
+- [ ] Vùng entropy cao không có chữ ký: xuất làm ứng viên với nhãn `high-entropy` (không phân biệt chắc nén với mã hoá), kèm offset và độ dài.
+- [ ] Tái dùng module entropy đã có ở Phase 4.2 (cửa sổ, ngưỡng, gộp vùng liền kề) thay vì viết lại.
+
+### 8.5 Mở rộng sau (P2)
+- [ ] **Quét khoá trong RAM** (module riêng, vd. `--find-keys`): lịch khoá AES (kiểu aeskeyfind), khoá RSA/PEM dạng nhị phân; nhắm tới việc tìm khoá cho vỏ ở 8.4.
+- [ ] Ghép mảnh (reassembly) theo thứ tự trang khi có bảng trang (dump `.DMP`, VM snapshot).
+- [ ] Thêm định dạng: BMP, SQLite, OLE/Office cũ, MP4, executable (PE/ELF carve).
+
+### 8.6 Test và đối chiếu
+- [ ] Dump tổng hợp đặt file ở offset biết trước: nằm trọn, vắt qua ranh giới chunk, bị cắt cụt, bị lồng nhau.
+- [ ] Golden test CLI trong `cli/tests/golden.rs` (cùng kiểu các phase trước): carve 1 JPEG + 1 PNG, kiểm index và `complete`.
+- [ ] Fuzz validator (`cargo-fuzz`): header khai kích thước khổng lồ, marker lặp vô hạn, chunk PNG sai CRC.
+- [ ] So sánh với foremost, PhotoRec, bulk_extractor trên cùng dump: số file, số false positive, thời gian, RAM.
+- [ ] Case thật: Lab 6 (6 chữ ký RAR → mở bằng mật khẩu tìm thấy), Lab 4 (JPEG/BMP/ZIP trên Desktop); ghi rõ file nào lấy lại được hoàn chỉnh, file nào không.
+
+**Xong khi:** carve được JPEG/PNG/ZIP/RAR hoàn chỉnh từ dump tổng hợp với 0 false negative trên bộ test; không panic và không vượt trần bộ nhớ trên input hỏng; so sánh công khai với foremost/PhotoRec có số liệu.
+
+---
+
 ## Mốc phát hành đề xuất
 
 | Mốc | Nội dung | Điều kiện |
 |-----|----------|-----------|
-| **0.10** | Phase 1 + 2 + 2.5 | README khớp code, CI có fuzz + MSRV, release theo tag có checksum |
-| **0.11** | Phase 3 | Có benchmark công khai, XOR chạy song song, quét dump lớn không treo (stream + tiến độ + cảnh báo giới hạn) |
-| **0.12** | Phase 4 (gồm 4.4) | Detector có validate, dedupe, entropy gọn |
-| **0.13** | Phase 5 | Encoding enum, NDJSON/CSV, completions |
-| **1.0** | Chốt API | API library ổn định, tài liệu đầy đủ, fuzz sạch |
-| **1.x** | Phase 6 | Thêm định dạng và binding theo nhu cầu |
+| **1.1** | Phase 1 + 2 + 2.5 | README khớp code, CI có fuzz + MSRV, release theo tag có checksum |
+| **1.2** | Phase 3 | Có benchmark công khai, XOR chạy song song, quét dump lớn không treo (stream + tiến độ + cảnh báo giới hạn) |
+| **1.3** | Phase 4 (phần còn lại của 4.1/4.3) | Noise filter, validate secret, dedupe mặc định |
+| **1.4** | Phase 5 | Completions, config, exit code có tài liệu |
+| **1.5** | Phase 7 | Demo MemLabs + bài viết + số liệu benchmark thật |
+| **1.6** | Phase 8 (8.1–8.4, 8.6) | `--carve` JPEG/PNG/ZIP/RAR có index + test + fuzz; nhận diện vỏ mã hoá |
+| **2.0** | Chốt API | API library ổn định, tài liệu đầy đủ, fuzz sạch |
+| **2.x** | Phase 6, 8.5 | Thêm định dạng, tìm khoá trong RAM, binding theo nhu cầu |
 
 ---
 
@@ -193,10 +261,13 @@ Mục tiêu: có vài case thật cho thấy bxmap tìm ra thứ có ý nghĩa n
 5. Giảm false positive secret + dedupe + trường `rule`/`confidence`/`context`
 6. Enum encoding + NDJSON/CSV
 7. Demo MemLabs + bài viết
-8. Định dạng mới, carving
+8. `--carve` (Phase 8: 8.1 → 8.2 → 8.3, rồi 8.4, 8.6)
+9. Định dạng mới, tìm khoá trong RAM (8.5), binding
 
 ## Ngoài phạm vi (cố ý không làm)
 
-- Giải mã/giải nén dữ liệu entropy cao (bxmap chỉ báo hiệu, không decrypt).
+- Giải mã/giải nén dữ liệu entropy cao (bxmap chỉ báo hiệu, không decrypt). `--carve` chỉ cắt file có cấu trúc và khoanh vùng vỏ mã hoá.
+- Crack/brute-force mật khẩu của archive hay container.
+- Tự giải nén hoặc thực thi file đã carve.
 - Phán quyết "độc hại / không độc hại": detector chỉ là gợi ý triage.
 - Phân tích hành vi hoặc dựng lại đối tượng kernel như Volatility.

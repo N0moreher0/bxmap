@@ -92,4 +92,16 @@ bxmap --help
 - `--entropy-no-data` — with `--entropy`, omit the `data_hex` payload and keep
   only `offset`, `length` and `entropy`.
 
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Scan finished and every extracted record was written. |
+| `1` | Usage or I/O error (bad flag, unreadable input, failed write). The message goes to stderr. |
+| `3` | `--max-strings` stopped the scan early. Results are incomplete; the warning names the offset where scanning stopped. Re-run with a larger limit or `--max-strings 0`. |
+
+`--report summary` repeats the limit status in the closing summary, and
+`json-tree`/`ndjson` carry `truncated` metadata so scripts can detect code `3`
+without parsing stderr.
+
 For library usage see the crate README at <https://docs.rs/bxmap>.
