@@ -112,7 +112,7 @@ padding bytes. `bxmap` gives applications a predictable core:
 
 - **Streaming by default**: scan multi-gigabyte files without loading them
   completely into RAM.
-- **Dual encoding support**: detect ASCII and UTF-16LE in the same pass.
+- **Multi-encoding support**: detect ASCII, UTF-16LE, UTF-16BE, UTF-32LE, and UTF-32BE in the same pass.
 - **Conservative noise filtering**: suppress clear period-1 and period-2
   fill patterns while preserving short evidence.
 - **Entropy hints**: identify fixed-size regions with high byte-distribution
@@ -139,7 +139,7 @@ padding bytes. `bxmap` gives applications a predictable core:
 
 ```toml
 [dependencies]
-bxmap = "0.9.3"
+bxmap = "1.0.4"
 ```
 
 Or:
@@ -148,8 +148,9 @@ Or:
 cargo add bxmap
 ```
 
-The crate exposes a Rust API only. Build your own CLI, service, desktop
-application, forensic pipeline, or scripting integration around it.
+The crate exposes a Rust API (including the `bxmap::minidump` module for
+MDMP parsing). Build your own CLI, service, desktop application, forensic
+pipeline, or scripting integration around it.
 
 For the ready-made frontend, inspect [`cli/src/main.rs`](./cli/src/main.rs)
 or install it with `cargo install bxmap-cli`.
@@ -289,15 +290,9 @@ The CLI adds:
 - `--extract tools` names the capture/analysis tooling in the dump (DumpIt,
   WinPmem, FTK Imager, Volatility, ...) and default `.raw`/`.mem` image names,
   with `trace=path|command|prefetch|filename` evidence.
-- `--report summary` adds encoding counts, scanned-range coverage, limit status
-  and top artifacts to the stderr summary.
+- `--report <mode>` adds encoding counts, scanned-range coverage, limit status
+  and top artifacts to the stderr summary; modes: `none`, `summary`, `user`, `all`.
 - IOC triage refangs `[.]`/`[at]`, validates public IPv4, drops private IP noise, uses entropy to reject base64 filler.
-  only the selected IOC type; Base64 mode decodes printable UTF-8 payloads
-- `--magic-bytes` to report bounded executable/document signatures such as PE
-  (`MZ`), ELF, ZIP/Office, PDF, and PNG
-- IOC triage refangs common `[.]`/`[at]` obfuscation, validates public IPv4
-  addresses, filters private IP noise, and uses entropy to reject Base64-like
-  filler
 - `--parse-pid` to map common PID markers in extracted strings
 - `-o/--output`
 - automatic scan reports and priority triage signals on `stderr`

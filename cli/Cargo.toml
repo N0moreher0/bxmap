@@ -2,7 +2,7 @@
 name = "bxmap-cli"
 version = "1.0.14"
 edition = "2021"
-license = "AGPL-3.0-only"
+license-file = "LICENSE-AGPL"
 description = "Command-line frontend for the bxmap memory-dump string extraction library"
 readme = "README.md"
 repository = "https://github.com/N0moreher0/bxmap"

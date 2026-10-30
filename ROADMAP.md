@@ -13,8 +13,8 @@ Phiên bản hiện tại: `bxmap` **1.0.4**, `bxmap-cli` **1.0.14** (Phase 4.4 
 Chi phí thấp, hiệu quả cao nhất. Làm trước khi thêm tính năng.
 
 ### 1.1 README và tài liệu
-- [ ] Sửa các chỗ mâu thuẫn: "ASCII/UTF-16LE" vs UTF-16BE/UTF-32; "No MDMP parsing" vs module `Minidump`; "Rust API only" vs `minidump`.
-- [ ] Xóa mục bị lặp (`--encoding`, `--magic-bytes`, IOC triage).
+- [x] Sửa các chỗ mâu thuẫn: "ASCII/UTF-16LE" vs UTF-16BE/UTF-32; "No MDMP parsing" vs module `Minidump`; "Rust API only" vs `minidump`.
+- [x] Xóa mục bị lặp (`--encoding`, `--magic-bytes`, IOC triage).
 - [x] Tách `cli/README.md` (cách dùng CLI); README gốc chỉ giữ phần library + link sang CLI.
 - [x] Thêm `CHANGELOG.md`, `SECURITY.md` (cách báo lỗi), `CONTRIBUTING.md`.
 - [ ] Thêm badge: CI, MSRV, crates.io version, docs.rs.
@@ -22,8 +22,8 @@ Chi phí thấp, hiệu quả cao nhất. Làm trước khi thêm tính năng.
 **Xong khi:** đọc README từ đầu đến cuối không còn câu nào trái với code hiện tại.
 
 ### 1.2 Giấy phép
-- [ ] Quyết định giấy phép cho **library** (`bxmap`): cân nhắc MIT/Apache-2.0 hoặc MPL-2.0 để dự án khác dùng được; giữ AGPL-3.0 cho `bxmap-cli` nếu muốn.
-- [ ] Cập nhật `Cargo.toml`, `LICENSE` từng crate, ghi rõ trong README.
+- [x] Quyết định giấy phép cho **library** (`bxmap`): **MIT OR Apache-2.0** (chuẩn Rust crate); giữ **AGPL-3.0** cho `bxmap-cli`.
+- [x] Cập nhật `Cargo.toml`, `LICENSE-MIT` + `LICENSE-APACHE` (library), `cli/LICENSE-AGPL` (CLI), ghi rõ trong README.
 
 ### 1.3 Release và chuỗi cung ứng
 - [x] Chuyển từ "mỗi push `main` ra release" sang **release theo tag semver**; push `main` chỉ build artifact CI (nightly).
