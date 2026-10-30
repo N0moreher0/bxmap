@@ -45,7 +45,7 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 ### 2.2 Bộ test
 - [ ] Unit test cho từng encoding (ASCII, UTF-16LE/BE, UTF-32LE/BE), gồm chuỗi nằm **vắt ngang ranh giới chunk** và ngang ranh giới region song song.
 - [ ] Test đảm bảo kết quả song song == kết quả tuần tự (cùng tập, cùng thứ tự theo offset).
-- [ ] Golden test cho output `text`, `json`, `json-tree`.
+- [~] Golden test cho output `text`, `json`, `json-tree` (integration smoke tests).
 - [ ] Bộ dump mẫu nhỏ, tổng hợp (không chứa dữ liệu thật) cho test hồi quy.
 
 **Xong khi:** CI chạy fuzz smoke test mỗi PR và không còn panic đã biết.

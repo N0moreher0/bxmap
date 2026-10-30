@@ -24,6 +24,5 @@ bxmap = { version = "1.0.4", path = "..", default-features = false }
 rayon = "1"
 regex = "1"
 
-[[bin]]
-name = "bxmap"
-path = "src/main.rs"
+[dev-dependencies]
+tempfile = "3"
