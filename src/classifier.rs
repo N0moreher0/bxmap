@@ -4,8 +4,9 @@
 //! (separate pass), so it doesn't touch the hot scanning path. Rules live
 //! here as data so they can be extended/tested without recompiling core logic.
 
-use std::sync::OnceLock;
+use aho_corasick::AhoCorasick;
 use regex::Regex;
+use std::sync::OnceLock;
 
 /// A concrete secret value extracted from text.
 #[derive(Debug, Clone)]
@@ -60,10 +61,134 @@ fn secret_compiled() -> &'static Vec<(&'static str, Regex)> {
     })
 }
 
+/// Literal anchors for `SECRET_PATTERNS`: every match of the named pattern MUST
+/// contain at least one of these substrings (compared ASCII case-insensitively,
+/// which only ever over-selects). A single Aho-Corasick pass over the text then
+/// tells us which of the regexes can possibly match, instead of running all of
+/// them on every string. A pattern missing from this table is simply always run,
+/// so forgetting an entry costs speed, never correctness.
+const SECRET_ANCHORS: &[(&str, &[&str])] = &[
+    ("AWS_ACCESS_KEY", &["AKIA"]),
+    ("AWS_SECRET_KEY", &["aws"]),
+    ("GOOGLE_API_KEY", &["AIza"]),
+    ("GOOGLE_OAUTH_CLIENT_ID", &[".apps.googleusercontent.com"]),
+    ("AZURE_STORAGE_KEY", &["azure"]),
+    ("AZURE_SAS_TOKEN", &["sig="]),
+    ("GITHUB_PAT_CLASSIC", &["ghp_"]),
+    ("GITHUB_FINE_GRAINED_PAT", &["github_pat_"]),
+    ("GITHUB_OAUTH_TOKEN", &["gho_"]),
+    ("GITHUB_APP_TOKEN", &["ghu_", "ghs_"]),
+    ("GITLAB_PAT", &["glpat-"]),
+    ("NPM_TOKEN", &["npm_"]),
+    ("OPENAI_API_KEY", &["sk-"]),
+    ("ANTHROPIC_API_KEY", &["sk-ant-"]),
+    ("HUGGINGFACE_TOKEN", &["hf_"]),
+    ("DEEPSEEK_API_KEY", &["sk-"]),
+    ("STRIPE_SECRET_KEY", &["sk_live_", "sk_test_"]),
+    ("STRIPE_PUBLISHABLE_KEY", &["pk_live_", "pk_test_"]),
+    ("STRIPE_RESTRICTED_KEY", &["rk_live_", "rk_test_"]),
+    ("PAYPAL_CLIENT_SECRET", &["paypal"]),
+    ("SLACK_BOT_TOKEN", &["xoxb-"]),
+    ("SLACK_USER_TOKEN", &["xoxp-"]),
+    ("SLACK_WEBHOOK", &["https://hooks.slack.com/services/"]),
+    ("TWILIO_API_KEY_SID", &["SK"]),
+    ("TWILIO_AUTH_TOKEN", &["twilio"]),
+    ("SENDGRID_API_KEY", &["SG."]),
+    ("JWT_TOKEN", &["eyJ"]),
+    ("PRIVATE_KEY_BLOCK", &["-----BEGIN "]),
+    (
+        "DATABASE_URI",
+        &["postgres", "mysql", "mongodb", "redis", "sqlserver", "mssql"],
+    ),
+    (
+        "GENERIC_SECRET",
+        &["password", "passwd", "secret", "token", "apikey", "api_key"],
+    ),
+];
+
+/// Minimum byte length of any possible match, per pattern (derived from the regex).
+/// Lets us skip patterns that have no literal anchor (Discord) on short strings.
+const SECRET_MIN_LEN: &[(&str, usize)] = &[
+    ("DISCORD_BOT_TOKEN", 59), // 24 + '.' + 6 + '.' + 27+
+    ("TWILIO_API_KEY_SID", 34), // "SK" + 32 hex
+];
+
+struct SecretPrefilter {
+    ac: AhoCorasick,
+    /// Aho-Corasick pattern id -> bitmask of `SECRET_PATTERNS` indices it enables.
+    anchor_masks: Vec<u64>,
+    /// Patterns without anchors: candidates for every string.
+    always: u64,
+    /// Every pattern (used for non-ASCII text, see `secret_candidates`).
+    all: u64,
+    /// (pattern index, min byte length) gates.
+    gates: Vec<(usize, usize)>,
+}
+
+fn secret_prefilter() -> &'static SecretPrefilter {
+    static PREFILTER: OnceLock<SecretPrefilter> = OnceLock::new();
+    PREFILTER.get_or_init(|| {
+        let count = SECRET_PATTERNS.len();
+        assert!(count <= 64, "secret prefilter uses a u64 bitmask");
+        let all = if count == 64 { u64::MAX } else { (1u64 << count) - 1 };
+        let mut anchors: Vec<&str> = Vec::new();
+        let mut anchor_masks: Vec<u64> = Vec::new();
+        let mut anchored = 0u64;
+        let mut gates = Vec::new();
+        for (idx, (name, _)) in SECRET_PATTERNS.iter().enumerate() {
+            if let Some((_, lits)) = SECRET_ANCHORS.iter().find(|(n, _)| n == name) {
+                for lit in lits.iter() {
+                    match anchors.iter().position(|a| a.eq_ignore_ascii_case(lit)) {
+                        Some(pos) => anchor_masks[pos] |= 1u64 << idx,
+                        None => {
+                            anchors.push(lit);
+                            anchor_masks.push(1u64 << idx);
+                        }
+                    }
+                }
+                anchored |= 1u64 << idx;
+            }
+            if let Some((_, min)) = SECRET_MIN_LEN.iter().find(|(n, _)| n == name) {
+                gates.push((idx, *min));
+            }
+        }
+        let ac = AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(&anchors)
+            .expect("secret anchors form a valid automaton");
+        SecretPrefilter { ac, anchor_masks, always: all & !anchored, all, gates }
+    })
+}
+
+/// Bitmask over `SECRET_PATTERNS` of the patterns that can possibly match `text`.
+fn secret_candidates(text: &str) -> u64 {
+    let pf = secret_prefilter();
+    // `(?i)` in the regexes is Unicode-aware (e.g. U+017F folds to 's', U+212A to
+    // 'k') while the automaton only folds ASCII, so for non-ASCII text we keep the
+    // exact old behaviour and try every pattern.
+    if !text.is_ascii() {
+        return pf.all;
+    }
+    let mut mask = pf.always;
+    for m in pf.ac.find_overlapping_iter(text) {
+        mask |= pf.anchor_masks[m.pattern().as_usize()];
+    }
+    for &(idx, min) in &pf.gates {
+        if text.len() < min {
+            mask &= !(1u64 << idx);
+        }
+    }
+    mask
+}
+
 pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for (name, re) in secret_compiled() {
+    let candidates = secret_candidates(text);
+    for (idx, (name, re)) in secret_compiled().iter().enumerate() {
+        if candidates & (1u64 << idx) == 0 {
+            continue;
+        }
         for m in re.find_iter(text) {
             let val = m.as_str().to_string();
             if seen.insert(val.clone()) {
@@ -156,7 +281,11 @@ pub fn entropy_of(text: &str) -> f64 {
 pub fn classify(text: &str) -> Option<Classification> {
     let e = entropy_of(text);
     // Secret patterns take priority
-    for (name, re) in secret_compiled() {
+    let candidates = secret_candidates(text);
+    for (idx, (name, re)) in secret_compiled().iter().enumerate() {
+        if candidates & (1u64 << idx) == 0 {
+            continue;
+        }
         if re.is_match(text) {
             if *name == "GENERIC_SECRET" {
                 // only classify if entropy reasonable? keep as-is
@@ -189,6 +318,94 @@ mod tests {
         assert_eq!(c.group, "SECRET");
         assert_eq!(c.typ, "AWS_ACCESS_KEY");
     }
+    /// The pre-prefilter implementation, kept as the reference for equivalence tests.
+    fn detect_secrets_reference(text: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (name, re) in secret_compiled() {
+            for m in re.find_iter(text) {
+                let val = m.as_str().to_string();
+                if seen.insert(val.clone()) {
+                    out.push((name.to_string(), val));
+                }
+            }
+        }
+        out
+    }
+
+    fn detect_pairs(text: &str) -> Vec<(String, String)> {
+        detect_secrets(text).into_iter().map(|m| (m.typ.to_string(), m.value)).collect()
+    }
+
+    #[test]
+    fn prefilter_is_equivalent_to_running_every_regex() {
+        let samples = [
+            "AKIAIOSFODNN7EXAMPLE",
+            "akiaiosfodnn7example",
+            "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+            "github_pat_11ABCDEFG0123456789_abcdefghij",
+            "sk-abcdefghijklmnopqrstuvwxyz012345",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+            "SK0123456789abcdef0123456789abcde",
+            "sk_live_abcdefghijklmnopqrstuv",
+            "xoxb-123456789012-abcdefghij",
+            "https://hooks.slack.com/services/T000/B000/XXXX",
+            "SG.abcdefghijklmnopqrstu.abcdefghijklmnopqrstu",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop",
+            "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----",
+            "postgres://user:pw@db.example.com:5432/app",
+            "MONGODB://u:p@host/db",
+            "PASSWORD=hunter2hunter2",
+            "Api_Key: abcdef123456",
+            "token=abc",
+            "aws_secret_access_key = wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+            "AZURE storage account key AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "https://example.com/x?foo=1&sig=abcdefghijklmnopqrstuvwx",
+            "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM.abcdef.abcdefghijklmnopqrstuvwxyz0",
+            "hello world this is a plain sentence",
+            "",
+            "SK",
+            // non-ASCII: (?i) is Unicode-aware, the automaton is not
+            "\u{17F}ecret=abcdefgh1234",
+            "to\u{212A}en=abcdefgh1234",
+            "pa\u{17F}\u{17F}word=abcdefgh1234",
+        ];
+        for text in samples {
+            assert_eq!(detect_pairs(text), detect_secrets_reference(text), "text: {text:?}");
+        }
+        // pseudo-random mixes of anchors and noise
+        let atoms = [
+            "AKIA", "ghp_", "sk-", "SK", "eyJ", ".", "=", ":", "token", "SECRET", "passwd",
+            "redis", "://", "SG.", "aws", "xoxb-", "Azure", "key", "ABCDEFGHIJKLMNOPQRST",
+            "0123456789abcdef0123456789abcdef", "-----BEGIN ", "PRIVATE KEY-----", " ", "x",
+        ];
+        let mut state = 0x2545F4914F6CDD1Du64;
+        for _ in 0..4000 {
+            let mut text = String::new();
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            let parts = 1 + (state % 7) as usize;
+            for _ in 0..parts {
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                text.push_str(atoms[(state % atoms.len() as u64) as usize]);
+            }
+            assert_eq!(detect_pairs(&text), detect_secrets_reference(&text), "text: {text:?}");
+        }
+    }
+
+    #[test]
+    fn every_secret_pattern_has_an_anchor_entry() {
+        // Not required for correctness (missing entries are always run) but it is
+        // what makes the prefilter effective, so keep the tables in sync.
+        for (name, _) in SECRET_PATTERNS {
+            let anchored = SECRET_ANCHORS.iter().any(|(n, _)| n == name);
+            let gated = SECRET_MIN_LEN.iter().any(|(n, _)| n == name);
+            assert!(anchored || gated, "{name} has neither anchors nor a length gate");
+        }
+        for (name, _) in SECRET_ANCHORS {
+            assert!(SECRET_PATTERNS.iter().any(|(n, _)| n == name), "stale anchor entry {name}");
+        }
+    }
+
     #[test]
     fn generic_string_unclassified() {
         let c = classify("hello world this is a normal sentence");

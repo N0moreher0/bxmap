@@ -371,6 +371,57 @@ fn is_printable(b: u8) -> bool {
 /// position could be the START of a new string (every offset is tried),
 /// but while a run is ALREADY open, the next test only happens at the
 /// correct "next low byte" position (2 bytes ahead).
+/// Selects which encodings the scanner will actually look for. Restricting
+/// this (e.g. to ASCII only) lets the core loop skip the work for the other
+/// encodings entirely, instead of scanning everything and filtering later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodingFilter {
+    pub ascii: bool,
+    pub utf16le: bool,
+    pub utf16be: bool,
+    pub utf32le: bool,
+    pub utf32be: bool,
+}
+
+impl EncodingFilter {
+    pub const fn all() -> Self {
+        Self {
+            ascii: true,
+            utf16le: true,
+            utf16be: true,
+            utf32le: true,
+            utf32be: true,
+        }
+    }
+    pub const fn ascii() -> Self {
+        Self {
+            ascii: true,
+            utf16le: false,
+            utf16be: false,
+            utf32le: false,
+            utf32be: false,
+        }
+    }
+    pub const fn utf16() -> Self {
+        Self {
+            ascii: false,
+            utf16le: true,
+            utf16be: true,
+            utf32le: false,
+            utf32be: false,
+        }
+    }
+    pub const fn utf32() -> Self {
+        Self {
+            ascii: false,
+            utf16le: false,
+            utf16be: false,
+            utf32le: true,
+            utf32be: true,
+        }
+    }
+}
+
 struct StringRunScanner<'a> {
     min_len: usize,
     noise_cfg: NoiseConfig,
@@ -394,6 +445,12 @@ struct StringRunScanner<'a> {
     u32be_start: i64,
     u32be_next_pos: i64,
     u32be_buf: Vec<u32>,
+
+    encodings: EncodingFilter,
+    candidate_start: [bool; 256],
+
+    /// Reused ASCII staging buffer for the repeat-noise check and text creation.
+    scratch: Vec<u8>,
 }
 
 impl<'a> StringRunScanner<'a> {
@@ -401,7 +458,20 @@ impl<'a> StringRunScanner<'a> {
         min_len: usize,
         noise_cfg: NoiseConfig,
         on_found: &'a mut dyn FnMut(ExtractedString),
+        encodings: EncodingFilter,
     ) -> Self {
+        // Precompute a per-byte "could this byte be the START of some enabled
+        // run?" table. Used by the fast-skip path. Conservative: a may-be-start
+        // byte is never skipped, even if the subsequent conditions end up not
+        // opening a run (correctness only suffers speed, never results).
+        let mut candidate_start = [false; 256];
+        let le_enabled = encodings.ascii || encodings.utf16le || encodings.utf32le;
+        let be_enabled = encodings.utf16be || encodings.utf32be;
+        for i in 0..256usize {
+            let b = i as u8;
+            candidate_start[i] = (le_enabled && is_printable(b))
+                || (be_enabled && (b == 0 || is_printable(b)));
+        }
         Self {
             min_len,
             noise_cfg,
@@ -423,6 +493,9 @@ impl<'a> StringRunScanner<'a> {
             u32be_start: -1,
             u32be_next_pos: -1,
             u32be_buf: Vec::with_capacity(64),
+            encodings,
+            candidate_start,
+            scratch: Vec::with_capacity(64),
         }
     }
 
@@ -463,12 +536,64 @@ impl<'a> StringRunScanner<'a> {
                 && self.u32le_start < 0
                 && self.u32be_start < 0
             {
+                let valid_end = offset + buffer_valid_len;
                 while k < process_count {
-                    let b = buffer[offset + k];
-                    if b == 0x00 || is_printable(b) {
-                        break;
+                    let i = offset + k;
+                    let b = buffer[i];
+                    // Fast path: bytes that cannot possibly open ANY enabled
+                    // run (non-printable AND, for BE-only scan, non-zero) are
+                    // skipped; 8 at a time when a whole word has no candidate.
+                    if !self.candidate_start[b as usize] {
+                        if k + 8 <= process_count && i + 8 <= valid_end {
+                            let mut all_noncandidate = true;
+                            for t in 1..8usize {
+                                if self.candidate_start[buffer[i + t] as usize] {
+                                    all_noncandidate = false;
+                                    break;
+                                }
+                            }
+                            if all_noncandidate {
+                                k += 8;
+                                continue;
+                            }
+                        }
+                        k += 1;
+                        continue;
                     }
-                    k += 1;
+                    if b == 0x00 {
+                        // zero handling only relevant for BE runs.
+                        if !(self.encodings.utf16be || self.encodings.utf32be) {
+                            // zero can't open anything else: treat as
+                            // non-candidate. (candidate_start would already be
+                            // false in this configuration, so we shouldn't
+                            // reach here -- guard for safety.)
+                            k += 1;
+                            continue;
+                        }
+                        // 8 zero bytes ahead => positions k..k+4 cannot start anything.
+                        if k + 4 <= process_count
+                            && i + 8 <= valid_end
+                            && u64::from_ne_bytes(buffer[i..i + 8].try_into().unwrap()) == 0
+                        {
+                            k += 4;
+                            continue;
+                        }
+                        let can_u16be = self.encodings.utf16be
+                            && i + 1 < valid_end
+                            && is_printable(buffer[i + 1]);
+                        let can_u32be = self.encodings.utf32be
+                            && i + 3 < valid_end
+                            && buffer[i + 1] == 0
+                            && buffer[i + 2] == 0
+                            && is_printable(buffer[i + 3]);
+                        if can_u16be || can_u32be {
+                            break;
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    // a printable candidate byte
+                    break;
                 }
                 if k >= process_count {
                     break;
@@ -481,41 +606,52 @@ impl<'a> StringRunScanner<'a> {
             let printable_b = is_printable(b); // shared by both branches below, avoids looking up the table twice for the same byte
 
             // -- ASCII: only needs the current byte itself, no lookahead --
-            if printable_b {
-                if self.ascii_start < 0 {
-                    self.ascii_start = g as i64;
-                }
-                self.ascii_buf.push(b);
-                if self.ascii_buf.len() >= MAX_RUN_CHARS {
+            if self.encodings.ascii {
+                if printable_b {
+                    if self.ascii_start < 0 {
+                        self.ascii_start = g as i64;
+                    }
+                    self.ascii_buf.push(b);
+                    if self.ascii_buf.len() >= MAX_RUN_CHARS {
+                        self.flush_ascii();
+                    }
+                } else {
                     self.flush_ascii();
                 }
-            } else {
-                self.flush_ascii();
+            } else if self.ascii_start >= 0 {
+                self.ascii_start = -1;
+                self.ascii_buf.clear();
             }
 
-            // -- UTF-16LE: needs a lookahead at buffer[i+1] --
-            let has_next = (i + 1) < (offset + buffer_valid_len);
-            if has_next {
-                let aligned = self.u16_start < 0 || g as i64 == self.u16_next_pos;
-                if aligned {
-                    let hi = buffer[i + 1];
-                    if hi == 0x00 && printable_b {
-                        if self.u16_start < 0 {
-                            self.u16_start = g as i64;
-                            self.u16_buf.clear();
-                        }
-                        self.u16_buf.push(b as u16);
-                        self.u16_next_pos = g as i64 + 2;
-                        if self.u16_buf.len() >= MAX_RUN_CHARS {
+            if self.encodings.utf16le {
+                // -- UTF-16LE: needs a lookahead at buffer[i+1] --
+                let has_next = (i + 1) < (offset + buffer_valid_len);
+                if has_next {
+                    let aligned = self.u16_start < 0 || g as i64 == self.u16_next_pos;
+                    if aligned {
+                        let hi = buffer[i + 1];
+                        if hi == 0x00 && printable_b {
+                            if self.u16_start < 0 {
+                                self.u16_start = g as i64;
+                                self.u16_buf.clear();
+                            }
+                            self.u16_buf.push(b as u16);
+                            self.u16_next_pos = g as i64 + 2;
+                            if self.u16_buf.len() >= MAX_RUN_CHARS {
+                                self.flush_u16();
+                            }
+                        } else {
                             self.flush_u16();
                         }
-                    } else {
-                        self.flush_u16();
                     }
                 }
+            } else if self.u16_start >= 0 {
+                self.u16_start = -1;
+                self.u16_next_pos = -1;
+                self.u16_buf.clear();
             }
 
-            // -- UTF-16BE --
+            if self.encodings.utf16be {
             if i + 1 < (offset + buffer_valid_len) {
                 let aligned = self.u16be_start < 0 || g as i64 == self.u16be_next_pos;
                 if aligned {
@@ -552,7 +688,14 @@ impl<'a> StringRunScanner<'a> {
                 }
             }
 
-            // -- UTF-32LE --
+
+            } else if self.u16be_start >= 0 {
+                self.u16be_start = -1;
+                self.u16be_next_pos = -1;
+                self.u16be_buf.clear();
+            }
+
+            if self.encodings.utf32le {
             if i + 3 < (offset + buffer_valid_len) {
                 let aligned = self.u32le_start < 0 || g as i64 == self.u32le_next_pos;
                 if aligned {
@@ -580,31 +723,43 @@ impl<'a> StringRunScanner<'a> {
                 self.flush_u32le();
             }
 
-            // -- UTF-32BE --
-            if i + 3 < (offset + buffer_valid_len) {
-                let aligned = self.u32be_start < 0 || g as i64 == self.u32be_next_pos;
-                if aligned {
-                    let b1 = buffer[i + 1];
-                    let b2 = buffer[i + 2];
-                    let b3 = buffer[i + 3];
-                    if b == 0 && b1 == 0 && b2 == 0 && is_printable(b3) {
-                        if self.u32be_start < 0 {
-                            self.u32be_start = g as i64;
-                            self.u32be_buf.clear();
-                        }
-                        self.u32be_buf.push(b3 as u32);
-                        self.u32be_next_pos = g as i64 + 4;
-                        if self.u32be_buf.len() >= MAX_RUN_CHARS {
-                            self.flush_u32be();
-                        }
-                    } else {
-                        if self.u32be_start >= 0 {
-                            self.flush_u32be();
+
+            } else if self.u32le_start >= 0 {
+                self.u32le_start = -1;
+                self.u32le_next_pos = -1;
+                self.u32le_buf.clear();
+            }
+
+            if self.encodings.utf32be {
+                if i + 3 < (offset + buffer_valid_len) {
+                    let aligned = self.u32be_start < 0 || g as i64 == self.u32be_next_pos;
+                    if aligned {
+                        let b1 = buffer[i + 1];
+                        let b2 = buffer[i + 2];
+                        let b3 = buffer[i + 3];
+                        if b == 0 && b1 == 0 && b2 == 0 && is_printable(b3) {
+                            if self.u32be_start < 0 {
+                                self.u32be_start = g as i64;
+                                self.u32be_buf.clear();
+                            }
+                            self.u32be_buf.push(b3 as u32);
+                            self.u32be_next_pos = g as i64 + 4;
+                            if self.u32be_buf.len() >= MAX_RUN_CHARS {
+                                self.flush_u32be();
+                            }
+                        } else {
+                            if self.u32be_start >= 0 {
+                                self.flush_u32be();
+                            }
                         }
                     }
+                } else if self.u32be_start >= 0 {
+                    self.flush_u32be();
                 }
             } else if self.u32be_start >= 0 {
-                self.flush_u32be();
+                self.u32be_start = -1;
+                self.u32be_next_pos = -1;
+                self.u32be_buf.clear();
             }
 
             k += 1;
@@ -622,6 +777,11 @@ impl<'a> StringRunScanner<'a> {
     }
 
     fn flush_ascii(&mut self) {
+        if !self.encodings.ascii {
+            self.ascii_start = -1;
+            self.ascii_buf.clear();
+            return;
+        }
         if self.ascii_start >= 0
             && self.ascii_buf.len() >= self.min_len
             && !is_low_information_repeat(&self.ascii_buf, &self.noise_cfg)
@@ -638,12 +798,19 @@ impl<'a> StringRunScanner<'a> {
     }
 
     fn flush_u16(&mut self) {
+        if !self.encodings.utf16le {
+            self.u16_start = -1;
+            self.u16_next_pos = -1;
+            self.u16_buf.clear();
+            return;
+        }
         if self.u16_start >= 0 && self.u16_buf.len() >= self.min_len {
             // u16_buf always holds values in 0..=0x7F (gated by is_printable
             // before pushing) -- the `as u8` cast is safe, no bits lost.
-            let as_bytes: Vec<u8> = self.u16_buf.iter().map(|&c| c as u8).collect();
-            if !is_low_information_repeat(&as_bytes, &self.noise_cfg) {
-                let text = String::from_utf16_lossy(&self.u16_buf);
+            self.scratch.clear();
+            self.scratch.extend(self.u16_buf.iter().map(|&c| c as u8));
+            if !is_low_information_repeat(&self.scratch, &self.noise_cfg) {
+                let text = String::from_utf8_lossy(&self.scratch).into_owned();
                 (self.on_found)(ExtractedString {
                     offset: self.u16_start as u64,
                     encoding: "utf16le",
@@ -657,10 +824,17 @@ impl<'a> StringRunScanner<'a> {
     }
 
     fn flush_u16be(&mut self) {
+        if !self.encodings.utf16be {
+            self.u16be_start = -1;
+            self.u16be_next_pos = -1;
+            self.u16be_buf.clear();
+            return;
+        }
         if self.u16be_start >= 0 && self.u16be_buf.len() >= self.min_len {
-            let as_bytes: Vec<u8> = self.u16be_buf.iter().map(|&c| c as u8).collect();
-            if !is_low_information_repeat(&as_bytes, &self.noise_cfg) {
-                let text = String::from_utf16_lossy(&self.u16be_buf);
+            self.scratch.clear();
+            self.scratch.extend(self.u16be_buf.iter().map(|&c| c as u8));
+            if !is_low_information_repeat(&self.scratch, &self.noise_cfg) {
+                let text = String::from_utf8_lossy(&self.scratch).into_owned();
                 (self.on_found)(ExtractedString {
                     offset: self.u16be_start as u64,
                     encoding: "utf16be",
@@ -674,10 +848,17 @@ impl<'a> StringRunScanner<'a> {
     }
 
     fn flush_u32le(&mut self) {
+        if !self.encodings.utf32le {
+            self.u32le_start = -1;
+            self.u32le_next_pos = -1;
+            self.u32le_buf.clear();
+            return;
+        }
         if self.u32le_start >= 0 && self.u32le_buf.len() >= self.min_len {
-            let as_bytes: Vec<u8> = self.u32le_buf.iter().map(|&c| c as u8).collect();
-            if !is_low_information_repeat(&as_bytes, &self.noise_cfg) {
-                let text: String = as_bytes.iter().map(|&b| b as char).collect();
+            self.scratch.clear();
+            self.scratch.extend(self.u32le_buf.iter().map(|&c| c as u8));
+            if !is_low_information_repeat(&self.scratch, &self.noise_cfg) {
+                let text = String::from_utf8_lossy(&self.scratch).into_owned();
                 (self.on_found)(ExtractedString {
                     offset: self.u32le_start as u64,
                     encoding: "utf32le",
@@ -691,10 +872,17 @@ impl<'a> StringRunScanner<'a> {
     }
 
     fn flush_u32be(&mut self) {
+        if !self.encodings.utf32be {
+            self.u32be_start = -1;
+            self.u32be_next_pos = -1;
+            self.u32be_buf.clear();
+            return;
+        }
         if self.u32be_start >= 0 && self.u32be_buf.len() >= self.min_len {
-            let as_bytes: Vec<u8> = self.u32be_buf.iter().map(|&c| c as u8).collect();
-            if !is_low_information_repeat(&as_bytes, &self.noise_cfg) {
-                let text: String = as_bytes.iter().map(|&b| b as char).collect();
+            self.scratch.clear();
+            self.scratch.extend(self.u32be_buf.iter().map(|&c| c as u8));
+            if !is_low_information_repeat(&self.scratch, &self.noise_cfg) {
+                let text = String::from_utf8_lossy(&self.scratch).into_owned();
                 (self.on_found)(ExtractedString {
                     offset: self.u32be_start as u64,
                     encoding: "utf32be",
@@ -778,12 +966,48 @@ pub fn extract_strings_with_noise_config(
                 results.push(s);
             }
         };
-        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found);
+        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
         scanner.feed(data, 0, data.len(), data.len(), 0);
         scanner.flush_all();
     }
     results.sort_by_key(|s| s.offset);
     results
+}
+
+/// Same as [`extract_strings_with_noise_config`], but only scans the encodings
+/// selected by `encodings` (see [`EncodingFilter`]).
+pub fn extract_strings_with_noise_config_and_encodings(
+    data: &[u8],
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+) -> Vec<ExtractedString> {
+    let mut results: Vec<ExtractedString> =
+        Vec::with_capacity(estimate_capacity(data.len() as u64, max_strings));
+    {
+        let mut on_found = |s: ExtractedString| {
+            if results.len() < max_strings {
+                results.push(s);
+            }
+        };
+        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, encodings);
+        scanner.feed(data, 0, data.len(), data.len(), 0);
+        scanner.flush_all();
+    }
+    results.sort_by_key(|s| s.offset);
+    results
+}
+
+/// Convenience wrapper combining [`NoiseConfig::default`] with an encoding
+/// selection (see [`EncodingFilter`]).
+pub fn extract_strings_with_encodings(
+    data: &[u8],
+    min_len: usize,
+    max_strings: usize,
+    encodings: EncodingFilter,
+) -> Vec<ExtractedString> {
+    extract_strings_with_noise_config_and_encodings(data, min_len, max_strings, NoiseConfig::default(), encodings)
 }
 
 // Borrow-checker note: in `extract_strings_from_reader` below, the outer
@@ -834,7 +1058,7 @@ pub fn extract_strings_from_reader_with_noise_config<R: Read>(
                 count.set(count.get() + 1);
             }
         };
-        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found);
+        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
 
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut global_base: u64 = 0;
@@ -876,6 +1100,82 @@ pub fn extract_strings_from_reader_with_noise_config<R: Read>(
     Ok(results)
 }
 
+/// Same as [`extract_strings_from_reader_with_noise_config`], but only scans the
+/// encodings selected by `encodings` (see [`EncodingFilter`]).
+pub fn extract_strings_from_reader_with_noise_config_and_encodings<R: Read>(
+    mut reader: R,
+    min_len: usize,
+    max_strings: usize,
+    estimated_len: u64,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+) -> std::io::Result<Vec<ExtractedString>> {
+    let mut results: Vec<ExtractedString> =
+        Vec::with_capacity(estimate_capacity(estimated_len, max_strings));
+    let count = std::cell::Cell::new(0usize);
+    {
+        let mut on_found = |s: ExtractedString| {
+            if count.get() < max_strings {
+                results.push(s);
+                count.set(count.get() + 1);
+            }
+        };
+        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, encodings);
+
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        let mut global_base: u64 = 0;
+        let mut carry_len: usize = 0; // 0 or 1
+
+        while count.get() < max_strings {
+            let to_read_into = buffer.len() - carry_len;
+            let mut read_total = 0usize;
+            while read_total < to_read_into {
+                let n =
+                    reader.read(&mut buffer[carry_len + read_total..carry_len + to_read_into])?;
+                if n == 0 {
+                    break;
+                }
+                read_total += n;
+            }
+
+            let len = carry_len + read_total;
+            if len == 0 {
+                break;
+            }
+
+            let is_last_chunk = read_total < to_read_into;
+
+            if is_last_chunk {
+                scanner.feed(&buffer, 0, len, len, global_base);
+                scanner.flush_all();
+                break;
+            } else {
+                scanner.feed(&buffer, 0, len - 1, len, global_base);
+                buffer[0] = buffer[len - 1];
+                carry_len = 1;
+                global_base += (len - 1) as u64;
+            }
+        }
+    }
+
+    results.sort_by_key(|s| s.offset);
+    Ok(results)
+}
+
+/// Convenience wrapper of [`extract_strings_from_reader_with_noise_config_and_encodings`]
+/// with the default noise config.
+pub fn extract_strings_from_reader_with_encodings<R: Read>(
+    reader: R,
+    min_len: usize,
+    max_strings: usize,
+    estimated_len: u64,
+    encodings: EncodingFilter,
+) -> std::io::Result<Vec<ExtractedString>> {
+    extract_strings_from_reader_with_noise_config_and_encodings(
+        reader, min_len, max_strings, estimated_len, NoiseConfig::default(), encodings,
+    )
+}
+
 /// Streams extracted strings to `on_found` while scanning a reader.
 ///
 /// The input is still read in fixed-size chunks, but results are delivered
@@ -895,7 +1195,7 @@ pub fn extract_strings_from_reader_streaming<R: Read, F: FnMut(ExtractedString)>
             on_found(s);
         }
     };
-    let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut scanner_callback);
+    let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut scanner_callback, EncodingFilter::all());
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut global_base = 0u64;
     let mut carry_len = 0usize;
@@ -929,6 +1229,72 @@ pub fn extract_strings_from_reader_streaming<R: Read, F: FnMut(ExtractedString)>
     }
 
     Ok(emitted.get())
+}
+
+/// Streaming variant, but only scans the encodings selected by `encodings`.
+pub fn extract_strings_from_reader_streaming_with_encodings<R: Read, F: FnMut(ExtractedString)>(
+    mut reader: R,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+    mut on_found: F,
+) -> std::io::Result<usize> {
+    let emitted = std::cell::Cell::new(0usize);
+    let mut scanner_callback = |s: ExtractedString| {
+        if emitted.get() < max_strings {
+            emitted.set(emitted.get() + 1);
+            on_found(s);
+        }
+    };
+    let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut scanner_callback, encodings);
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut global_base = 0u64;
+    let mut carry_len = 0usize;
+
+    while emitted.get() < max_strings {
+        let to_read_into = buffer.len() - carry_len;
+        let mut read_total = 0usize;
+        while read_total < to_read_into {
+            let n = reader.read(&mut buffer[carry_len + read_total..carry_len + to_read_into])?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+
+        let len = carry_len + read_total;
+        if len == 0 {
+            break;
+        }
+        let is_last_chunk = read_total < to_read_into;
+        if is_last_chunk {
+            scanner.feed(&buffer, 0, len, len, global_base);
+            scanner.flush_all();
+            break;
+        }
+
+        scanner.feed(&buffer, 0, len - 1, len, global_base);
+        buffer[0] = buffer[len - 1];
+        carry_len = 1;
+        global_base += (len - 1) as u64;
+    }
+
+    Ok(emitted.get())
+}
+
+/// File-based streaming variant of the encoding-aware streaming scanner.
+pub fn extract_strings_from_file_streaming_with_encodings<F: FnMut(ExtractedString)>(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+    on_found: F,
+) -> std::io::Result<usize> {
+    let file = File::open(dump_path)?;
+    let reader = BufReader::with_capacity(1 << 16, file);
+    extract_strings_from_reader_streaming_with_encodings(reader, min_len, max_strings, noise_cfg, encodings, on_found)
 }
 
 /// File-based streaming variant of [`extract_strings_from_reader_streaming`].
@@ -979,6 +1345,40 @@ pub fn extract_strings_from_file_with_noise_config(
         max_strings,
         estimated_len,
         noise_cfg,
+    )
+}
+
+/// Same as [`extract_strings_from_file_with_noise_config`], but only scans the
+/// encodings selected by `encodings` (see [`EncodingFilter`]).
+pub fn extract_strings_from_file_with_noise_config_and_encodings(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+) -> std::io::Result<Vec<ExtractedString>> {
+    let file = File::open(dump_path)?;
+    let estimated_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let reader = BufReader::with_capacity(1 << 16, file);
+    extract_strings_from_reader_with_noise_config_and_encodings(
+        reader,
+        min_len,
+        max_strings,
+        estimated_len,
+        noise_cfg,
+        encodings,
+    )
+}
+
+/// Convenience wrapper of the above with the default noise config.
+pub fn extract_strings_from_file_with_encodings(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+    encodings: EncodingFilter,
+) -> std::io::Result<Vec<ExtractedString>> {
+    extract_strings_from_file_with_noise_config_and_encodings(
+        dump_path, min_len, max_strings, NoiseConfig::default(), encodings,
     )
 }
 
@@ -1056,7 +1456,65 @@ pub fn extract_strings_from_file_parallel(
                         local.push(s);
                     }
                 };
-                let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found);
+                let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
+                scanner.feed(&buf, 0, buf.len(), buf.len(), start);
+                scanner.flush_all();
+            }
+            Ok(local)
+        })
+        .collect();
+
+    let mut results = Vec::new();
+    for r in chunk_results {
+        results.extend(r?);
+    }
+    results.sort_by_key(|s| s.offset);
+    if results.len() > max_strings {
+        results.truncate(max_strings);
+    }
+    Ok(results)
+}
+
+/// Same as [`extract_strings_from_file_parallel`], but only scans the encodings
+/// selected by `encodings` (see [`EncodingFilter`]).
+pub fn extract_strings_from_file_parallel_with_encodings(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+) -> std::io::Result<Vec<ExtractedString>> {
+    use rayon::prelude::*;
+
+    let file_len = std::fs::metadata(dump_path)?.len();
+    if file_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let overlap = MAX_RUN_CHARS as u64;
+    let n_chunks = ((file_len + PARALLEL_CHUNK_SIZE - 1) / PARALLEL_CHUNK_SIZE) as usize;
+
+    let chunk_results: Vec<std::io::Result<Vec<ExtractedString>>> = (0..n_chunks)
+        .into_par_iter()
+        .map(|idx| -> std::io::Result<Vec<ExtractedString>> {
+            let start = idx as u64 * PARALLEL_CHUNK_SIZE;
+            let logical_end = std::cmp::min(start + PARALLEL_CHUNK_SIZE, file_len);
+            let read_end = std::cmp::min(logical_end + overlap, file_len);
+            let read_len = (read_end - start) as usize;
+
+            let mut file = File::open(dump_path)?;
+            file.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0u8; read_len];
+            file.read_exact(&mut buf)?;
+
+            let mut local: Vec<ExtractedString> = Vec::new();
+            {
+                let mut on_found = |s: ExtractedString| {
+                    if s.offset < logical_end {
+                        local.push(s);
+                    }
+                };
+                let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, encodings);
                 scanner.feed(&buf, 0, buf.len(), buf.len(), start);
                 scanner.flush_all();
             }
@@ -1124,6 +1582,36 @@ mod tests {
     }
 
     #[test]
+    fn be_strings_after_zero_pages_are_still_found() {
+        // zero-run fast skip must never hide a BE run that begins inside/after zeros
+        let mut u16be = vec![0u8; 100];
+        for c in b"abcd" {
+            u16be.extend_from_slice(&[0, *c]);
+        }
+        let found = extract_strings(&u16be, 4, 1000);
+        assert!(found
+            .iter()
+            .any(|r| r.encoding == "utf16be" && r.text == "abcd" && r.offset == 100));
+
+        let mut u32be = vec![0u8; 64];
+        for c in b"abcd" {
+            u32be.extend_from_slice(&[0, 0, 0, *c]);
+        }
+        let found = extract_strings(&u32be, 4, 1000);
+        assert!(found
+            .iter()
+            .any(|r| r.encoding == "utf32be" && r.text == "abcd" && r.offset == 64));
+
+        // run that ends exactly at the end of the buffer, after a long zero page
+        let mut tail = vec![0u8; 4096];
+        tail.extend_from_slice(b"\0h\0e\0l\0l\0o");
+        let found = extract_strings(&tail, 4, 1000);
+        assert!(found
+            .iter()
+            .any(|r| r.encoding == "utf16be" && r.text == "hello" && r.offset == 4096));
+    }
+
+    #[test]
     fn min_len_filters_short_runs() {
         let data = b"ab\x00cdef\x00".to_vec();
         let out = extract_strings(&data, 4, 200_000);
@@ -1145,7 +1633,7 @@ mod tests {
         let mut results = Vec::new();
         {
             let mut on_found = |s: ExtractedString| results.push(s);
-            let mut scanner = StringRunScanner::new(4, NoiseConfig::default(), &mut on_found);
+            let mut scanner = StringRunScanner::new(4, NoiseConfig::default(), &mut on_found, EncodingFilter::all());
             // Chunk 1: bytes 0..=5 (feed 5, valid_len 6) -- carry byte 6 (index 5)
             scanner.feed(&full[0..6], 0, 5, 6, 0);
             // Chunk 2 starts with the carry (full[5]) then the rest full[6..]
@@ -1271,4 +1759,4 @@ mod tests {
             .any(|s| s.encoding == "utf16le" && s.text == "aaaaaaaa"));
     }
 }
-pub const VERSION: &str = "1.0.3";
+pub const VERSION: &str = "1.0.4";

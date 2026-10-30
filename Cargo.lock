@@ -223,8 +223,9 @@ dependencies = [
 
 [[package]]
 name = "bxmap"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
+ "aho-corasick",
  "rayon",
  "regex",
  "serde",
@@ -233,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "bxmap-cli"
-version = "1.0.12"
+version = "1.0.14"
 dependencies = [
  "bxmap",
  "rayon",

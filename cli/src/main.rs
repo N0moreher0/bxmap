@@ -1,8 +1,9 @@
 use bxmap::{
-    extract_strings_from_file_parallel, extract_strings_from_file_streaming,
-    extract_strings_from_file_with_noise_config,
+    extract_strings_from_file_parallel, extract_strings_from_file_parallel_with_encodings,
+    extract_strings_from_file_streaming, extract_strings_from_file_streaming_with_encodings,
+    extract_strings_from_file_with_noise_config, extract_strings_from_file_with_noise_config_and_encodings,
     scan_entropy_from_file_streaming_with_data, scan_yara_from_file_streaming, EntropyRegion,
-    ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
+    ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN, EncodingFilter,
 };
 use regex::Regex;
 use std::fs::File;
@@ -343,11 +344,14 @@ fn json_escape(value: &str) -> String {
 }
 
 fn hex_encode(data: &[u8]) -> String {
-    let mut encoded = String::with_capacity(data.len() * 2);
-    for byte in data {
-        encoded.push_str(&format!("{byte:02x}"));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = Vec::with_capacity(data.len() * 2);
+    for &byte in data {
+        encoded.push(HEX[(byte >> 4) as usize]);
+        encoded.push(HEX[(byte & 0x0f) as usize]);
     }
-    encoded
+    // Only ASCII hex digits were pushed, so this cannot fail.
+    String::from_utf8(encoded).expect("hex digits are ASCII")
 }
 
 fn matches_filter(regex: Option<&Regex>, text: &str) -> bool {
@@ -447,7 +451,7 @@ fn apply_detectors(result: ExtractedString, detectors: &[Detector]) -> Vec<Extra
     if detectors.is_empty() {
         return vec![result];
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(detectors.len());
     for det in detectors {
         match det {
             Detector::Ip => {
@@ -965,7 +969,7 @@ fn important_reason(text: &str) -> Option<&'static str> {
         Some("crypto-wallet")
     } else if lower.contains("http://") || lower.contains("https://") {
         Some("url")
-    } else if lower.contains("c2") || lower.contains("gate.php") {
+    } else if has_c2_token(&lower) || lower.contains("gate.php") {
         Some("network")
     } else if is_email_address(&refanged) {
         Some("email")
@@ -999,14 +1003,45 @@ fn contains_credential_marker(text: &str) -> bool {
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect();
-    let markers = ["password", "passwd", "token", "secret", "apikey", "jwt"];
-    tokens.iter().enumerate().any(|(index, token)| {
+    let markers = ["password", "passwd", "token", "secret", "apikey"];
+    let marker_hit = tokens.iter().enumerate().any(|(index, token)| {
         markers.contains(token)
             && (tokens
                 .get(index.saturating_sub(1))
                 .is_some_and(|neighbor| *neighbor != *token)
                 || tokens.get(index + 1).is_some())
-    })
+    });
+    marker_hit || contains_jwt_shape(text)
+}
+
+/// `c2` as a standalone word (`c2`, `c2 server`, `/c2/`), not as a substring of
+/// random identifiers such as `uC2I` or `abc2def`.
+fn has_c2_token(lower: &str) -> bool {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == "c2")
+}
+
+/// A JWT-shaped value: three dot-separated base64url segments starting with `eyJ`.
+/// The bare word "jwt" next to random text is not a credential signal.
+fn contains_jwt_shape(text: &str) -> bool {
+    text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '=' || c == ':')
+        .any(|part| {
+            let mut segments = part.split('.');
+            match (segments.next(), segments.next(), segments.next(), segments.next()) {
+                (Some(h), Some(p), Some(sig), None) => {
+                    h.len() >= 10
+                        && h.to_ascii_lowercase().starts_with("eyj")
+                        && p.len() >= 6
+                        && !sig.is_empty()
+                        && [h, p, sig].iter().all(|seg| {
+                            seg.bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                        })
+                }
+                _ => false,
+            }
+        })
 }
 
 fn contains_crypto_address(text: &str) -> bool {
@@ -1074,7 +1109,7 @@ mod tests {
     use std::fs;
 
     use super::{
-        contains_crypto_address, contains_meaningful_base64, detected_domain_value,
+        contains_jwt_shape, hex_encode, contains_crypto_address, contains_meaningful_base64, detected_domain_value,
         detected_ip_value, detected_url_value, important_reason, matches_filter,
         is_email_address, parse_pid_marker, refang_ioc_text, scan_magic_bytes,
         xor_printable_score,
@@ -1140,6 +1175,15 @@ mod tests {
         assert_ne!(important_reason("docs 203.0.113.10"), Some("ip-address"));
         assert_eq!(important_reason("publicKeyToken=abc"), None);
         assert_eq!(important_reason("token=abc"), Some("credential"));
+        // regression: random junk must not be flagged just for containing "jwt" / "c2"
+        assert_eq!(important_reason("rW)jWT"), None);
+        assert_eq!(important_reason("uC2I"), None);
+        assert_eq!(important_reason("abc2def"), None);
+        assert_eq!(important_reason("beacon to c2 server"), Some("network"));
+        assert_eq!(
+            important_reason("Authorization: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF123_-"),
+            Some("credential")
+        );
         assert!(contains_meaningful_base64(
             "VGhpcyBpcyBhIHJlYWwgYmFzZTY0IHBheWxvYWQxMjM="
         ));
@@ -1200,6 +1244,20 @@ mod tests {
         assert_eq!(matches[0].offset, 65_535);
         assert_eq!(matches[0].kind, "PE/DOS executable");
         assert_eq!(matches[1].kind, "PDF document");
+    }
+    #[test]
+    fn hex_encode_matches_reference_for_all_bytes() {
+        let data: Vec<u8> = (0..=255u8).collect();
+        let reference: String = data.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex_encode(&data), reference);
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn jwt_shape_requires_three_segments() {
+        assert!(contains_jwt_shape("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig_1-"));
+        assert!(!contains_jwt_shape("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0"));
+        assert!(!contains_jwt_shape("rW)jWT"));
     }
 }
 
@@ -1289,6 +1347,21 @@ fn print_selected_options(args: &Args, threads: usize) {
         args.filter_regex.as_deref().unwrap_or("off")
     );
     eprintln!("    output={output}");
+}
+
+/// Warns when the scan hit `--max-strings` and therefore did not cover the whole file.
+/// `last_offset` is the offset of the last emitted result, which is a lower bound
+/// on how far the scan got; without this notice the summary looks like a full scan.
+fn print_truncation_notice(result_count: usize, max_strings: usize, last_offset: u64, size: u64) {
+    if max_strings == 0 || result_count < max_strings {
+        return;
+    }
+    let pct = if size == 0 { 100.0 } else { last_offset as f64 * 100.0 / size as f64 };
+    eprintln!(
+        "  [!] TRUNCATED: reached --max-strings {max_strings}; scan stopped near offset {last_offset:#x} (~{pct:.1}% of the file)."
+    );
+    eprintln!("      The remaining data was NOT scanned and the throughput above is computed on the whole file size.");
+    eprintln!("      Re-run with a larger --max-strings to cover the entire input.");
 }
 
 fn print_report(
@@ -1481,7 +1554,12 @@ fn main() -> Result<(), String> {
         .noise_threshold
         .map(NoiseConfig::from_threshold)
         .unwrap_or_default();
-    print_selected_options(&args, threads);
+    let enc_filter = match args.encoding {
+        Encoding::All => EncodingFilter::all(),
+        Encoding::Ascii => EncodingFilter::ascii(),
+        Encoding::Utf16 => EncodingFilter::utf16(),
+        Encoding::Utf32 => EncodingFilter::utf32(),
+    };
     let magic_matches = if args.magic_bytes {
         scan_magic_bytes(&args.path).map_err(|error| format!("magic-byte scan failed: {error}"))?
     } else {
@@ -1545,15 +1623,18 @@ fn main() -> Result<(), String> {
         let mut long = 0;
         let mut important = Vec::new();
         let mut write_error = None;
-        extract_strings_from_file_streaming(
+        let mut last_offset = 0u64;
+        extract_strings_from_file_streaming_with_encodings(
             &args.path,
             args.min_len,
             args.max_strings,
             noise,
+            enc_filter,
             |result| {
                 if write_error.is_some() {
                     return;
                 }
+                last_offset = last_offset.max(result.offset);
                 if matches!(args.encoding, Encoding::All)
                     || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
                     || (args.encoding == Encoding::Utf16 && (result.encoding == "utf16le" || result.encoding == "utf16be"))
@@ -1597,10 +1678,10 @@ fn main() -> Result<(), String> {
                     write_xor_json(result, &mut writer, &mut json_count)
                         .map_err(|e| format!("write failed: {e}"))?;
                 }
-                for magic in &magic_matches {
-                    write_magic_json(magic, &mut writer, &mut json_count)
-                        .map_err(|e| format!("write failed: {e}"))?;
-                }
+            }
+            for magic in &magic_matches {
+                write_magic_json(magic, &mut writer, &mut json_count)
+                    .map_err(|e| format!("write failed: {e}"))?;
             }
             if args.entropy {
                 scan_entropy_from_file_streaming_with_data(
@@ -1635,10 +1716,10 @@ fn main() -> Result<(), String> {
                     write_xor_text(result, &mut writer)
                         .map_err(|e| format!("write failed: {e}"))?;
                 }
-                for magic in &magic_matches {
-                    write_magic_text(magic, &mut writer)
-                        .map_err(|e| format!("write failed: {e}"))?;
-                }
+            }
+            for magic in &magic_matches {
+                write_magic_text(magic, &mut writer)
+                    .map_err(|e| format!("write failed: {e}"))?;
             }
             if args.entropy {
             scan_entropy_from_file_streaming_with_data(
@@ -1666,6 +1747,7 @@ fn main() -> Result<(), String> {
             result_count, short, medium, long, &important, &entropy_regions, file_size,
             start.elapsed().as_secs_f64(), threads,
         );
+        print_truncation_notice(result_count, args.max_strings, last_offset, file_size);
         return Ok(());
     }
 
@@ -1675,14 +1757,15 @@ fn main() -> Result<(), String> {
             .build()
             .map_err(|e| format!("cannot create worker pool: {e}"))?;
         pool.install(|| {
-            extract_strings_from_file_parallel(&args.path, args.min_len, args.max_strings, noise)
+            extract_strings_from_file_parallel_with_encodings(&args.path, args.min_len, args.max_strings, noise, enc_filter)
         })
     } else {
-        extract_strings_from_file_with_noise_config(
+        extract_strings_from_file_with_noise_config_and_encodings(
             &args.path,
             args.min_len,
             args.max_strings,
             noise,
+            enc_filter,
         )
     }
     .map_err(|e| format!("scan failed: {e}"))?;
@@ -1755,6 +1838,12 @@ fn main() -> Result<(), String> {
         if let Some(path) = output_path.clone() { eprintln!("wrote {} results to '{}'", results.len(), path); }
         let _ = args.stats;
         print_report(results.len(), 0, 0, 0, &[], &entropy_regions, file_size, start.elapsed().as_secs_f64(), threads);
+        print_truncation_notice(
+            results.len(),
+            args.max_strings,
+            results.iter().map(|r| r.offset).max().unwrap_or(0),
+            file_size,
+        );
         return Ok(());
     }
     if args.format == Format::Json {
@@ -1776,10 +1865,10 @@ fn main() -> Result<(), String> {
                 write_xor_json(result, &mut writer, &mut json_count)
                     .map_err(|e| format!("write failed: {e}"))?;
             }
-            for magic in &magic_matches {
-                write_magic_json(magic, &mut writer, &mut json_count)
-                    .map_err(|e| format!("write failed: {e}"))?;
-            }
+        }
+        for magic in &magic_matches {
+            write_magic_json(magic, &mut writer, &mut json_count)
+                .map_err(|e| format!("write failed: {e}"))?;
         }
         if args.entropy {
             let mut entropy_write_error = None;
@@ -1817,10 +1906,10 @@ fn main() -> Result<(), String> {
                 write_xor_text(result, &mut writer)
                     .map_err(|e| format!("write failed: {e}"))?;
             }
-            for magic in &magic_matches {
-                write_magic_text(magic, &mut writer)
-                    .map_err(|e| format!("write failed: {e}"))?;
-            }
+        }
+        for magic in &magic_matches {
+            write_magic_text(magic, &mut writer)
+                .map_err(|e| format!("write failed: {e}"))?;
         }
         if args.entropy && args.format == Format::Text {
             let mut entropy_write_error = None;
@@ -1863,6 +1952,12 @@ fn main() -> Result<(), String> {
     print_report(
         results.len(), short, medium, long, &important, &entropy_regions, file_size,
         start.elapsed().as_secs_f64(), threads,
+    );
+    print_truncation_notice(
+        results.len(),
+        args.max_strings,
+        results.iter().map(|r| r.offset).max().unwrap_or(0),
+        file_size,
     );
     Ok(())
 }
