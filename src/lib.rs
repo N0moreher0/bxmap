@@ -597,6 +597,9 @@ struct StringRunScanner<'a> {
     /// Same for UTF-32LE / UTF-32BE.
     last_u32le_bytes: Vec<u8>,
     last_u32le_offset: i64,
+    /// Buffered results waiting to be emitted in offset order.
+    /// Emitted when we know no earlier results can appear (current_pos > offset + MAX_RUN_CHARS).
+    pending: Vec<ExtractedString>,
 }
 
 impl<'a> StringRunScanner<'a> {
@@ -645,6 +648,42 @@ impl<'a> StringRunScanner<'a> {
             last_u16le_offset: -100,
             last_u32le_bytes: Vec::with_capacity(64),
             last_u32le_offset: -100,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Emit any pending results whose offset is far enough behind the current
+    /// processing position that no earlier results can appear.
+    /// A run can be at most MAX_RUN_CHARS long (force-flushed), so if we're at
+    /// position `current_pos`, any result with offset < current_pos - MAX_RUN_CHARS
+    /// is safe to emit.
+    fn emit_pending(&mut self, current_pos: u64) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let threshold = current_pos.saturating_sub(MAX_RUN_CHARS as u64 + 1);
+        // Sort by offset (pending is small, typically < 10 items)
+        self.pending.sort_by_key(|s| s.offset);
+        // Emit all results with offset < threshold
+        let mut i = 0;
+        while i < self.pending.len() && self.pending[i].offset < threshold {
+            let result = self.pending[i].clone();
+            (self.on_found)(result);
+            i += 1;
+        }
+        if i > 0 {
+            self.pending.drain(0..i);
+        }
+    }
+
+    /// Flush all pending results (used at end of stream).
+    fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.pending.sort_by_key(|s| s.offset);
+        for result in self.pending.drain(..) {
+            (self.on_found)(result);
         }
     }
 
@@ -905,6 +944,9 @@ impl<'a> StringRunScanner<'a> {
 
             k += 1;
         }
+        // Emit any pending results that are now far enough behind the current position.
+        let current_pos = global_base + process_count as u64;
+        self.emit_pending(current_pos);
     }
 
     /// Call ONCE after `feed()` has processed all the data (end of
@@ -915,6 +957,7 @@ impl<'a> StringRunScanner<'a> {
         self.flush_u16be();
         self.flush_u32le();
         self.flush_u32be();
+        self.flush_pending();
     }
 
     fn flush_ascii(&mut self) {
@@ -928,7 +971,7 @@ impl<'a> StringRunScanner<'a> {
             && !is_low_information_repeat(&self.ascii_buf, &self.noise_cfg)
         {
             let text = String::from_utf8_lossy(&self.ascii_buf).into_owned();
-            (self.on_found)(ExtractedString {
+            self.pending.push(ExtractedString {
                 offset: self.ascii_start as u64,
                 encoding: "ascii",
                 text,
@@ -952,7 +995,7 @@ impl<'a> StringRunScanner<'a> {
             self.scratch.extend(self.u16_buf.iter().map(|&c| c as u8));
             if !is_low_information_repeat(&self.scratch, &self.noise_cfg) {
                 let text = String::from_utf8_lossy(&self.scratch).into_owned();
-                (self.on_found)(ExtractedString {
+                self.pending.push(ExtractedString {
                     offset: self.u16_start as u64,
                     encoding: "utf16le",
                     text,
@@ -983,7 +1026,7 @@ impl<'a> StringRunScanner<'a> {
                 && self.last_u16le_bytes == self.scratch;
             if !is_low_information_repeat(&self.scratch, &self.noise_cfg) && !duplicate {
                 let text = String::from_utf8_lossy(&self.scratch).into_owned();
-                (self.on_found)(ExtractedString {
+                self.pending.push(ExtractedString {
                     offset: self.u16be_start as u64,
                     encoding: "utf16be",
                     text,
@@ -1007,7 +1050,7 @@ impl<'a> StringRunScanner<'a> {
             self.scratch.extend(self.u32le_buf.iter().map(|&c| c as u8));
             if !is_low_information_repeat(&self.scratch, &self.noise_cfg) {
                 let text = String::from_utf8_lossy(&self.scratch).into_owned();
-                (self.on_found)(ExtractedString {
+                self.pending.push(ExtractedString {
                     offset: self.u32le_start as u64,
                     encoding: "utf32le",
                     text,
@@ -1036,7 +1079,7 @@ impl<'a> StringRunScanner<'a> {
                 && self.last_u32le_bytes == self.scratch;
             if !is_low_information_repeat(&self.scratch, &self.noise_cfg) && !duplicate {
                 let text = String::from_utf8_lossy(&self.scratch).into_owned();
-                (self.on_found)(ExtractedString {
+                self.pending.push(ExtractedString {
                     offset: self.u32be_start as u64,
                     encoding: "utf32be",
                     text,
@@ -2140,6 +2183,99 @@ mod tests {
         assert!(!out
             .iter()
             .any(|s| s.encoding == "utf32be" && s.text == "hello"));
+    }
+
+    #[test]
+    fn streaming_results_are_sorted_by_offset() {
+        // Test that streaming API emits results in ascending offset order.
+        // Uses a pattern that exercises UTF-16LE/BE runs across chunk boundaries.
+        // Use the in-memory function as reference (it sorts)
+        let mut data = Vec::new();
+        // ASCII string
+        data.extend_from_slice(b"ASCII_TEST_STRING\x00");
+        // UTF-16LE "HELLO" - this creates LE at even offsets, BE at odd offsets
+        for c in b"HELLO" {
+            data.push(*c);
+            data.push(0);
+        }
+        data.extend_from_slice(&[0, 0]); // terminator
+                                         // Another ASCII string
+        data.extend_from_slice(b"ANOTHER_ASCII_STRING\x00");
+
+        let reference = extract_strings(&data, 4, 1000);
+
+        // Now use streaming with a small buffer to force multiple feeds
+        // We simulate by using the scanner directly with multiple feed calls
+        let mut streaming_results = Vec::new();
+        let mut on_found = |s: ExtractedString| streaming_results.push(s);
+        let mut scanner = StringRunScanner::new(
+            4,
+            NoiseConfig::default(),
+            &mut on_found,
+            EncodingFilter::all(),
+        );
+        // Feed in small chunks to simulate streaming
+        let chunk_size = 32;
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = std::cmp::min(offset + chunk_size, data.len());
+            let is_last = end == data.len();
+            let valid_len = if is_last {
+                end - offset
+            } else {
+                end - offset + 1
+            }; // +1 for lookahead
+            let actual_valid = std::cmp::min(valid_len, data.len() - offset);
+            scanner.feed(
+                &data[offset..],
+                0,
+                end - offset,
+                actual_valid,
+                offset as u64,
+            );
+            if is_last {
+                scanner.flush_all();
+            }
+            offset = end;
+        }
+
+        // Check that both produce same results in same order
+        eprintln!("Reference ({}):", reference.len());
+        for (i, r) in reference.iter().enumerate() {
+            eprintln!(
+                "  [{}] offset={} encoding={} text={}",
+                i, r.offset, r.encoding, r.text
+            );
+        }
+        eprintln!("Streaming ({}):", streaming_results.len());
+        for (i, s) in streaming_results.iter().enumerate() {
+            eprintln!(
+                "  [{}] offset={} encoding={} text={}",
+                i, s.offset, s.encoding, s.text
+            );
+        }
+
+        assert_eq!(
+            streaming_results.len(),
+            reference.len(),
+            "streaming count {} vs reference {}",
+            streaming_results.len(),
+            reference.len()
+        );
+
+        for (i, (stream, ref_s)) in streaming_results.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(
+                stream.offset, ref_s.offset,
+                "offset mismatch at index {}: streaming {} vs reference {}",
+                i, stream.offset, ref_s.offset
+            );
+            assert_eq!(stream.text, ref_s.text, "text mismatch at index {}", i);
+            assert_eq!(
+                stream.encoding, ref_s.encoding,
+                "encoding mismatch at index {}",
+                i
+            );
+        }
     }
 
     fn temp_bin(name: &str, data: &[u8]) -> std::path::PathBuf {

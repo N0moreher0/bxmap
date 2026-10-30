@@ -62,7 +62,7 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 - [x] **Chuỗi chứa xuống dòng bị in nguyên**: output text escape control chars (\n, \r, \t, ...) thành một dòng.
 - [x] **Chuỗi quá dài**: thêm `--max-str-len` để cắt output.
 - [ ] Số liệu xác nhận thêm trên Lab 4 (dump 1 GiB, `--min-len 8`): 305.742/544.317 (~56%) chuỗi UTF-16BE là bản trùng của LE.
-- [ ] **Thứ tự output:** README ghi "sorted by ascending offset" nhưng output thực tế không tăng dần chặt chẽ (BE offset `+1` đôi khi đứng trước LE). Sửa code hoặc sửa tài liệu cho khớp, và thêm test.
+- [x] **Thứ tự output:** README ghi "sorted by ascending offset" nhưng output thực tế không tăng dần chặt chẽ (BE offset `+1` đôi khi đứng trước LE). **Đã sửa**: scanner giờ buffer kết quả và emit theo thứ tự offset (`emit_pending`/`flush_pending` trong `StringRunScanner`); thêm test `streaming_results_are_sorted_by_offset`.
 - [x] **Chạm `--max-strings` thì dừng im lặng** (Lab 4: đúng 200.000 bản ghi, mới quét ~52 MiB của 1 GiB). Phải in cảnh báo rõ ràng ("đã chạm giới hạn tại offset X / tổng Y, kết quả chưa đầy đủ") và trả exit code khác 0 (hoặc cờ `truncated: true` trong JSON). Đã in cảnh báo + exit code 3; `json-tree` có `metadata.truncated`.
 - [x] Test hồi quy: dump mẫu có text ASCII-in-UTF-16 để chắc chắn bug LE/BE không quay lại.
 
