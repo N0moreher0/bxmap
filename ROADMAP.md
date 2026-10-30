@@ -97,9 +97,9 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 - [ ] Giữ mặc định bảo thủ (không làm mất bằng chứng ngắn như `0000`); mọi bộ lọc mới đều opt-in hoặc có cờ tắt.
 
 ### 4.2 Entropy
-- [ ] Kích thước cửa sổ và ngưỡng cấu hình được.
-- [ ] Gộp các vùng entropy cao liền kề thành một record.
-- [~] `--entropy-no-data` / giới hạn kích thước `data_hex` để output không phình. (`--entropy-no-data` đã xong; còn giới hạn kích thước `data_hex`.)
+- [x] Kích thước cửa sổ và ngưỡng cấu hình được (`--entropy-window`, `--entropy-threshold`).
+- [x] Gộp các vùng entropy cao liền kề thành một record (`--entropy-merge`; entropy của vùng gộp tính chính xác từ histogram).
+- [x] `--entropy-no-data` / giới hạn kích thước `data_hex` để output không phình (`--entropy-no-data`, `--entropy-max-data`, mặc định 4096 byte kèm `data_truncated`).
 
 ### 4.3 IOC / secret
 - [ ] Validate để giảm false positive: checksum Base58Check/Bech32 (ví crypto), Luhn, cấu trúc JWT (decode header/payload), độ dài và prefix theo từng nhà cung cấp.

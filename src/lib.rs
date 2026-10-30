@@ -292,10 +292,126 @@ pub fn scan_entropy_from_file_streaming_with_data<F: FnMut(EntropyRegion, &[u8])
     threshold: f64,
     mut on_region: F,
 ) -> std::io::Result<usize> {
+    scan_entropy_from_file_with_options(
+        dump_path,
+        EntropyScanOptions {
+            threshold,
+            ..EntropyScanOptions::default()
+        },
+        |region, data, _truncated| on_region(region, data),
+    )
+}
+
+/// Configurable entropy pass.
+#[derive(Debug, Clone, Copy)]
+pub struct EntropyScanOptions {
+    /// Bytes per entropy window. `0` falls back to [`ENTROPY_BLOCK_SIZE`].
+    pub window: usize,
+    /// Minimum Shannon entropy (bits per byte) for a window to be reported.
+    pub threshold: f64,
+    /// Merge contiguous high-entropy windows into one region. The merged
+    /// region reports the exact entropy of the whole run.
+    pub merge: bool,
+    /// Keep at most this many payload bytes per region. `0` keeps no payload;
+    /// [`usize::MAX`] keeps everything (which can grow large when `merge` is
+    /// enabled).
+    pub max_data: usize,
+}
+
+impl Default for EntropyScanOptions {
+    fn default() -> Self {
+        Self {
+            window: ENTROPY_BLOCK_SIZE,
+            threshold: ENTROPY_DEFAULT_THRESHOLD,
+            merge: false,
+            max_data: usize::MAX,
+        }
+    }
+}
+
+/// Default entropy threshold used by the CLI and the simple scan helpers.
+pub const ENTROPY_DEFAULT_THRESHOLD: f64 = 7.2;
+
+/// Pending merged region: keeps the exact byte histogram (so the merged
+/// entropy is exact) plus a capped copy of the payload.
+struct PendingEntropyRegion {
+    offset: u64,
+    length: usize,
+    counts: [u64; 256],
+    data: Vec<u8>,
+    data_truncated: bool,
+}
+
+impl PendingEntropyRegion {
+    fn new(offset: u64, max_data: usize) -> Self {
+        Self {
+            offset,
+            length: 0,
+            counts: [0u64; 256],
+            data: Vec::with_capacity(max_data.min(ENTROPY_BLOCK_SIZE)),
+            data_truncated: false,
+        }
+    }
+
+    fn extend(&mut self, block: &[u8], max_data: usize) {
+        self.length += block.len();
+        for &byte in block {
+            self.counts[byte as usize] += 1;
+        }
+        let keep = max_data.saturating_sub(self.data.len()).min(block.len());
+        self.data.extend_from_slice(&block[..keep]);
+        if keep < block.len() {
+            self.data_truncated = true;
+        }
+    }
+
+    fn region(&self) -> EntropyRegion {
+        EntropyRegion {
+            offset: self.offset,
+            length: self.length,
+            entropy: entropy_from_counts(&self.counts, self.length),
+        }
+    }
+}
+
+fn entropy_from_counts(counts: &[u64; 256], total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let len = total as f64;
+    counts
+        .iter()
+        .filter(|&&count| count != 0)
+        .map(|&count| {
+            let probability = count as f64 / len;
+            -probability * probability.log2()
+        })
+        .sum()
+}
+
+/// Configurable streaming entropy scan.
+///
+/// The callback receives each region, a payload slice capped at
+/// `options.max_data` (`usize::MAX` keeps the whole region) and a flag telling
+/// whether the payload was truncated. When `options.merge` is set, contiguous
+/// windows above the threshold are reported as a single region whose entropy
+/// is computed exactly from the full byte histogram.
+pub fn scan_entropy_from_file_with_options<F: FnMut(EntropyRegion, &[u8], bool)>(
+    dump_path: &str,
+    options: EntropyScanOptions,
+    mut on_region: F,
+) -> std::io::Result<usize> {
+    let window = if options.window == 0 {
+        ENTROPY_BLOCK_SIZE
+    } else {
+        options.window
+    };
+    let max_data = options.max_data;
     let mut file = File::open(dump_path)?;
-    let mut buffer = vec![0u8; ENTROPY_BLOCK_SIZE];
+    let mut buffer = vec![0u8; window];
     let mut offset = 0u64;
-    let mut matches = 0usize;
+    let mut emitted = 0usize;
+    let mut pending: Option<PendingEntropyRegion> = None;
 
     loop {
         let mut filled = 0usize;
@@ -309,22 +425,41 @@ pub fn scan_entropy_from_file_streaming_with_data<F: FnMut(EntropyRegion, &[u8])
         if filled == 0 {
             break;
         }
-        let entropy = shannon_entropy(&buffer[..filled]);
-        if entropy >= threshold {
-            matches += 1;
-            let region = EntropyRegion {
-                offset,
-                length: filled,
-                entropy,
-            };
-            on_region(region, &buffer[..filled]);
+        let block = &buffer[..filled];
+        if shannon_entropy(block) >= options.threshold {
+            let contiguous = pending
+                .as_ref()
+                .is_some_and(|region| region.offset + region.length as u64 == offset);
+            if options.merge && contiguous {
+                if let Some(region) = pending.as_mut() {
+                    region.extend(block, max_data);
+                }
+            } else {
+                if let Some(region) = pending.take() {
+                    let current = region.region();
+                    on_region(current, &region.data, region.data_truncated);
+                    emitted += 1;
+                }
+                let mut region = PendingEntropyRegion::new(offset, max_data);
+                region.extend(block, max_data);
+                pending = Some(region);
+            }
+        } else if let Some(region) = pending.take() {
+            let current = region.region();
+            on_region(current, &region.data, region.data_truncated);
+            emitted += 1;
         }
         offset += filled as u64;
         if filled < buffer.len() {
             break;
         }
     }
-    Ok(matches)
+    if let Some(region) = pending.take() {
+        let current = region.region();
+        on_region(current, &region.data, region.data_truncated);
+        emitted += 1;
+    }
+    Ok(emitted)
 }
 
 /// The printable-character set: printable ASCII + common whitespace,
@@ -2085,5 +2220,118 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(found.len(), 1);
+    }
+
+    /// Deterministic pseudo-random bytes for entropy tests.
+    fn pseudo_random_bytes(len: usize) -> Vec<u8> {
+        let mut state: u32 = 0x9e37_79b9;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn entropy_options_merge_adjacent_windows() {
+        let data = pseudo_random_bytes(8 * 1024);
+        let path = temp_bin("entropy-merge", &data);
+
+        let mut regions = Vec::new();
+        scan_entropy_from_file_with_options(
+            path.to_str().unwrap(),
+            EntropyScanOptions {
+                window: 1024,
+                threshold: 7.0,
+                merge: false,
+                max_data: usize::MAX,
+            },
+            |region, payload, truncated| {
+                assert_eq!(payload.len(), region.length);
+                assert!(!truncated);
+                regions.push(region);
+            },
+        )
+        .unwrap();
+        assert_eq!(regions.len(), 8);
+        assert!(regions.iter().all(|r| r.length == 1024));
+
+        let mut merged = Vec::new();
+        let mut payload_len = 0usize;
+        scan_entropy_from_file_with_options(
+            path.to_str().unwrap(),
+            EntropyScanOptions {
+                window: 1024,
+                threshold: 7.0,
+                merge: true,
+                max_data: usize::MAX,
+            },
+            |region, payload, truncated| {
+                payload_len += payload.len();
+                assert!(!truncated);
+                merged.push(region);
+            },
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].offset, 0);
+        assert_eq!(merged[0].length, data.len());
+        assert_eq!(payload_len, data.len());
+        // The merged entropy is exact, so it must match the whole-file value.
+        assert!((merged[0].entropy - shannon_entropy(&data)).abs() < 1e-12);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn entropy_options_cap_payload() {
+        let data = pseudo_random_bytes(4 * 1024);
+        let path = temp_bin("entropy-cap", &data);
+
+        let mut seen = 0usize;
+        scan_entropy_from_file_with_options(
+            path.to_str().unwrap(),
+            EntropyScanOptions {
+                window: 1024,
+                threshold: 7.0,
+                merge: true,
+                max_data: 16,
+            },
+            |region, payload, truncated| {
+                seen += 1;
+                assert_eq!(region.length, data.len());
+                assert_eq!(payload.len(), 16);
+                assert!(truncated);
+                assert_eq!(payload, &data[..16]);
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn entropy_options_threshold_filters_low_entropy() {
+        let path = temp_bin("entropy-threshold", &vec![0u8; 4096]);
+
+        let mut seen = 0usize;
+        scan_entropy_from_file_with_options(
+            path.to_str().unwrap(),
+            EntropyScanOptions {
+                window: 1024,
+                threshold: 0.5,
+                merge: false,
+                max_data: usize::MAX,
+            },
+            |_region, _payload, _truncated| seen += 1,
+        )
+        .unwrap();
+        assert_eq!(seen, 0);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

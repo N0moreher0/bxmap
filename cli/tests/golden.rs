@@ -884,3 +884,193 @@ fn golden_entropy_no_data_requires_entropy() {
         "{stderr}"
     );
 }
+
+#[test]
+fn golden_entropy_merge_merges_adjacent_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, high_entropy_bytes(8 * 1024)).unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--entropy",
+            "--entropy-window",
+            "1024",
+            "--entropy-merge",
+            "--entropy-no-data",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("\"group\":\"Undefined\"").count(),
+        1,
+        "merge must collapse contiguous windows: {stdout}"
+    );
+    assert!(stdout.contains("\"length\":8192"), "{stdout}");
+}
+
+#[test]
+fn golden_entropy_window_controls_region_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, high_entropy_bytes(8 * 1024)).unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--entropy",
+            "--entropy-window",
+            "1024",
+            "--entropy-no-data",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("\"length\":1024").count(),
+        8,
+        "one region per 1024-byte window: {stdout}"
+    );
+}
+
+#[test]
+fn golden_entropy_max_data_caps_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, high_entropy_bytes(4 * 1024)).unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--entropy",
+            "--entropy-window",
+            "1024",
+            "--entropy-max-data",
+            "8",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"data_truncated\":true"), "{stdout}");
+    // 8 payload bytes render as 16 hex characters.
+    let start = stdout.find("\"data_hex\":\"").expect("data_hex") + "\"data_hex\":\"".len();
+    let rest = &stdout[start..];
+    let end = rest.find('"').expect("closing quote");
+    assert_eq!(end, 16, "payload must be capped to 8 bytes: {stdout}");
+}
+
+#[test]
+fn golden_entropy_window_zero_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([path.to_str().unwrap(), "--entropy", "--entropy-window", "0"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--entropy-window must be greater than 0"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn golden_entropy_threshold_out_of_range_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--entropy",
+            "--entropy-threshold",
+            "9",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--entropy-threshold must be between 0 and 8"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn golden_entropy_flags_require_entropy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([path.to_str().unwrap(), "--entropy-merge"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--entropy-merge requires --entropy"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn golden_entropy_max_data_zero_omits_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, high_entropy_bytes(16 * 1024)).unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--entropy",
+            "--entropy-max-data",
+            "0",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("data_hex"), "{stdout}");
+    assert!(!stdout.contains("data_truncated"), "{stdout}");
+}

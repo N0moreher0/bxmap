@@ -59,6 +59,14 @@ bxmap --help
 - `--compact` — minify `json`/`json-tree` output: one line, no indentation.
   Handy for large exports and for piping into other tools.
 - `--entropy` — report high-entropy regions.
+- `--entropy-window <BYTES>` — bytes per entropy window (default 65536).
+- `--entropy-threshold <BITS>` — minimum Shannon entropy per window, 0–8
+  (default 7.2).
+- `--entropy-merge` — merge contiguous high-entropy windows into a single
+  region; the reported entropy is computed exactly over the whole run.
+- `--entropy-max-data <BYTES>` — keep at most this many payload bytes per
+  region (default 4096, `0` keeps none). Capped records carry
+  `data_truncated: true` in JSON and `data_truncated=1` in text.
 - `--entropy-no-data` — with `--entropy`, omit the `data_hex` payload and keep
   only `offset`, `length` and `entropy`.
 

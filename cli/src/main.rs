@@ -2,9 +2,9 @@ use bxmap::{
     extract_strings_from_file_parallel_with_encodings,
     extract_strings_from_file_streaming_range_with_encodings,
     extract_strings_from_file_streaming_range_with_encodings_progress,
-    extract_strings_from_file_with_noise_config_and_encodings,
-    scan_entropy_from_file_streaming_with_data, scan_yara_from_file_streaming, EncodingFilter,
-    EntropyRegion, ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
+    extract_strings_from_file_with_noise_config_and_encodings, scan_entropy_from_file_with_options,
+    scan_yara_from_file_streaming, EncodingFilter, EntropyRegion, EntropyScanOptions,
+    ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
 };
 use regex::Regex;
 use std::fs::File;
@@ -77,6 +77,10 @@ fn passes_region_filter(
 }
 
 const ENTROPY_THRESHOLD: f64 = 7.2;
+/// Default cap on the `data_hex` payload per entropy region (bytes, not hex
+/// characters). `--entropy-max-data 0` disables the payload entirely and
+/// `--entropy-no-data` is the same thing spelled out.
+const ENTROPY_MAX_DATA: usize = 4096;
 const MAX_ENTROPY_REPORTS: usize = 12;
 const MAX_XOR_CANDIDATES: usize = 256;
 const MAX_XOR_CANDIDATE_LEN: usize = 100;
@@ -198,6 +202,10 @@ struct Args {
     auto_tune: bool,
     entropy: bool,
     entropy_no_data: bool,
+    entropy_window: Option<usize>,
+    entropy_threshold: Option<f64>,
+    entropy_merge: bool,
+    entropy_max_data: Option<usize>,
     yar: Option<String>,
     brute_xor: Option<Vec<usize>>,
     parse_pid: bool,
@@ -273,6 +281,13 @@ OPTIONS:
     --threads <N>        Parallel worker count
     --auto-tune          Choose a safe worker count for this machine
     --entropy            Scan and export high-entropy regions
+    --entropy-window <N> Bytes per entropy window (default 65536)
+    --entropy-threshold <F>
+                           Minimum entropy in bits/byte (default 7.2, max 8)
+    --entropy-merge      Merge contiguous high-entropy windows into one record
+    --entropy-max-data <N>
+                           Keep at most N payload bytes per region (default
+                           4096, 0 = no payload)
     --entropy-no-data    Omit the data_hex payload from entropy records
     --yar <PATH>         Compile and match a YARA/YARA-X rule file while streaming
     --brute-xor <1b;2b;3b>
@@ -337,6 +352,10 @@ fn parse_args() -> Result<Args, String> {
         auto_tune: false,
         entropy: false,
         entropy_no_data: false,
+        entropy_window: None,
+        entropy_threshold: None,
+        entropy_merge: false,
+        entropy_max_data: None,
         yar: None,
         brute_xor: None,
         parse_pid: false,
@@ -421,6 +440,28 @@ fn parse_args() -> Result<Args, String> {
             "--auto-tune" => args.auto_tune = true,
             "--entropy" => args.entropy = true,
             "--entropy-no-data" => args.entropy_no_data = true,
+            "--entropy-window" => {
+                args.entropy_window = Some(
+                    next(&mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --entropy-window".to_string())?,
+                )
+            }
+            "--entropy-threshold" => {
+                args.entropy_threshold = Some(
+                    next(&mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --entropy-threshold".to_string())?,
+                )
+            }
+            "--entropy-merge" => args.entropy_merge = true,
+            "--entropy-max-data" => {
+                args.entropy_max_data = Some(
+                    next(&mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --entropy-max-data".to_string())?,
+                )
+            }
             "--yar" => args.yar = Some(next(&mut i)?),
             "--brute-xor" => {
                 let value = next(&mut i)?;
@@ -862,6 +903,7 @@ fn write_entropy_json(
     result_count: &mut usize,
     layout: JsonLayout,
     include_data: bool,
+    data_truncated: bool,
 ) -> io::Result<()> {
     json_record_open(writer, result_count, layout, Some("entropy"))?;
     write!(
@@ -871,6 +913,9 @@ fn write_entropy_json(
     )?;
     if include_data {
         write!(writer, ",\"data_hex\":{}", json_escape(&hex_encode(data)))?;
+        if data_truncated {
+            write!(writer, ",\"data_truncated\":true")?;
+        }
     }
     write!(writer, "}}")?;
     *result_count += 1;
@@ -897,6 +942,7 @@ fn write_entropy_text(
     data: &[u8],
     writer: &mut dyn Write,
     include_data: bool,
+    data_truncated: bool,
 ) -> io::Result<()> {
     write!(
         writer,
@@ -905,6 +951,9 @@ fn write_entropy_text(
     )?;
     if include_data {
         write!(writer, "\tdata_hex={}", hex_encode(data))?;
+        if data_truncated {
+            write!(writer, "\tdata_truncated=1")?;
+        }
     }
     writeln!(writer)
 }
@@ -2261,8 +2310,26 @@ fn run() -> Result<(), String> {
             return Err("--detect-format rich supports --format text or json".to_string());
         }
     }
-    if args.entropy_no_data && !args.entropy {
-        return Err("--entropy-no-data requires --entropy".to_string());
+    if !args.entropy {
+        for (flag, set) in [
+            ("--entropy-no-data", args.entropy_no_data),
+            ("--entropy-window", args.entropy_window.is_some()),
+            ("--entropy-threshold", args.entropy_threshold.is_some()),
+            ("--entropy-merge", args.entropy_merge),
+            ("--entropy-max-data", args.entropy_max_data.is_some()),
+        ] {
+            if set {
+                return Err(format!("{flag} requires --entropy"));
+            }
+        }
+    }
+    if args.entropy_window == Some(0) {
+        return Err("--entropy-window must be greater than 0".to_string());
+    }
+    if let Some(threshold) = args.entropy_threshold {
+        if !(0.0..=8.0).contains(&threshold) {
+            return Err("--entropy-threshold must be between 0 and 8".to_string());
+        }
     }
     if args.format == Format::Csv
         && (args.magic_bytes || args.yar.is_some() || args.brute_xor.is_some() || args.entropy)
@@ -2320,6 +2387,17 @@ fn run() -> Result<(), String> {
         Encoding::Utf16 => EncodingFilter::utf16(),
         Encoding::Utf32 => EncodingFilter::utf32(),
     };
+    let entropy_options = EntropyScanOptions {
+        window: args.entropy_window.unwrap_or(bxmap::ENTROPY_BLOCK_SIZE),
+        threshold: args.entropy_threshold.unwrap_or(ENTROPY_THRESHOLD),
+        merge: args.entropy_merge,
+        max_data: if args.entropy_no_data {
+            0
+        } else {
+            args.entropy_max_data.unwrap_or(ENTROPY_MAX_DATA)
+        },
+    };
+    let entropy_include_data = !args.entropy_no_data && entropy_options.max_data != 0;
     let mut magic_matches = if args.magic_bytes {
         scan_magic_bytes(&args.path).map_err(|error| format!("magic-byte scan failed: {error}"))?
     } else {
@@ -2328,11 +2406,15 @@ fn run() -> Result<(), String> {
     let start = Instant::now();
     let mut entropy_regions = Vec::new();
     if args.entropy {
-        scan_entropy_from_file_streaming_with_data(&args.path, ENTROPY_THRESHOLD, |region, _| {
-            if entropy_regions.len() < MAX_ENTROPY_REPORTS {
-                entropy_regions.push(region);
-            }
-        })
+        scan_entropy_from_file_with_options(
+            &args.path,
+            entropy_options,
+            |region, _data, _truncated| {
+                if entropy_regions.len() < MAX_ENTROPY_REPORTS {
+                    entropy_regions.push(region);
+                }
+            },
+        )
         .map_err(|e| format!("entropy scan failed: {e}"))?;
     }
     let mut yara_matches = Vec::new();
@@ -2520,10 +2602,10 @@ fn run() -> Result<(), String> {
                     .map_err(|e| format!("write failed: {e}"))?;
             }
             if args.entropy {
-                scan_entropy_from_file_streaming_with_data(
+                scan_entropy_from_file_with_options(
                     &args.path,
-                    ENTROPY_THRESHOLD,
-                    |region, data| {
+                    entropy_options,
+                    |region, data, data_truncated| {
                         if write_error.is_none() {
                             if let Err(error) = write_entropy_json(
                                 region,
@@ -2531,7 +2613,8 @@ fn run() -> Result<(), String> {
                                 &mut writer,
                                 &mut json_count,
                                 json_layout,
-                                !args.entropy_no_data,
+                                entropy_include_data,
+                                data_truncated,
                             ) {
                                 write_error = Some(error);
                             }
@@ -2571,14 +2654,18 @@ fn run() -> Result<(), String> {
                 write_magic_text(magic, &mut writer).map_err(|e| format!("write failed: {e}"))?;
             }
             if args.entropy {
-                scan_entropy_from_file_streaming_with_data(
+                scan_entropy_from_file_with_options(
                     &args.path,
-                    ENTROPY_THRESHOLD,
-                    |region, data| {
+                    entropy_options,
+                    |region, data, data_truncated| {
                         if write_error.is_none() {
-                            if let Err(error) =
-                                write_entropy_text(region, data, &mut writer, !args.entropy_no_data)
-                            {
+                            if let Err(error) = write_entropy_text(
+                                region,
+                                data,
+                                &mut writer,
+                                entropy_include_data,
+                                data_truncated,
+                            ) {
                                 write_error = Some(error);
                             }
                         }
@@ -2912,10 +2999,10 @@ fn run() -> Result<(), String> {
         }
         if args.entropy {
             let mut entropy_write_error = None;
-            scan_entropy_from_file_streaming_with_data(
+            scan_entropy_from_file_with_options(
                 &args.path,
-                ENTROPY_THRESHOLD,
-                |region, data| {
+                entropy_options,
+                |region, data, data_truncated| {
                     if entropy_write_error.is_some()
                         || !entropy_region_in_range(&region, range_active, range_start, range_end)
                     {
@@ -2927,7 +3014,8 @@ fn run() -> Result<(), String> {
                         &mut writer,
                         &mut json_count,
                         json_layout,
-                        !args.entropy_no_data,
+                        entropy_include_data,
+                        data_truncated,
                     ) {
                         entropy_write_error = Some(error);
                     }
@@ -2977,18 +3065,22 @@ fn run() -> Result<(), String> {
         }
         if args.entropy && args.format == Format::Text {
             let mut entropy_write_error = None;
-            scan_entropy_from_file_streaming_with_data(
+            scan_entropy_from_file_with_options(
                 &args.path,
-                ENTROPY_THRESHOLD,
-                |region, data| {
+                entropy_options,
+                |region, data, data_truncated| {
                     if entropy_write_error.is_some()
                         || !entropy_region_in_range(&region, range_active, range_start, range_end)
                     {
                         return;
                     }
-                    if let Err(error) =
-                        write_entropy_text(region, data, &mut writer, !args.entropy_no_data)
-                    {
+                    if let Err(error) = write_entropy_text(
+                        region,
+                        data,
+                        &mut writer,
+                        entropy_include_data,
+                        data_truncated,
+                    ) {
                         entropy_write_error = Some(error);
                     }
                 },

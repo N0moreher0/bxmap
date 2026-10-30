@@ -48,6 +48,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   newlines), which keeps large exports smaller and easier to pipe.
 - `--entropy-no-data` omits the `data_hex` payload from `--entropy` records, so
   the report stays small when only offsets/lengths/entropy are needed.
+- Entropy scanning is now configurable: `--entropy-window <BYTES>` sets the
+  block size, `--entropy-threshold <BITS>` sets the cutoff (0–8), and
+  `--entropy-merge` collapses contiguous high-entropy windows into one region
+  with the exact merged entropy. The new
+  `bxmap::scan_entropy_from_file_with_options` API takes an
+  `EntropyScanOptions` (`window`, `threshold`, `merge`, `max_data`).
+- `--entropy-max-data <BYTES>` caps the `data_hex` payload per region (default
+  4096 bytes, `0` keeps none); capped records add `data_truncated` in JSON and
+  `data_truncated=1` in text so the full `length` is still reported.
 - Errors are printed as `Error: <message>` without the `Debug` quoting.
 - `-o out.json.gz` gzip-compresses output on the fly (any `--format`). The
   gzip trailer is written even when the scan exits early with truncation.

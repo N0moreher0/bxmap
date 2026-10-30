@@ -119,10 +119,14 @@ padding bytes. `bxmap` gives applications a predictable core:
   entropy as possible compressed, encrypted, or packed data; no decryption is
   attempted.
 - In CLI JSON output, matching regions are emitted as `group: "Undefined"`
-  records with `offset`, `length`, `entropy`, and `data_hex`.
+  records with `offset`, `length`, `entropy`, and `data_hex` (capped by
+  `--entropy-max-data`; capped records add `data_truncated: true`).
 - Text output emits the same `Undefined` records in tab-separated form.
 - Entropy scanning is opt-in with `--entropy` so the default scan keeps its
-  original throughput.
+  original throughput. The window size (`--entropy-window`), threshold
+  (`--entropy-threshold`) and merging of contiguous windows
+  (`--entropy-merge`) are configurable; library users can call
+  `scan_entropy_from_file_with_options` with `EntropyScanOptions`.
 - **Configurable behavior**: control minimum length, result limits, and noise
   thresholds from Rust.
 - **Parallel when useful**: opt into bounded region-based scanning with Rayon.
