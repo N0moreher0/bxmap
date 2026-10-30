@@ -20,6 +20,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Truncation is no longer silent: the CLI prints a clear warning and exits with
   code `3` when `--max-strings` stops the scan early; `json-tree` metadata also
   reports `truncated` and `scanned_until`.
+- Generic-secret false positives are filtered: identifiers (`GetTokenInformation`,
+  `Malloc`, `DigiCert`), keywords (`true`/`false`/`undefined`), JavaScript
+  fragments and known .NET `publicKeyToken` values are no longer reported.
 
 ### Changed
 - `apply_detectors` allocates output capacity up front and clones lazily.

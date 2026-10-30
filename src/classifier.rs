@@ -341,6 +341,74 @@ fn secret_candidates(text: &str) -> u64 {
     mask
 }
 
+/// Values that show up next to `token=`/`password=` in manifests, JavaScript
+/// and Windows API names but are not credentials.
+const NON_SECRET_VALUES: &[&str] = &[
+    "true",
+    "false",
+    "null",
+    "none",
+    "nil",
+    "undefined",
+    "function",
+    "password",
+    "passwd",
+    "token",
+    "secret",
+    "apikey",
+    "api_key",
+    // Strong-name public key tokens from .NET manifests.
+    "6595b64144ccf1df",
+    "31bf3856ad364e35",
+    "1122334455667788",
+    "b77a5c561934e089",
+    "cc7b13ffcd2ddd51",
+];
+
+/// Decide whether the value after a generic `password=`/`token:` prefix looks
+/// like a credential instead of an identifier, keyword or JavaScript snippet.
+fn generic_secret_plausible(full_match: &str) -> bool {
+    let value = match full_match.find(['=', ':']) {
+        Some(index) => full_match[index + 1..].trim(),
+        None => full_match.trim(),
+    };
+    let value = value
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | ']' | '}' | '>' | '<'));
+    if value.len() < 6 {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    if NON_SECRET_VALUES.contains(&lower.as_str()) {
+        return false;
+    }
+    // JavaScript / code fragments.
+    if lower.starts_with("function")
+        || value.contains("=>")
+        || value.contains('{')
+        || value.contains('}')
+        || value.contains(';')
+        || value.contains('(')
+    {
+        return false;
+    }
+    let has_digit = value.bytes().any(|b| b.is_ascii_digit());
+    let has_symbol = value
+        .bytes()
+        .any(|b| !b.is_ascii_alphanumeric() && b != b'_');
+    let identifier = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    // `GetTokenInformation`, `Malloc`, `DigiCert`: identifier-shaped words.
+    if identifier && !has_digit && value.len() < 24 {
+        return false;
+    }
+    // Short alphabetic words are natural language, not keys.
+    if !has_digit && !has_symbol && value.len() < 20 {
+        return false;
+    }
+    true
+}
+
 pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
     detect_secrets_detailed(text)
         .into_iter()
@@ -364,6 +432,9 @@ pub fn detect_secrets_detailed(text: &str) -> Vec<SecretFinding> {
         }
         for m in re.find_iter(text) {
             let val = m.as_str().to_string();
+            if *name == "GENERIC_SECRET" && !generic_secret_plausible(&val) {
+                continue;
+            }
             if seen.insert(val.clone()) {
                 out.push(SecretFinding {
                     rule: name,
@@ -592,9 +663,9 @@ pub fn classify(text: &str) -> Option<Classification> {
         if candidates & (1u64 << idx) == 0 {
             continue;
         }
-        if re.is_match(text) {
-            if *name == "GENERIC_SECRET" {
-                // only classify if entropy reasonable? keep as-is
+        if let Some(matched) = re.find(text) {
+            if *name == "GENERIC_SECRET" && !generic_secret_plausible(matched.as_str()) {
+                continue;
             }
             return Some(Classification {
                 group: "SECRET",
@@ -604,7 +675,10 @@ pub fn classify(text: &str) -> Option<Classification> {
     }
     // existing rules...
     for (rule, re) in compiled_rules() {
-        if re.is_match(text) {
+        if let Some(matched) = re.find(text) {
+            if rule.typ == "GENERIC_SECRET" && !generic_secret_plausible(matched.as_str()) {
+                continue;
+            }
             if rule.min_entropy > 0.0 && e < rule.min_entropy {
                 continue;
             }
@@ -641,6 +715,9 @@ mod tests {
         for (name, re) in secret_compiled() {
             for m in re.find_iter(text) {
                 let val = m.as_str().to_string();
+                if *name == "GENERIC_SECRET" && !generic_secret_plausible(&val) {
+                    continue;
+                }
                 if seen.insert(val.clone()) {
                     out.push((name.to_string(), val));
                 }
@@ -838,5 +915,46 @@ mod tests {
             .expect("generic secret should be detected");
         assert_eq!(generic.severity, "low");
         assert!(generic.confidence < 0.5);
+    }
+
+    #[test]
+    fn generic_secret_rejects_common_false_positives() {
+        let samples = [
+            "Token: GetTokenInformation",
+            "Token: Malloc",
+            "Token:DigiCert",
+            "Password: false,",
+            "ApiKey=function(a){return a}",
+            "publicKeyToken=\"6595b64144ccf1df\"",
+            "publicKeyToken=\"31bf3856ad364e35\"",
+            "token=undefined",
+        ];
+        for text in samples {
+            let found = detect_secrets(text);
+            assert!(
+                !found.iter().any(|m| m.typ == "GENERIC_SECRET"),
+                "false positive for {text:?}: {found:?}"
+            );
+            assert!(
+                classify(text).map_or(true, |c| c.typ != "GENERIC_SECRET"),
+                "classify false positive for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_secret_keeps_real_looking_values() {
+        for text in [
+            "password=hunter2hunter2",
+            "api_key=abcdef123456",
+            "token=sk-live-abc123def456",
+            "Password: correcthorsebatterystaple",
+        ] {
+            let found = detect_secrets(text);
+            assert!(
+                found.iter().any(|m| m.typ == "GENERIC_SECRET"),
+                "missed plausible secret {text:?}: {found:?}"
+            );
+        }
     }
 }
