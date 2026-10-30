@@ -1,15 +1,16 @@
 use bxmap::{
     extract_strings_from_file_parallel, extract_strings_from_file_parallel_with_encodings,
     extract_strings_from_file_streaming, extract_strings_from_file_streaming_with_encodings,
-    extract_strings_from_file_with_noise_config, extract_strings_from_file_with_noise_config_and_encodings,
-    scan_entropy_from_file_streaming_with_data, scan_yara_from_file_streaming, EntropyRegion,
-    ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN, EncodingFilter,
+    extract_strings_from_file_with_noise_config,
+    extract_strings_from_file_with_noise_config_and_encodings,
+    scan_entropy_from_file_streaming_with_data, scan_yara_from_file_streaming, EncodingFilter,
+    EntropyRegion, ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
 };
 use regex::Regex;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
-use std::time::Instant;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 static DUMP_MAP: OnceLock<bxmap::minidump::Minidump> = OnceLock::new();
 
@@ -26,13 +27,22 @@ fn va_annotation(offset: u64) -> Option<(u64, String)> {
             .unwrap_or(&m.name)
             .to_string(),
         None => dump.region_for_va(va).map_or("-".to_string(), |r| {
-            format!("{} {}", r.kind_name(), bxmap::minidump::protect_name(r.protect))
+            format!(
+                "{} {}",
+                r.kind_name(),
+                bxmap::minidump::protect_name(r.protect)
+            )
         }),
     };
     Some((va, label))
 }
 
-fn passes_region_filter(offset: u64, module: &Option<String>, rwx_only: bool, heap_only: bool) -> bool {
+fn passes_region_filter(
+    offset: u64,
+    module: &Option<String>,
+    rwx_only: bool,
+    heap_only: bool,
+) -> bool {
     if module.is_none() && !rwx_only && !heap_only {
         return true;
     }
@@ -337,7 +347,6 @@ fn json_escape(value: &str) -> String {
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
-
     }
     out.push('"');
     out
@@ -361,10 +370,8 @@ fn matches_filter(regex: Option<&Regex>, text: &str) -> bool {
 fn detected_ip_value(text: &str) -> Option<String> {
     static IPV4: OnceLock<Regex> = OnceLock::new();
     let ipv4 = IPV4.get_or_init(|| {
-        Regex::new(
-            r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b",
-        )
-        .unwrap()
+        Regex::new(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
+            .unwrap()
     });
     if let Some(value) = ipv4
         .find_iter(text)
@@ -381,17 +388,19 @@ fn detected_url_value(text: &str) -> Option<String> {
     static URL: OnceLock<Regex> = OnceLock::new();
     URL.get_or_init(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>]+"#).unwrap())
         .find(text)
-        .map(|matched| matched.as_str().trim_end_matches(['.', ',', ';', ')', ']', '}']).to_string())
+        .map(|matched| {
+            matched
+                .as_str()
+                .trim_end_matches(['.', ',', ';', ')', ']', '}'])
+                .to_string()
+        })
 }
 
 fn detected_domain_value(text: &str) -> Option<String> {
     static DOMAIN: OnceLock<Regex> = OnceLock::new();
     DOMAIN
         .get_or_init(|| {
-            Regex::new(
-                r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b",
-            )
-            .unwrap()
+            Regex::new(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b").unwrap()
         })
         .find(text)
         .map(|matched| matched.as_str().to_string())
@@ -417,8 +426,16 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
     for chunk in bytes.chunks_exact(4) {
         let a = base64_value(chunk[0])?;
         let b = base64_value(chunk[1])?;
-        let c = if chunk[2] == b'=' { 0 } else { base64_value(chunk[2])? };
-        let d = if chunk[3] == b'=' { 0 } else { base64_value(chunk[3])? };
+        let c = if chunk[2] == b'=' {
+            0
+        } else {
+            base64_value(chunk[2])?
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else {
+            base64_value(chunk[3])?
+        };
         output.push((a << 2) | (b >> 4));
         if chunk[2] != b'=' {
             output.push((b << 4) | (c >> 2));
@@ -433,13 +450,15 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
 fn detect_and_decode_base64(text: &str) -> Option<String> {
     static B64: OnceLock<Regex> = OnceLock::new();
     let regex = B64.get_or_init(|| {
-        Regex::new(r"(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
-            .unwrap()
+        Regex::new(r"(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?").unwrap()
     });
     regex.find_iter(text).find_map(|matched| {
         let decoded = decode_base64(matched.as_str())?;
         let decoded = String::from_utf8(decoded).ok()?;
-        if decoded.chars().any(|character| character.is_ascii_alphanumeric()) {
+        if decoded
+            .chars()
+            .any(|character| character.is_ascii_alphanumeric())
+        {
             Some(decoded)
         } else {
             None
@@ -580,10 +599,7 @@ fn write_entropy_text(
     )
 }
 
-fn write_yara_text(
-    rule: &bxmap::YaraMatch,
-    writer: &mut dyn Write,
-) -> io::Result<()> {
+fn write_yara_text(rule: &bxmap::YaraMatch, writer: &mut dyn Write) -> io::Result<()> {
     writeln!(
         writer,
         "{:#010x}\tYARA\t{}::{}",
@@ -641,75 +657,77 @@ struct XorResult {
 }
 
 fn refang_ioc_text(text: &str) -> String {
-        static BRACKET_DOT: OnceLock<Regex> = OnceLock::new();
-        static BRACKET_AT: OnceLock<Regex> = OnceLock::new();
-        static WORD_DOT: OnceLock<Regex> = OnceLock::new();
-        static WORD_AT: OnceLock<Regex> = OnceLock::new();
-        let text = BRACKET_DOT
-            .get_or_init(|| Regex::new(r"\s*[\[\(]\s*\.\s*[\]\)]\s*").unwrap())
-            .replace_all(text, ".");
-        let text = BRACKET_AT
-            .get_or_init(|| Regex::new(r"(?i)\s*[\[\(]\s*at\s*[\]\)]\s*").unwrap())
-            .replace_all(&text, "@");
-        let text = WORD_DOT
-            .get_or_init(|| Regex::new(r"(?i)\s+dot\s+").unwrap())
-            .replace_all(&text, ".");
-        WORD_AT
-            .get_or_init(|| Regex::new(r"(?i)\s+at\s+").unwrap())
-            .replace_all(&text, "@")
-            .into_owned()
+    static BRACKET_DOT: OnceLock<Regex> = OnceLock::new();
+    static BRACKET_AT: OnceLock<Regex> = OnceLock::new();
+    static WORD_DOT: OnceLock<Regex> = OnceLock::new();
+    static WORD_AT: OnceLock<Regex> = OnceLock::new();
+    let text = BRACKET_DOT
+        .get_or_init(|| Regex::new(r"\s*[\[\(]\s*\.\s*[\]\)]\s*").unwrap())
+        .replace_all(text, ".");
+    let text = BRACKET_AT
+        .get_or_init(|| Regex::new(r"(?i)\s*[\[\(]\s*at\s*[\]\)]\s*").unwrap())
+        .replace_all(&text, "@");
+    let text = WORD_DOT
+        .get_or_init(|| Regex::new(r"(?i)\s+dot\s+").unwrap())
+        .replace_all(&text, ".");
+    WORD_AT
+        .get_or_init(|| Regex::new(r"(?i)\s+at\s+").unwrap())
+        .replace_all(&text, "@")
+        .into_owned()
 }
 
 fn is_public_ipv4(value: &str) -> bool {
-        let ip = value.split(':').next().unwrap_or(value);
-        let Ok(address) = ip.parse::<std::net::Ipv4Addr>() else {
-            return false;
-        };
-        let octets = address.octets();
-        let is_shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
-        let is_benchmark = octets[0] == 198 && (18..=19).contains(&octets[1]);
-        let is_documentation = (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-            || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-            || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
-        !address.is_private()
-            && !address.is_loopback()
-            && !address.is_link_local()
-            && !address.is_unspecified()
-            && !address.is_multicast()
-            && !address.is_broadcast()
-            && !is_shared
-            && !is_benchmark
-            && !is_documentation
+    let ip = value.split(':').next().unwrap_or(value);
+    let Ok(address) = ip.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let octets = address.octets();
+    let is_shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    let is_benchmark = octets[0] == 198 && (18..=19).contains(&octets[1]);
+    let is_documentation = (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
+    !address.is_private()
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && !address.is_broadcast()
+        && !is_shared
+        && !is_benchmark
+        && !is_documentation
 }
 
 fn contains_public_ip(text: &str) -> bool {
-        static IPV4: OnceLock<Regex> = OnceLock::new();
-        let regex = IPV4.get_or_init(|| {
-            Regex::new(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{1,5})?\b")
-                .unwrap()
-        });
-        regex
-            .find_iter(text)
-            .any(|matched| is_public_ipv4(matched.as_str()))
+    static IPV4: OnceLock<Regex> = OnceLock::new();
+    let regex = IPV4.get_or_init(|| {
+        Regex::new(
+            r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{1,5})?\b",
+        )
+        .unwrap()
+    });
+    regex
+        .find_iter(text)
+        .any(|matched| is_public_ipv4(matched.as_str()))
 }
 
 fn shannon_entropy(text: &str) -> f64 {
-        if text.is_empty() {
-            return 0.0;
-        }
-        let mut counts = [0usize; 256];
-        for byte in text.bytes() {
-            counts[byte as usize] += 1;
-        }
-        let length = text.len() as f64;
-        counts
-            .iter()
-            .filter(|&&count| count != 0)
-            .map(|&count| {
-                let probability = count as f64 / length;
-                -probability * probability.log2()
-            })
-            .sum()
+    if text.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0usize; 256];
+    for byte in text.bytes() {
+        counts[byte as usize] += 1;
+    }
+    let length = text.len() as f64;
+    counts
+        .iter()
+        .filter(|&&count| count != 0)
+        .map(|&count| {
+            let probability = count as f64 / length;
+            -probability * probability.log2()
+        })
+        .sum()
 }
 
 fn is_repetitive_noise(text: &str) -> bool {
@@ -729,25 +747,24 @@ fn is_repetitive_noise(text: &str) -> bool {
 }
 
 fn contains_meaningful_base64(text: &str) -> bool {
-        static BASE64: OnceLock<Regex> = OnceLock::new();
-        let regex = BASE64.get_or_init(|| {
-            Regex::new(r"(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
-                .unwrap()
-        });
-        let bytes = text.as_bytes();
-        regex.find_iter(text).any(|matched| {
-            let before_ok = matched.start() == 0
-                || !bytes[matched.start() - 1].is_ascii_alphanumeric()
-                    && !matches!(bytes[matched.start() - 1], b'+' | b'/' | b'=');
-            let after_ok = matched.end() == bytes.len()
-                || !bytes[matched.end()].is_ascii_alphanumeric()
-                    && !matches!(bytes[matched.end()], b'+' | b'/' | b'=');
-            let value = matched.as_str();
-            before_ok
-                && after_ok
-                && shannon_entropy(value) >= 2.5
-                && value.bytes().any(|byte| byte.is_ascii_digit())
-        })
+    static BASE64: OnceLock<Regex> = OnceLock::new();
+    let regex = BASE64.get_or_init(|| {
+        Regex::new(r"(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?").unwrap()
+    });
+    let bytes = text.as_bytes();
+    regex.find_iter(text).any(|matched| {
+        let before_ok = matched.start() == 0
+            || !bytes[matched.start() - 1].is_ascii_alphanumeric()
+                && !matches!(bytes[matched.start() - 1], b'+' | b'/' | b'=');
+        let after_ok = matched.end() == bytes.len()
+            || !bytes[matched.end()].is_ascii_alphanumeric()
+                && !matches!(bytes[matched.end()], b'+' | b'/' | b'=');
+        let value = matched.as_str();
+        before_ok
+            && after_ok
+            && shannon_entropy(value) >= 2.5
+            && value.bytes().any(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn xor_printable_score(data: &[u8]) -> f64 {
@@ -756,7 +773,9 @@ fn xor_printable_score(data: &[u8]) -> f64 {
     }
     let printable = data
         .iter()
-        .filter(|&&byte| (32..=126).contains(&byte) || byte == b'\t' || byte == b'\n' || byte == b'\r')
+        .filter(|&&byte| {
+            (32..=126).contains(&byte) || byte == b'\t' || byte == b'\n' || byte == b'\r'
+        })
         .count();
     let alphanumeric = data
         .iter()
@@ -860,7 +879,10 @@ fn append_xor_candidates(candidates: &mut Vec<(u64, Vec<u8>)>, offset: u64, data
                 .windows(3)
                 .all(|window| window[0] == window[2] && window[0] != window[1])
         {
-            candidates.push((offset + (index * MAX_XOR_CANDIDATE_LEN) as u64, chunk.to_vec()));
+            candidates.push((
+                offset + (index * MAX_XOR_CANDIDATE_LEN) as u64,
+                chunk.to_vec(),
+            ));
             if candidates.len() >= MAX_XOR_CANDIDATES {
                 return;
             }
@@ -1028,7 +1050,12 @@ fn contains_jwt_shape(text: &str) -> bool {
     text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '=' || c == ':')
         .any(|part| {
             let mut segments = part.split('.');
-            match (segments.next(), segments.next(), segments.next(), segments.next()) {
+            match (
+                segments.next(),
+                segments.next(),
+                segments.next(),
+                segments.next(),
+            ) {
                 (Some(h), Some(p), Some(sig), None) => {
                     h.len() >= 10
                         && h.to_ascii_lowercase().starts_with("eyj")
@@ -1054,7 +1081,11 @@ fn is_crypto_address(token: &str) -> bool {
     let lower = token.to_ascii_lowercase();
     if token.len() < 14
         || shannon_entropy(token) < 2.5
-        || token.bytes().collect::<std::collections::HashSet<_>>().len() < 6
+        || token
+            .bytes()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            < 6
     {
         return false;
     }
@@ -1109,11 +1140,10 @@ mod tests {
     use std::fs;
 
     use super::{
-        contains_jwt_shape, hex_encode, contains_crypto_address, contains_meaningful_base64, detected_domain_value,
-        detected_ip_value, detected_url_value, important_reason, matches_filter,
-        is_email_address, parse_pid_marker, refang_ioc_text, scan_magic_bytes,
-        xor_printable_score,
-        ExtractedString,
+        contains_crypto_address, contains_jwt_shape, contains_meaningful_base64,
+        detected_domain_value, detected_ip_value, detected_url_value, hex_encode, important_reason,
+        is_email_address, matches_filter, parse_pid_marker, refang_ioc_text, scan_magic_bytes,
+        xor_printable_score, ExtractedString,
     };
     use regex::Regex;
 
@@ -1166,7 +1196,10 @@ mod tests {
 
     #[test]
     fn refangs_common_ioc_obfuscation() {
-        assert_eq!(refang_ioc_text("https://example[.]com user [at] example[.]com"), "https://example.com user@example.com");
+        assert_eq!(
+            refang_ioc_text("https://example[.]com user [at] example[.]com"),
+            "https://example.com user@example.com"
+        );
     }
 
     #[test]
@@ -1188,14 +1221,8 @@ mod tests {
             "VGhpcyBpcyBhIHJlYWwgYmFzZTY0IHBheWxvYWQxMjM="
         ));
         assert!(!contains_meaningful_base64(&"A".repeat(48)));
-        assert_eq!(
-            important_reason("14666666666DDDDDDDDDDDDDDDDDDDD"),
-            None
-        );
-        assert_eq!(
-            important_reason("))))FFFFFFFF)))))......66@"),
-            None
-        );
+        assert_eq!(important_reason("14666666666DDDDDDDDDDDDDDDDDDDD"), None);
+        assert_eq!(important_reason("))))FFFFFFFF)))))......66@"), None);
         assert!(!is_email_address("H      %     ?     2     @"));
         assert!(is_email_address("analyst@example.com"));
     }
@@ -1220,18 +1247,15 @@ mod tests {
             text: "prefix AKIAIOSFODNN7EXAMPLE suffix".to_string(),
         };
         assert_eq!(
-            super::apply_detectors(result, &[super::Detector::Secret])[0]
-                .text,
+            super::apply_detectors(result, &[super::Detector::Secret])[0].text,
             "AKIAIOSFODNN7EXAMPLE"
         );
     }
 
     #[test]
     fn magic_scan_handles_chunk_boundaries_without_duplicates() {
-        let path = std::env::temp_dir().join(format!(
-            "bxmap-magic-test-{}.dmp",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("bxmap-magic-test-{}.dmp", std::process::id()));
         let mut data = vec![b'x'; 65_535];
         data.extend_from_slice(b"MZ");
         data.extend_from_slice(&[b'y'; 65_535]);
@@ -1255,7 +1279,9 @@ mod tests {
 
     #[test]
     fn jwt_shape_requires_three_segments() {
-        assert!(contains_jwt_shape("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig_1-"));
+        assert!(contains_jwt_shape(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig_1-"
+        ));
         assert!(!contains_jwt_shape("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0"));
         assert!(!contains_jwt_shape("rW)jWT"));
     }
@@ -1315,13 +1341,17 @@ fn print_selected_options(args: &Args, threads: usize) {
     let detector = if args.detectors.is_empty() {
         "off".to_string()
     } else {
-        args.detectors.iter().map(|d| match d {
-            Detector::Ip => "ip",
-            Detector::Url => "url",
-            Detector::Domain => "domain",
-            Detector::Base64 => "b64",
-            Detector::Secret => "secret",
-        }).collect::<Vec<_>>().join(",")
+        args.detectors
+            .iter()
+            .map(|d| match d {
+                Detector::Ip => "ip",
+                Detector::Url => "url",
+                Detector::Domain => "domain",
+                Detector::Base64 => "b64",
+                Detector::Secret => "secret",
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     };
 
     if io::stderr().is_terminal() {
@@ -1333,9 +1363,7 @@ fn print_selected_options(args: &Args, threads: usize) {
         "    format={format} encoding={encoding} min-len={} max-strings={}",
         args.min_len, args.max_strings
     );
-    eprintln!(
-        "    threads={threads} auto-tune={auto_tune} noise-threshold={noise}"
-    );
+    eprintln!("    threads={threads} auto-tune={auto_tune} noise-threshold={noise}");
     eprintln!(
         "    entropy={entropy} yara={} brute-xor={} parse-pid={parse_pid} detector={detector} magic-bytes={}",
         yara,
@@ -1356,7 +1384,11 @@ fn print_truncation_notice(result_count: usize, max_strings: usize, last_offset:
     if max_strings == 0 || result_count < max_strings {
         return;
     }
-    let pct = if size == 0 { 100.0 } else { last_offset as f64 * 100.0 / size as f64 };
+    let pct = if size == 0 {
+        100.0
+    } else {
+        last_offset as f64 * 100.0 / size as f64
+    };
     eprintln!(
         "  [!] TRUNCATED: reached --max-strings {max_strings}; scan stopped near offset {last_offset:#x} (~{pct:.1}% of the file)."
     );
@@ -1399,8 +1431,7 @@ fn print_report(
             let reason = important_reason(&result.text).unwrap_or("interesting");
             eprintln!(
                 "      - {:<12} | offset {:#010x} | {:<7} | {}",
-                reason,
-                result.offset, result.encoding, result.text
+                reason, result.offset, result.encoding, result.text
             );
         }
     }
@@ -1516,7 +1547,10 @@ fn main() -> Result<(), String> {
         print!("{}", dump.render_tree(30));
         return Ok(());
     }
-    if args.map_va || args.in_module.is_some() || args.rwx_only || args.heap_only
+    if args.map_va
+        || args.in_module.is_some()
+        || args.rwx_only
+        || args.heap_only
         || args.path.to_ascii_lowercase().ends_with(".mdmp")
         || args.path.to_ascii_lowercase().ends_with(".hdmp")
         || args.path.to_ascii_lowercase().ends_with(".dmp")
@@ -1637,8 +1671,10 @@ fn main() -> Result<(), String> {
                 last_offset = last_offset.max(result.offset);
                 if matches!(args.encoding, Encoding::All)
                     || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
-                    || (args.encoding == Encoding::Utf16 && (result.encoding == "utf16le" || result.encoding == "utf16be"))
-                    || (args.encoding == Encoding::Utf32 && (result.encoding == "utf32le" || result.encoding == "utf32be"))
+                    || (args.encoding == Encoding::Utf16
+                        && (result.encoding == "utf16le" || result.encoding == "utf16be"))
+                    || (args.encoding == Encoding::Utf32
+                        && (result.encoding == "utf32le" || result.encoding == "utf32be"))
                 {
                     for result in apply_detectors(result, &args.detectors) {
                         if matches_filter(filter_regex.as_ref(), &result.text) {
@@ -1671,10 +1707,9 @@ fn main() -> Result<(), String> {
                     .map_err(|e| format!("write failed: {e}"))?;
             }
             for result in &xor_results {
-                if filter_regex
-                    .as_ref()
-                    .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
-                {
+                if filter_regex.as_ref().map_or(true, |regex| {
+                    regex.is_match(&String::from_utf8_lossy(&result.plaintext))
+                }) {
                     write_xor_json(result, &mut writer, &mut json_count)
                         .map_err(|e| format!("write failed: {e}"))?;
                 }
@@ -1705,38 +1740,35 @@ fn main() -> Result<(), String> {
             write!(writer, "\n]\n").map_err(|e| format!("write failed: {e}"))?;
         } else {
             for matched in &yara_matches {
-                write_yara_text(matched, &mut writer)
-                    .map_err(|e| format!("write failed: {e}"))?;
+                write_yara_text(matched, &mut writer).map_err(|e| format!("write failed: {e}"))?;
             }
             for result in &xor_results {
-                if filter_regex
-                    .as_ref()
-                    .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
-                {
+                if filter_regex.as_ref().map_or(true, |regex| {
+                    regex.is_match(&String::from_utf8_lossy(&result.plaintext))
+                }) {
                     write_xor_text(result, &mut writer)
                         .map_err(|e| format!("write failed: {e}"))?;
                 }
             }
             for magic in &magic_matches {
-                write_magic_text(magic, &mut writer)
-                    .map_err(|e| format!("write failed: {e}"))?;
+                write_magic_text(magic, &mut writer).map_err(|e| format!("write failed: {e}"))?;
             }
             if args.entropy {
-            scan_entropy_from_file_streaming_with_data(
-                &args.path,
-                ENTROPY_THRESHOLD,
-                |region, data| {
-                    if write_error.is_none() {
-                        if let Err(error) = write_entropy_text(region, data, &mut writer) {
-                            write_error = Some(error);
+                scan_entropy_from_file_streaming_with_data(
+                    &args.path,
+                    ENTROPY_THRESHOLD,
+                    |region, data| {
+                        if write_error.is_none() {
+                            if let Err(error) = write_entropy_text(region, data, &mut writer) {
+                                write_error = Some(error);
+                            }
                         }
-                    }
-                },
-            )
-            .map_err(|e| format!("entropy scan failed: {e}"))?;
-            if let Some(error) = write_error {
-                return Err(format!("write failed: {error}"));
-            }
+                    },
+                )
+                .map_err(|e| format!("entropy scan failed: {e}"))?;
+                if let Some(error) = write_error {
+                    return Err(format!("write failed: {error}"));
+                }
             }
         }
         writer.flush().map_err(|e| format!("write failed: {e}"))?;
@@ -1744,8 +1776,15 @@ fn main() -> Result<(), String> {
             eprintln!("wrote {result_count} results to '{path}'");
         }
         print_report(
-            result_count, short, medium, long, &important, &entropy_regions, file_size,
-            start.elapsed().as_secs_f64(), threads,
+            result_count,
+            short,
+            medium,
+            long,
+            &important,
+            &entropy_regions,
+            file_size,
+            start.elapsed().as_secs_f64(),
+            threads,
         );
         print_truncation_notice(result_count, args.max_strings, last_offset, file_size);
         return Ok(());
@@ -1757,7 +1796,13 @@ fn main() -> Result<(), String> {
             .build()
             .map_err(|e| format!("cannot create worker pool: {e}"))?;
         pool.install(|| {
-            extract_strings_from_file_parallel_with_encodings(&args.path, args.min_len, args.max_strings, noise, enc_filter)
+            extract_strings_from_file_parallel_with_encodings(
+                &args.path,
+                args.min_len,
+                args.max_strings,
+                noise,
+                enc_filter,
+            )
         })
     } else {
         extract_strings_from_file_with_noise_config_and_encodings(
@@ -1777,7 +1822,14 @@ fn main() -> Result<(), String> {
             Encoding::Utf16 => result.encoding == "utf16le" || result.encoding == "utf16be",
             Encoding::Utf32 => result.encoding == "utf32le" || result.encoding == "utf32be",
         })
-        .filter(|result| passes_region_filter(result.offset, &args.in_module, args.rwx_only, args.heap_only))
+        .filter(|result| {
+            passes_region_filter(
+                result.offset,
+                &args.in_module,
+                args.rwx_only,
+                args.heap_only,
+            )
+        })
         .flat_map(|result| apply_detectors(result, &args.detectors))
         .filter(|result| {
             filter_regex
@@ -1807,12 +1859,20 @@ fn main() -> Result<(), String> {
         let mut out = String::from("{\"groups\":[\n");
         let mut first_group = true;
         for ((g, t), items) in &groups {
-            if !first_group { out.push_str(",\n"); }
+            if !first_group {
+                out.push_str(",\n");
+            }
             first_group = false;
-            out.push_str(&format!("  {{\"group\":{},\"type\":{},\"items\":[\n", json_escape(g), json_escape(t)));
+            out.push_str(&format!(
+                "  {{\"group\":{},\"type\":{},\"items\":[\n",
+                json_escape(g),
+                json_escape(t)
+            ));
             let mut first_item = true;
             for r in items {
-                if !first_item { out.push_str(",\n"); }
+                if !first_item {
+                    out.push_str(",\n");
+                }
                 first_item = false;
                 let ent = bxmap::classifier::entropy_of(&r.text);
                 let ts_part = if let Some(dump) = DUMP_MAP.get() {
@@ -1828,16 +1888,37 @@ fn main() -> Result<(), String> {
                 } else {
                     String::new()
                 };
-                out.push_str(&format!("    {{\"text\":{},\"offset\":{},\"entropy\":{:.4}{}}}", json_escape(&r.text), r.offset, ent, ts_part));
+                out.push_str(&format!(
+                    "    {{\"text\":{},\"offset\":{},\"entropy\":{:.4}{}}}",
+                    json_escape(&r.text),
+                    r.offset,
+                    ent,
+                    ts_part
+                ));
             }
             out.push_str("\n  ]}");
         }
-        out.push_str(&format!("\n],\"metadata\":{{\"total_strings\":{}}}\n}}\n", results.len()));
+        out.push_str(&format!(
+            "\n],\"metadata\":{{\"total_strings\":{}}}\n}}\n",
+            results.len()
+        ));
         write!(writer, "{}", out).map_err(|e| format!("write failed: {e}"))?;
         writer.flush().map_err(|e| format!("write failed: {e}"))?;
-        if let Some(path) = output_path.clone() { eprintln!("wrote {} results to '{}'", results.len(), path); }
+        if let Some(path) = output_path.clone() {
+            eprintln!("wrote {} results to '{}'", results.len(), path);
+        }
         let _ = args.stats;
-        print_report(results.len(), 0, 0, 0, &[], &entropy_regions, file_size, start.elapsed().as_secs_f64(), threads);
+        print_report(
+            results.len(),
+            0,
+            0,
+            0,
+            &[],
+            &entropy_regions,
+            file_size,
+            start.elapsed().as_secs_f64(),
+            threads,
+        );
         print_truncation_notice(
             results.len(),
             args.max_strings,
@@ -1851,17 +1932,16 @@ fn main() -> Result<(), String> {
         let mut json_count = 0;
         for result in &results {
             write_string_json(result, &mut writer, &mut json_count, args.parse_pid)
-            .map_err(|e| format!("write failed: {e}"))?;
+                .map_err(|e| format!("write failed: {e}"))?;
         }
         for matched in &yara_matches {
             write_yara_json(matched, &mut writer, &mut json_count)
-            .map_err(|e| format!("write failed: {e}"))?;
+                .map_err(|e| format!("write failed: {e}"))?;
         }
         for result in &xor_results {
-            if filter_regex
-                .as_ref()
-                .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
-            {
+            if filter_regex.as_ref().map_or(true, |regex| {
+                regex.is_match(&String::from_utf8_lossy(&result.plaintext))
+            }) {
                 write_xor_json(result, &mut writer, &mut json_count)
                     .map_err(|e| format!("write failed: {e}"))?;
             }
@@ -1873,21 +1953,21 @@ fn main() -> Result<(), String> {
         if args.entropy {
             let mut entropy_write_error = None;
             scan_entropy_from_file_streaming_with_data(
-            &args.path,
-            ENTROPY_THRESHOLD,
-            |region, data| {
-                if entropy_write_error.is_none() {
-                    if let Err(error) =
-                        write_entropy_json(region, data, &mut writer, &mut json_count)
-                    {
-                        entropy_write_error = Some(error);
+                &args.path,
+                ENTROPY_THRESHOLD,
+                |region, data| {
+                    if entropy_write_error.is_none() {
+                        if let Err(error) =
+                            write_entropy_json(region, data, &mut writer, &mut json_count)
+                        {
+                            entropy_write_error = Some(error);
+                        }
                     }
-                }
-            },
+                },
             )
             .map_err(|e| format!("entropy scan failed: {e}"))?;
             if let Some(error) = entropy_write_error {
-            return Err(format!("write failed: {error}"));
+                return Err(format!("write failed: {error}"));
             }
         }
         writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
@@ -1895,21 +1975,17 @@ fn main() -> Result<(), String> {
         write_results(&results, args.format, &mut writer, args.parse_pid)
             .map_err(|e| format!("write failed: {e}"))?;
         for matched in &yara_matches {
-            write_yara_text(matched, &mut writer)
-                .map_err(|e| format!("write failed: {e}"))?;
+            write_yara_text(matched, &mut writer).map_err(|e| format!("write failed: {e}"))?;
         }
         for result in &xor_results {
-            if filter_regex
-                .as_ref()
-                .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
-            {
-                write_xor_text(result, &mut writer)
-                    .map_err(|e| format!("write failed: {e}"))?;
+            if filter_regex.as_ref().map_or(true, |regex| {
+                regex.is_match(&String::from_utf8_lossy(&result.plaintext))
+            }) {
+                write_xor_text(result, &mut writer).map_err(|e| format!("write failed: {e}"))?;
             }
         }
         for magic in &magic_matches {
-            write_magic_text(magic, &mut writer)
-                .map_err(|e| format!("write failed: {e}"))?;
+            write_magic_text(magic, &mut writer).map_err(|e| format!("write failed: {e}"))?;
         }
         if args.entropy && args.format == Format::Text {
             let mut entropy_write_error = None;
@@ -1950,8 +2026,15 @@ fn main() -> Result<(), String> {
         }
     }
     print_report(
-        results.len(), short, medium, long, &important, &entropy_regions, file_size,
-        start.elapsed().as_secs_f64(), threads,
+        results.len(),
+        short,
+        medium,
+        long,
+        &important,
+        &entropy_regions,
+        file_size,
+        start.elapsed().as_secs_f64(),
+        threads,
     );
     print_truncation_notice(
         results.len(),

@@ -1,101 +1,32 @@
-# bxmap-cli
+# bxmap CLI
 
-```text
-+-----------------------------------------+
-|  BBBB    X   X   MMM MMM    AAA    PPPP |
-|  B   B    X X    M M M M   A   A   P   P|
-|  BBBB      X     M  M  M   AAAAA   PPPP |
-|  B   B    X X    M     M   A   A   P    |
-|  BBBB    X   X   M     M   A   A   P    |
-+-----------------------------------------+
-```
-
-Professional command-line frontend for the
-[`bxmap`](https://crates.io/crates/bxmap) memory-dump extraction library.
+Command-line frontend for the `bxmap` memory-dump string extraction library.
 
 ## Install
 
 ```bash
+cargo install bxmap-cli
+# or
 cargo binstall bxmap-cli
 ```
 
-This downloads a prebuilt binary from the GitHub Releases page and installs it
-without compiling Rust code. Automated releases are created for every push to
-the `main` branch.
-
-If `cargo-binstall` is not installed, use the normal source-build fallback:
+## Quick start
 
 ```bash
-cargo install bxmap-cli
-```
-
-## Use
-
-```bash
-bxmap memory.dmp
 bxmap memory.dmp --auto-tune
-bxmap memory.dmp --format json -o strings.json
-bxmap memory.dmp --encoding utf16 --min-len 6
-bxmap memory.dmp --noise-threshold 16 --threads 4
-bxmap memory.dmp --yar rules.yar --format json -o triage.json
-bxmap memory.dmp --brute-xor "1b;2b" --format json -o xor.json
-bxmap memory.dmp --filter-regex "(?i)(password|token|secret)"
-bxmap memory.dmp --detect-url
-bxmap memory.dmp --detect-b64 --magic-bytes
+bxmap memory.dmp --encoding ascii --format json -o strings.json
+bxmap memory.dmp --entropy --format json -o triage.json
+bxmap --help
 ```
 
-## Features
+## Useful flags
 
-- ASCII and UTF-16LE extraction.
-- Streaming scans for large dump files.
-- Configurable minimum length and result limits.
-- `--filter-regex <RE>` keeps extracted strings and XOR plaintext matching a
-  Rust regular expression; invalid expressions fail with an explicit error.
-- `--detect-ip` emits only detected public IPv4/IPv6 values.
-- `--detect-url` emits only HTTP/HTTPS URLs, with trailing punctuation removed.
-- `--detect-domain` emits only domain names, without surrounding extracted text.
-- `--detect-b64` finds Base64 runs and emits decoded printable UTF-8 text.
-- Detector modes are mutually exclusive and cannot be combined with
-  `--filter-regex`; without one, the default full extraction is unchanged.
-- `--magic-bytes` reports executable/document signatures such as PE (`MZ`), ELF,
-  ZIP/Office, PDF, and PNG while scanning large files in bounded chunks.
-- Conservative repeat-noise filtering.
-- Parallel scanning with explicit threads or `--auto-tune`.
-- Before scanning, the CLI prints the effective selected options to `stderr`
-  (`format`, `encoding`, limits, workers, entropy, YARA, XOR, PID parsing,
-  and output destination).
-- Text or JSON output.
-- Default single-worker scans stream results directly to the output.
-- `--entropy` enables high-entropy region hints in the report on `stderr`.
-- `--yar <PATH>` compiles and matches a YARA/YARA-X rule file while streaming
-  the dump; each matching rule is emitted as a `YARA` output record.
-- `--brute-xor <1b;2b;3b>` is an opt-in CLI-only pass. It collects bounded
-  non-zero byte candidates, tries the selected XOR key sizes, scores printable
-  ASCII/UTF-8 output, boosts useful IOC terms, and retains the top five
-  results per candidate/key size.
-- XOR ranking uses printable ASCII/whitespace ratio, valid UTF-8, and bonuses
-  for `http`, `www`, `.exe`, `.dll`, `Virtual`, `Create`, and `Thread`.
-- `--auto-tune` selects extraction workers; it does not currently parallelize
-  the brute-force XOR loop. Prefer `1b` or `1b;2b` for practical triage.
-- JSON output also includes each matching region as a `group: "Undefined"`
-  record with its bytes encoded as `data_hex`.
-- Text output includes the same `Undefined` entropy records with
-  `length`, `entropy`, and `data_hex` fields.
-- Entropy scanning is opt-in to preserve default scan speed.
-- `--parse-pid` adds a `pid` field to JSON or a `pid=...` column to text output
-  when a string contains a `PID=`/`ProcessId=` marker.
-- Automatic scan summary and priority triage signals on `stderr`.
-- IOC triage refangs `[.]`/`[at]` notation, validates public IPv4 addresses,
-  filters private/reserved IP noise, and ignores low-entropy Base64-like runs.
-- IPv4/IPv6 and common crypto-wallet address triage signals.
-- Clean stdout for shell pipelines and automation.
+- `--encoding <all|ascii|utf16|utf32>` — restrict extracted strings by encoding.
+- `--min-len <N>` — minimum string length.
+- `--format <text|json|json-tree>` — output format.
+- `--detect <list>` — IOC / credential triage.
+- `--auto-tune` — choose a worker count for this machine.
+- `--entropy` — report high-entropy regions.
 
-Run `bxmap --help` for the complete option list.
-
-## Output groups
-
-- Extracted strings are emitted with their offset and encoding.
-- Entropy records use `group: "Undefined"` and include `data_hex`.
-- YARA records use `group: "YARA"` and include namespace and rule name.
-- XOR records use `group: "XOR"` and include candidate offset, key hex,
-  score, and decoded plaintext.
+For library usage see the crate README at <https://docs.rs/bxmap>.
+PY
