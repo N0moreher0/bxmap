@@ -59,14 +59,22 @@ bxmap --help
 - `--compact` — minify `json`/`json-tree` output: one line, no indentation.
   Handy for large exports and for piping into other tools.
 - `--extract <list>` — also emit deduped artifacts collected from the
-  extracted strings: `paths`, `env`, `urls`, `emails`, `registry` or `all`
-  (comma-separated). Each artifact carries the first offset, an occurrence
-  count and an optional `detail` string (`user=<name>;category=<...>` for
-  paths, `name=...;sensitive=true` for credentials). Artifacts are sorted
-  rarest-first and appended after the normal rows. Supported with `text`,
-  `json`, `ndjson` and `csv`; `json-tree` is rejected because artifacts are a
-  flat record type. The library equivalent is
+  extracted strings: `paths`, `env`, `urls`, `emails`, `registry`, `tools` or
+  `all` (comma-separated). Each artifact carries the first offset, an
+  occurrence count and an optional `detail` string
+  (`user=<name>;category=<...>` for paths, `name=...;sensitive=true` for
+  credentials, `evidence=...;category=...;trace=...` for tools). Artifacts are
+  sorted rarest-first and appended after the normal rows. Supported with
+  `text`, `json`, `ndjson` and `csv`; `json-tree` is rejected because
+  artifacts are a flat record type. The library equivalent is
   `bxmap::artifacts::ArtifactCollector`.
+- `--extract tools` names the memory-capture/analysis tooling found in the
+  dump: DumpIt, WinPmem, FTK Imager, Magnet RAM Capture, Belkasoft RAM
+  Capturer, LiME, AVML, Volatility, Rekall, ProcDump, plus default image names
+  (`DESKTOP-<host>-<date>-<time>.raw`, `physicalmemory.mem`, `memory.raw`,
+  `ramdump.mem`). Matching is case-insensitive with word boundaries, each
+  string counts once per tool, and `trace=` lists every evidence kind seen
+  (`path`, `command`, `prefetch`, `filename`, `string`).
 - `--report summary` — print a detailed summary on stderr: string counts per
   encoding, the scanned byte range (percentage of the requested window and of
   the file), whether `--max-strings` stopped the scan early, and the top

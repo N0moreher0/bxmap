@@ -305,10 +305,13 @@ OPTIONS:
     --compact            Minify json/json-tree output (no indentation or
                            newlines). No effect on ndjson/csv/text.
     --extract <list>     Also emit deduped artifacts: paths, env, urls, emails,
-                           registry or all (comma-separated). Artifacts are
-                           collected from the extracted strings, sorted
+                           registry, tools or all (comma-separated). Artifacts
+                           are collected from the extracted strings, sorted
                            rarest-first and appended after the normal rows.
-                           Not supported with --format json-tree.
+                           `tools` reports memory-capture/analysis traces
+                           (DumpIt, WinPmem, FTK Imager, ...) plus default
+                           .raw/.mem image names. Not supported with
+                           --format json-tree.
     --report <summary>   Print a detailed stderr summary: string counts per
                            encoding, the scanned byte range, whether a limit
                            stopped the scan and the top artifacts (when

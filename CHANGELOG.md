@@ -66,16 +66,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and results are not going to the terminal. The new
   `extract_strings_from_file_streaming_range_with_encodings_progress` API
   reports consumed bytes per chunk.
-- `--extract <paths|env|urls|emails|registry|all>` appends deduped structured
-  artifacts (file paths, environment assignments, URLs, e-mails, registry keys)
-  after the normal rows for `text`, `json`, `ndjson` and `csv`. Each artifact
-  keeps its first offset, an occurrence count and optional `detail`
+- `--extract <paths|env|urls|emails|registry|tools|all>` appends deduped
+  structured artifacts (file paths, environment assignments, URLs, e-mails,
+  registry keys, memory-capture tool traces) after the normal rows for `text`,
+  `json`, `ndjson` and `csv`. Each artifact keeps its first offset, an
+  occurrence count and optional `detail`
   (`user=<name>;category=<...>` for paths, `name=...;sensitive=true` for
-  credential-like env names); the list is sorted rarest-first so unusual
-  evidence floats to the top. The new `bxmap::artifacts` module
-  (`ArtifactCollector`, `ArtifactKinds`, `Artifact`) exposes the same logic to
-  library users. `--format json-tree` rejects `--extract` because artifacts are
-  a flat record type.
+  credential-like env names, `evidence=...;category=...;trace=...` for tools);
+  the list is sorted rarest-first so unusual evidence floats to the top. The
+  new `bxmap::artifacts` module (`ArtifactCollector`, `ArtifactKinds`,
+  `Artifact`) exposes the same logic to library users. `--format json-tree`
+  rejects `--extract` because artifacts are a flat record type.
+- `--extract tools` names the capture/analysis tooling visible in the dump
+  (DumpIt, WinPmem, FTK Imager, Magnet RAM Capture, Belkasoft, LiME, AVML,
+  Volatility, Rekall, ProcDump) plus default image names such as
+  `DESKTOP-<host>-<date>-<time>.raw` or `physicalmemory.mem`. Matches are
+  case-insensitive, word-bounded and reported once per string; `trace=` records
+  every evidence kind seen for a tool (`path`, `command`, `prefetch`, `string`,
+  `filename`) so a DumpIt prefetch entry and its `.exe` path merge into one
+  artifact.
 - `--report summary` enriches the stderr summary with the string count per
   encoding, the scanned byte range (percentage of the requested window and of
   the file), whether `--max-strings` stopped the scan, and the top artifacts

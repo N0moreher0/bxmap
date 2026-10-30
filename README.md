@@ -279,10 +279,13 @@ The CLI adds:
 - `--encoding all|ascii|utf16|utf32` — utf-16/utf-32 cover both LE and BE in one pass.
 - `--map-va`, `--in-module`, `--rwx-only` for minidump-aware filtering.
 - `--magic-bytes` reports PE/ELF/ZIP-Office/PDF/PNG signatures.
-- `--extract <paths|env|urls|emails|registry|all>` appends deduped artifacts
-  (paths with `user=`/`category=` detail, environment assignments, URLs,
-  e-mails, registry keys) sorted rarest-first; works with `text`, `json`,
-  `ndjson` and `csv`.
+- `--extract <paths|env|urls|emails|registry|tools|all>` appends deduped
+  artifacts (paths with `user=`/`category=` detail, environment assignments,
+  URLs, e-mails, registry keys, capture-tool traces) sorted rarest-first; works
+  with `text`, `json`, `ndjson` and `csv`.
+- `--extract tools` names the capture/analysis tooling in the dump (DumpIt,
+  WinPmem, FTK Imager, Volatility, ...) and default `.raw`/`.mem` image names,
+  with `trace=path|command|prefetch|filename` evidence.
 - `--report summary` adds encoding counts, scanned-range coverage, limit status
   and top artifacts to the stderr summary.
 - IOC triage refangs `[.]`/`[at]`, validates public IPv4, drops private IP noise, uses entropy to reject base64 filler.

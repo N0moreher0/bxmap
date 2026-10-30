@@ -2,10 +2,12 @@
 //!
 //! The string extractor intentionally returns everything; this module turns
 //! that string sea into a small, deduped artifact list: file paths, environment
-//! assignments, URLs, e-mail addresses and registry keys. Each artifact keeps
-//! the first offset where it was seen plus an occurrence count, and the final
-//! list is sorted rarest-first so unusual evidence floats to the top.
+//! assignments, URLs, e-mail addresses, registry keys and memory-capture tool
+//! traces. Each artifact keeps the first offset where it was seen plus an
+//! occurrence count, and the final list is sorted rarest-first so unusual
+//! evidence floats to the top.
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -20,6 +22,8 @@ pub enum ArtifactKind {
     Url,
     Email,
     Registry,
+    /// Memory-capture / analysis tool traces (DumpIt, WinPmem, FTK, ...).
+    Tool,
 }
 
 impl ArtifactKind {
@@ -30,6 +34,7 @@ impl ArtifactKind {
             ArtifactKind::Url => "url",
             ArtifactKind::Email => "email",
             ArtifactKind::Registry => "registry",
+            ArtifactKind::Tool => "tool",
         }
     }
 
@@ -40,6 +45,7 @@ impl ArtifactKind {
             ArtifactKind::Url => 1 << 2,
             ArtifactKind::Email => 1 << 3,
             ArtifactKind::Registry => 1 << 4,
+            ArtifactKind::Tool => 1 << 5,
         }
     }
 }
@@ -58,7 +64,7 @@ impl std::ops::BitOr for ArtifactKinds {
 
 impl ArtifactKinds {
     pub const NONE: Self = Self(0);
-    pub const ALL: Self = Self(0b1_1111);
+    pub const ALL: Self = Self(0b11_1111);
 
     pub const fn paths() -> Self {
         Self(1 << 0)
@@ -78,6 +84,10 @@ impl ArtifactKinds {
 
     pub const fn registry() -> Self {
         Self(1 << 4)
+    }
+
+    pub const fn tools() -> Self {
+        Self(1 << 5)
     }
 
     pub fn insert(&mut self, kind: ArtifactKind) {
@@ -108,10 +118,11 @@ impl ArtifactKinds {
                 "url" | "urls" => kinds.insert(ArtifactKind::Url),
                 "email" | "emails" => kinds.insert(ArtifactKind::Email),
                 "registry" | "reg" => kinds.insert(ArtifactKind::Registry),
+                "tool" | "tools" => kinds.insert(ArtifactKind::Tool),
                 other => {
                     return Err(format!(
                         "invalid --extract value '{other}' (expected paths, env, urls, emails, \
-                         registry or all)"
+                         registry, tools or all)"
                     ))
                 }
             }
@@ -165,8 +176,18 @@ impl ArtifactCollector {
         if self.kinds.is_empty() || text.is_empty() {
             return;
         }
+        // Paths double as evidence for tool traces, so scan them once when
+        // either family is active.
+        let paths =
+            if self.kinds.contains(ArtifactKind::Path) || self.kinds.contains(ArtifactKind::Tool) {
+                extract_paths(text)
+            } else {
+                Vec::new()
+            };
         if self.kinds.contains(ArtifactKind::Path) {
-            for (start, path) in extract_paths(text) {
+            for (start, path) in &paths {
+                let path = *path;
+                let start = *start;
                 let windows = is_windows_path(path);
                 let key = if windows {
                     path.to_ascii_lowercase().replace('/', "\\")
@@ -233,6 +254,81 @@ impl ArtifactCollector {
                 );
             }
         }
+        if self.kinds.contains(ArtifactKind::Tool) {
+            self.observe_tools(text, offset, &paths);
+        }
+    }
+
+    /// Detect memory-capture / analysis tool traces. A single string can only
+    /// contribute one occurrence per tool, so `count` reflects how many strings
+    /// mention the tool instead of how often the name repeats inside one string.
+    fn observe_tools(&mut self, text: &str, offset: u64, paths: &[(usize, &str)]) {
+        let matcher = tool_matcher();
+        let mut seen = 0u32;
+        for matched in matcher.aho.find_iter(text) {
+            let signature_index = matcher.patterns[matched.pattern().as_usize()];
+            let bit = 1u32 << signature_index;
+            if seen & bit != 0 {
+                continue;
+            }
+            if !tool_boundary(text, matched.start(), matched.end()) {
+                continue;
+            }
+            seen |= bit;
+            let signature = &TOOL_SIGNATURES[signature_index];
+            // Prefer the full path that contains the hit: `C:\Program Files
+            // (x86)\DumpIt\DumpIt.exe` is better evidence than `DumpIt.exe`.
+            let containing = paths.iter().find_map(|(start, path)| {
+                let end = start + path.len();
+                if *start <= matched.start() && matched.end() <= end {
+                    Some(*path)
+                } else {
+                    None
+                }
+            });
+            let evidence = match containing {
+                Some(path) => path,
+                None => {
+                    let (begin, end) = token_bounds(text, matched.start(), matched.end());
+                    &text[begin..end]
+                }
+            };
+            let evidence_lower = evidence.to_ascii_lowercase();
+            let trace = if evidence_lower.contains(".pf") {
+                "prefetch"
+            } else if evidence_lower.contains(".exe") && !evidence_lower.contains(['\\', '/']) {
+                "command"
+            } else if evidence_lower.contains('\\') || evidence_lower.contains('/') {
+                "path"
+            } else {
+                "string"
+            };
+            let detail = format!(
+                "evidence={};category={};trace={trace}",
+                clip_evidence(evidence),
+                signature.category
+            );
+            self.record(
+                ArtifactKind::Tool,
+                signature.name,
+                signature.name.to_string(),
+                offset + matched.start() as u64,
+                Some(detail),
+            );
+        }
+        if let Some((start, name)) = default_dump_image(text) {
+            let detail = format!(
+                "evidence={};category=image;trace=filename",
+                clip_evidence(name)
+            );
+            self.record(
+                ArtifactKind::Tool,
+                "raw/mem image",
+                "raw/mem image".to_string(),
+                offset + start as u64,
+                Some(detail),
+            );
+        }
     }
 
     fn record(
@@ -245,8 +341,12 @@ impl ArtifactCollector {
     ) {
         if let Some(existing) = self.artifacts.get_mut(&(kind, key.clone())) {
             existing.count += 1;
-            if existing.detail.is_none() {
-                existing.detail = detail;
+            match (&mut existing.detail, detail) {
+                (Some(current), Some(incoming)) if kind == ArtifactKind::Tool => {
+                    *current = merge_tool_traces(current, &incoming);
+                }
+                (None, Some(incoming)) => existing.detail = Some(incoming),
+                _ => {}
             }
             return;
         }
@@ -295,6 +395,185 @@ fn registry_regex() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(
             r#"(?i)\b(?:HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|HKLM|HKCU|HKCR|HKU|HKCC)\\[^\s'"<>|]{2,1024}"#,
+        )
+        .unwrap()
+    })
+}
+
+/// One memory-capture / analysis tool we can name from its strings.
+struct ToolSignature {
+    /// Display name used as the artifact value.
+    name: &'static str,
+    /// `capture`, `analysis` or `image`.
+    category: &'static str,
+    /// Lowercase needles. Matched case-insensitively with word boundaries.
+    needles: &'static [&'static str],
+}
+
+const TOOL_SIGNATURES: &[ToolSignature] = &[
+    ToolSignature {
+        name: "DumpIt",
+        category: "capture",
+        needles: &["dumpit"],
+    },
+    ToolSignature {
+        name: "WinPmem",
+        category: "capture",
+        needles: &["winpmem", "pmem.sys"],
+    },
+    ToolSignature {
+        name: "FTK Imager",
+        category: "capture",
+        needles: &["ftkimager", "ftk imager"],
+    },
+    ToolSignature {
+        name: "Magnet RAM Capture",
+        category: "capture",
+        needles: &["magnetramcapture", "magnet ram capture"],
+    },
+    ToolSignature {
+        name: "Belkasoft RAM Capturer",
+        category: "capture",
+        needles: &["ramcapturer", "belkasoft"],
+    },
+    ToolSignature {
+        name: "LiME",
+        category: "capture",
+        needles: &["lime.ko", "insmod lime"],
+    },
+    ToolSignature {
+        name: "AVML",
+        category: "capture",
+        needles: &["avml"],
+    },
+    ToolSignature {
+        name: "Volatility",
+        category: "analysis",
+        needles: &["volatility", "vol.py"],
+    },
+    ToolSignature {
+        name: "Rekall",
+        category: "analysis",
+        needles: &["rekall"],
+    },
+    ToolSignature {
+        name: "ProcDump",
+        category: "capture",
+        needles: &["procdump"],
+    },
+];
+
+struct ToolMatcher {
+    aho: AhoCorasick,
+    /// Pattern id -> index into [`TOOL_SIGNATURES`].
+    patterns: Vec<usize>,
+}
+
+fn tool_matcher() -> &'static ToolMatcher {
+    static MATCHER: OnceLock<ToolMatcher> = OnceLock::new();
+    MATCHER.get_or_init(|| {
+        debug_assert!(TOOL_SIGNATURES.len() <= 32, "tool bitset fits in u32");
+        let mut patterns = Vec::new();
+        let mut needles = Vec::new();
+        for (index, signature) in TOOL_SIGNATURES.iter().enumerate() {
+            for needle in signature.needles {
+                patterns.push(index);
+                needles.push(*needle);
+            }
+        }
+        let aho = AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(needles)
+            .expect("tool needles are valid patterns");
+        ToolMatcher { aho, patterns }
+    })
+}
+
+/// True when the match is not glued to surrounding word characters, so
+/// `dumpit` matches `dumpit.exe` but not `mydumpit` or `dumpitx`.
+fn tool_boundary(text: &str, start: usize, end: usize) -> bool {
+    let word = |ch: char| ch.is_ascii_alphanumeric();
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    !before.is_some_and(word) && !after.is_some_and(word)
+}
+
+/// Expand a match to the surrounding token (path, filename, command word).
+fn token_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let separator = |ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\'' | '\0' | '<' | '>' | '|' | ',' | ';' | '(' | ')'
+            )
+    };
+    let mut begin = start;
+    for (index, ch) in text[..start].char_indices().rev() {
+        if separator(ch) {
+            break;
+        }
+        begin = index;
+    }
+    let mut finish = end;
+    for (offset, ch) in text[end..].char_indices() {
+        if separator(ch) {
+            break;
+        }
+        finish = end + offset + ch.len_utf8();
+    }
+    (begin, finish)
+}
+
+/// Merge the `trace=` field of two tool details so repeated sightings keep
+/// every evidence kind (`trace=path,prefetch`).
+fn merge_tool_traces(existing: &str, incoming: &str) -> String {
+    let mut traces: Vec<&str> = Vec::new();
+    for detail in [existing, incoming] {
+        for trace in detail
+            .split(';')
+            .filter_map(|part| part.strip_prefix("trace="))
+            .flat_map(|value| value.split(','))
+        {
+            if !trace.is_empty() && !traces.contains(&trace) {
+                traces.push(trace);
+            }
+        }
+    }
+    let mut parts: Vec<&str> = existing
+        .split(';')
+        .filter(|part| !part.starts_with("trace="))
+        .collect();
+    let merged = format!("trace={}", traces.join(","));
+    parts.push(&merged);
+    parts.join(";")
+}
+
+/// Keep artifact details one line and bounded.
+fn clip_evidence(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .take(160)
+        .collect();
+    if text.chars().count() > 160 {
+        out.push_str("...");
+    }
+    out.trim().to_string()
+}
+
+/// DumpIt's default `DESKTOP-<host>-<date>-<time>.raw` and common
+/// `memory.raw` / `physicalmemory.mem` style names.
+fn default_dump_image(text: &str) -> Option<(usize, &str)> {
+    let captures = dump_image_regex().captures(text)?;
+    let name = captures.name("name")?;
+    Some((name.start(), name.as_str()))
+}
+
+fn dump_image_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[\\/\s"'])(?P<name>(?:desktop-[a-z0-9]+-\d{8}-\d{6}|(?:memory|memdump|physicalmemory|ramdump|ram)[-_]?\d*)\.(?:raw|mem|dmp))"#,
         )
         .unwrap()
     })
@@ -705,11 +984,107 @@ mod tests {
     }
 
     #[test]
+    fn detects_capture_tool_paths() {
+        let artifacts = collect(
+            ArtifactKinds::tools(),
+            r"C:\Tools\DumpIt\DumpIt.exe and C:\Windows\System32\drivers\pmem.sys",
+        );
+        assert_eq!(artifacts.len(), 2, "{artifacts:?}");
+        let dumpit = artifacts.iter().find(|a| a.value == "DumpIt").unwrap();
+        let detail = dumpit.detail.as_deref().unwrap();
+        assert!(detail.contains("category=capture"), "{detail}");
+        assert!(detail.contains("trace=path"), "{detail}");
+        let winpmem = artifacts.iter().find(|a| a.value == "WinPmem").unwrap();
+        assert!(
+            winpmem.detail.as_deref().unwrap().contains("pmem.sys"),
+            "{winpmem:?}"
+        );
+    }
+
+    #[test]
+    fn detects_command_and_prefetch_traces() {
+        let artifacts = collect(
+            ArtifactKinds::tools(),
+            "winpmem_mini_x64_rc2.exe --output C:\\mem.raw  DUMPIT.EXE-1A2B3C4D.pf",
+        );
+        let winpmem = artifacts.iter().find(|a| a.value == "WinPmem").unwrap();
+        assert!(
+            winpmem.detail.as_deref().unwrap().contains("trace=command"),
+            "{winpmem:?}"
+        );
+        let dumpit = artifacts.iter().find(|a| a.value == "DumpIt").unwrap();
+        assert!(
+            dumpit.detail.as_deref().unwrap().contains("trace=prefetch"),
+            "{dumpit:?}"
+        );
+    }
+
+    #[test]
+    fn tool_evidence_keeps_the_full_path() {
+        let artifacts = collect(
+            ArtifactKinds::tools(),
+            r"C:\Program Files (x86)\DumpIt\DumpIt.exe",
+        );
+        assert_eq!(artifacts.len(), 1, "{artifacts:?}");
+        assert_eq!(
+            artifacts[0].detail.as_deref(),
+            Some(r"evidence=C:\Program Files (x86)\DumpIt\DumpIt.exe;category=capture;trace=path")
+        );
+    }
+
+    #[test]
+    fn merges_tool_traces_across_strings() {
+        let mut collector = ArtifactCollector::new(ArtifactKinds::tools(), 100);
+        collector.observe(r"C:\Tools\DumpIt\DumpIt.exe", 0);
+        collector.observe("DUMPIT.EXE-1A2B3C4D.pf", 100);
+        collector.observe("dumpit", 200);
+        let artifacts = collector.finish();
+        assert_eq!(artifacts.len(), 1, "{artifacts:?}");
+        assert_eq!(artifacts[0].count, 3);
+        assert_eq!(
+            artifacts[0].detail.as_deref(),
+            Some(
+                r"evidence=C:\Tools\DumpIt\DumpIt.exe;category=capture;trace=path,prefetch,string"
+            )
+        );
+    }
+
+    #[test]
+    fn detects_default_dump_image_names() {
+        let artifacts = collect(ArtifactKinds::tools(), "DESKTOP-7F3A2B-20240101-120000.raw");
+        let image = artifacts
+            .iter()
+            .find(|a| a.value == "raw/mem image")
+            .unwrap();
+        let detail = image.detail.as_deref().unwrap();
+        assert!(detail.contains("trace=filename"), "{detail}");
+        assert!(detail.contains("DESKTOP-7F3A2B"), "{detail}");
+
+        let generic = collect(ArtifactKinds::tools(), r"C:\dumps\physicalmemory.mem");
+        assert!(
+            generic.iter().any(|a| a.value == "raw/mem image"),
+            "{generic:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_tool_names_inside_larger_words() {
+        let artifacts = collect(
+            ArtifactKinds::tools(),
+            "mydumpitx notadumpitx superavmlx volatilityx",
+        );
+        assert!(artifacts.is_empty(), "{artifacts:?}");
+    }
+
+    #[test]
     fn parses_kind_lists() {
         let kinds = ArtifactKinds::from_list("paths, env").unwrap();
         assert!(kinds.contains(ArtifactKind::Path));
         assert!(kinds.contains(ArtifactKind::Env));
         assert!(!kinds.contains(ArtifactKind::Url));
+        assert!(ArtifactKinds::from_list("tools")
+            .unwrap()
+            .contains(ArtifactKind::Tool));
         assert_eq!(ArtifactKinds::from_list("all").unwrap(), ArtifactKinds::ALL);
         assert!(ArtifactKinds::from_list("bogus").is_err());
     }

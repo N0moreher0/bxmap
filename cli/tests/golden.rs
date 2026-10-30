@@ -1195,6 +1195,76 @@ fn golden_extract_json_emits_artifact_records() {
 }
 
 #[test]
+fn golden_extract_tools_reports_capture_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tools.bin");
+    let mut data = Vec::new();
+    data.extend_from_slice(b"C:\\Users\\eminem\\Downloads\\DumpIt.exe\0");
+    data.extend_from_slice(b"winpmem_mini_x64_rc2.exe --output C:\\dumps\\mem.raw\0");
+    data.extend_from_slice(b"DUMPIT.EXE-1A2B3C4D.pf\0");
+    data.extend_from_slice(b"DESKTOP-7F3A2B-20240101-120000.raw\0");
+    std::fs::write(&path, data).unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--extract",
+            "tools",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let artifact_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains("\tARTIFACT\t"))
+        .collect();
+    assert!(
+        artifact_lines
+            .iter()
+            .any(|line| line.contains("\ttool\tcount=2\tDumpIt\tevidence=")
+                && line.contains("category=capture")
+                && line.contains("trace=path,prefetch")),
+        "{stdout}"
+    );
+    assert!(
+        artifact_lines
+            .iter()
+            .any(|line| line.contains("\ttool\tcount=1\tWinPmem\tevidence=")
+                && line.contains("trace=command")),
+        "{stdout}"
+    );
+    assert!(
+        artifact_lines.iter().any(|line| line
+            .contains("\ttool\tcount=1\traw/mem image\tevidence=")
+            && line.contains("trace=filename")),
+        "{stdout}"
+    );
+    // The prefetch entry is merged into the DumpIt artifact, so `tools` alone
+    // never emits path/env/url/email/registry rows.
+    assert!(
+        !artifact_lines.iter().any(|line| {
+            line.contains("\tpath\t")
+                || line.contains("\tenv\t")
+                || line.contains("\turl\t")
+                || line.contains("\temail\t")
+                || line.contains("\tregistry\t")
+        }),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn golden_extract_ndjson_metadata_counts_artifacts() {
     let (_dir, path) = artifact_fixture();
 
