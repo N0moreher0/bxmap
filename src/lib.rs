@@ -1791,4 +1791,39 @@ mod tests {
             .iter()
             .any(|s| s.encoding == "utf16le" && s.text == "aaaaaaaa"));
     }
+
+    #[test]
+    fn chunk_boundary_ascii() {
+        let full = b"abcdef".to_vec();
+        let mut results = Vec::new();
+        {
+            let mut on_found = |s: ExtractedString| results.push(s);
+            let mut scanner = StringRunScanner::new(4, NoiseConfig::default(), &mut on_found, EncodingFilter::all());
+            scanner.feed(&full[0..6], 0, 5, 6, 0);
+            let mut block2 = vec![full[5]];
+            block2.extend_from_slice(&full[6..]);
+            scanner.feed(&block2, 0, block2.len(), block2.len(), 5);
+            scanner.flush_all();
+        }
+        assert!(results.iter().any(|s| s.encoding == "ascii" && s.text == "abcdef"));
+    }
+
+    #[test]
+    fn chunk_boundary_utf16be() {
+        let mut full = Vec::new();
+        for c in b"abcd" { full.extend_from_slice(&[0, *c]); }
+        let mut results = Vec::new();
+        {
+            let mut on_found = |s: ExtractedString| results.push(s);
+            let mut scanner = StringRunScanner::new(4, NoiseConfig::default(), &mut on_found, EncodingFilter::all());
+            scanner.feed(&full[0..6], 0, 5, 6, 0);
+            let mut block2 = vec![full[5]];
+            block2.extend_from_slice(&full[6..]);
+            scanner.feed(&block2, 0, block2.len(), block2.len(), 5);
+            scanner.flush_all();
+        }
+        assert!(results.iter().any(|s| s.encoding == "utf16be" && s.text == "abcd"));
+    }
+
+
 }
