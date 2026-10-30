@@ -1,7 +1,7 @@
 use bxmap::{
     extract_strings_from_file_parallel_with_encodings,
     extract_strings_from_file_streaming_range_with_encodings,
-    extract_strings_from_file_streaming_with_encodings,
+    extract_strings_from_file_streaming_range_with_encodings_progress,
     extract_strings_from_file_with_noise_config_and_encodings,
     scan_entropy_from_file_streaming_with_data, scan_yara_from_file_streaming, EncodingFilter,
     EntropyRegion, ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
@@ -10,7 +10,7 @@ use regex::Regex;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 static DUMP_MAP: OnceLock<bxmap::minidump::Minidump> = OnceLock::new();
 
@@ -107,6 +107,7 @@ struct Args {
     min_len: usize,
     max_str_len: usize,
     max_strings: usize,
+    progress: Option<bool>,
     format: Format,
     detect_format: DetectFormat,
     encoding: Encoding,
@@ -170,6 +171,9 @@ OPTIONS:
                            streaming scanner.
     --end <OFFSET>       Only emit strings that start before this byte offset
                            (decimal or 0x hex).
+    --progress           Show a progress line on stderr (auto when stderr is a
+                           terminal and results are not going to the terminal).
+    --no-progress        Disable the progress line.
     --format <text|json|json-tree>
                            Output format (default text). json-tree emits
                            grouped classification tree.
@@ -232,6 +236,7 @@ fn parse_args() -> Result<Args, String> {
         min_len: MIN_STRING_LEN,
         max_str_len: 0,
         max_strings: MAX_STRINGS,
+        progress: None,
         format: Format::Text,
         detect_format: DetectFormat::Flat,
         encoding: Encoding::All,
@@ -272,6 +277,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--start" => args.start = Some(parse_offset(&next(&mut i)?, "--start")?),
             "--end" => args.end = Some(parse_offset(&next(&mut i)?, "--end")?),
+            "--progress" => args.progress = Some(true),
+            "--no-progress" => args.progress = Some(false),
             "--max-str-len" => {
                 args.max_str_len = next(&mut i)?
                     .parse()
@@ -1875,6 +1882,9 @@ fn main() -> Result<(), String> {
     }
     let range_end = range_end.min(file_size);
     let scan_span = range_end.saturating_sub(range_start);
+    let show_progress = args.progress.unwrap_or_else(|| {
+        io::stderr().is_terminal() && (args.output.is_some() || !io::stdout().is_terminal())
+    });
     // Ask the scanner for one extra result so we can tell "hit the cap" from
     // "finished the file at exactly the cap".
     let internal_limit = args.max_strings.saturating_add(1);
@@ -1967,11 +1977,13 @@ fn main() -> Result<(), String> {
         let mut last_offset = 0u64;
         let mut raw_count = 0usize;
         let mut truncated = false;
+        let progress_results = std::cell::Cell::new(0usize);
         let mut handle = |result: ExtractedString| {
             if write_error.is_some() {
                 return;
             }
             raw_count += 1;
+            progress_results.set(raw_count);
             if raw_count > args.max_strings {
                 truncated = true;
                 return;
@@ -2020,28 +2032,46 @@ fn main() -> Result<(), String> {
                 }
             }
         };
-        let scan_result = if range_active {
-            extract_strings_from_file_streaming_range_with_encodings(
-                &args.path,
-                range_start,
-                range_end,
-                args.min_len,
-                internal_limit,
-                noise,
-                enc_filter,
-                &mut handle,
-            )
-        } else {
-            extract_strings_from_file_streaming_with_encodings(
-                &args.path,
-                args.min_len,
-                internal_limit,
-                noise,
-                enc_filter,
-                &mut handle,
-            )
+        let mut last_progress = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let mut progress = |scanned: u64| {
+            if !show_progress {
+                return;
+            }
+            let now = Instant::now();
+            if now.duration_since(last_progress) < Duration::from_millis(200) {
+                return;
+            }
+            last_progress = now;
+            let relative = scanned.saturating_sub(range_start);
+            let pct = if scan_span == 0 {
+                100.0
+            } else {
+                relative as f64 * 100.0 / scan_span as f64
+            };
+            let secs = now.duration_since(start).as_secs_f64().max(1e-9);
+            let mib_s = relative as f64 / secs / (1024.0 * 1024.0);
+            eprint!(
+                "\r  [..] {pct:>6.1}%  {mib_s:>7.1} MiB/s  scanned {scanned:#x}  results {}          ",
+                progress_results.get()
+            );
         };
+        let scan_result = extract_strings_from_file_streaming_range_with_encodings_progress(
+            &args.path,
+            range_start,
+            range_end,
+            args.min_len,
+            internal_limit,
+            noise,
+            enc_filter,
+            &mut handle,
+            &mut progress,
+        );
         scan_result.map_err(|e| format!("scan failed: {e}"))?;
+        if show_progress {
+            eprintln!();
+        }
         if let Some(error) = write_error {
             return Err(format!("write failed: {error}"));
         }

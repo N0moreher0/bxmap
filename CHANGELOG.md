@@ -29,6 +29,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   boundary stay intact, and only emits strings that start inside the range.
 - Truncation detection now asks the scanner for one extra result, so a scan that
   ends exactly at `--max-strings` is no longer reported as truncated.
+- `--progress` / `--no-progress` print a live status line on stderr (percent,
+  MiB/s, scanned offset). Progress is on by default when stderr is a terminal
+  and results are not going to the terminal. The new
+  `extract_strings_from_file_streaming_range_with_encodings_progress` API
+  reports consumed bytes per chunk.
 
 ### Changed
 - `apply_detectors` allocates output capacity up front and clones lazily.

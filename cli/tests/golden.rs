@@ -351,3 +351,54 @@ fn golden_start_greater_than_end_is_rejected() {
     assert!(stderr.contains("--start"), "{stderr}");
     assert!(stderr.contains("--end"), "{stderr}");
 }
+
+#[test]
+fn golden_progress_flag_writes_status_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00cccc\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[..]"), "{stderr}");
+    assert!(stderr.contains("MiB/s"), "{stderr}");
+}
+
+#[test]
+fn golden_no_progress_suppresses_status_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("[..]"), "{stderr}");
+}

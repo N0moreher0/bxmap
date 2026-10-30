@@ -81,7 +81,7 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 - [ ] `--auto-tune` mở rộng sang các stage khác (XOR, detector), không chỉ worker trích chuỗi.
 - [ ] **Không "đứng" khi `--max-strings` lớn** (user báo cáo): stream kết quả ra output ngay cả ở chế độ song song thay vì gom hết vào RAM rồi sắp xếp (kiểm chứng bằng đo RAM đỉnh).
 - [~] `--max-strings 0` = không giới hạn (đi kèm stream), và `--max-memory` để đặt trần RAM. (`--max-strings 0` đã xong; `--max-memory` chưa.)
-- [ ] **Thanh tiến độ trên stderr:** offset hiện tại, % dump, tốc độ MB/s, số kết quả — để người dùng biết tool đang chạy hay treo (in terminal có ảnh nền/nhiều dòng rất chậm, dễ nhầm là treo).
+- [x] **Thanh tiến độ trên stderr:** offset hiện tại, % dump, tốc độ MB/s, số kết quả — để người dùng biết tool đang chạy hay treo (in terminal có ảnh nền/nhiều dòng rất chậm, dễ nhầm là treo). Đã có `--progress` / `--no-progress`; tự bật khi stderr là terminal và kết quả không in ra terminal. Cập nhật tối đa 5 lần/giây qua API `extract_strings_from_file_streaming_range_with_encodings_progress`.
 - [x] `--start <offset>` / `--end <offset>` để quét một khoảng và chia việc cho nhiều tiến trình; tài liệu hóa cách chia khối có gối nhau (overlap) để không cắt đôi chuỗi. Đã có API `extract_strings_from_file_streaming_range_with_encodings` (đọc thêm `MAX_RUN_CHARS` mỗi phía, chỉ phát chuỗi bắt đầu trong `[start, end)`) và cờ CLI nhận số thập phân hoặc `0x` hex.
 - [ ] Cảnh báo/gợi ý khi stdout là terminal với lượng kết quả rất lớn ("hãy dùng `-o file`").
 

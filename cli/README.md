@@ -32,6 +32,9 @@ bxmap --help
   (the scanner overlaps by `MAX_RUN_CHARS` on each side), but only strings
   whose start offset falls inside the range are emitted. A range forces the
   sequential streaming scanner even with `--threads`.
+- `--progress` / `--no-progress` — show or hide a live status line on stderr
+  (percent, MiB/s, scanned offset). Auto-enabled when stderr is a terminal and
+  results are not going to the terminal.
 - `--format <text|json|json-tree>` — output format.
 - `--detect <list>` — IOC / credential triage.
 - `--detect-format <flat|rich>` — `rich` keeps the original text and adds
