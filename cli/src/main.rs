@@ -94,6 +94,7 @@ enum Format {
 struct Args {
     path: String,
     min_len: usize,
+    max_str_len: usize,
     max_strings: usize,
     format: Format,
     encoding: Encoding,
@@ -149,6 +150,7 @@ USAGE:
 
 OPTIONS:
     --min-len <N>        Minimum string length (default 4)
+    --max-str-len <N>    Truncate very long strings to N chars in output (default unlimited)
     --max-strings <N>    Maximum results (default 200000)
     --format <text|json|json-tree>
                            Output format (default text). json-tree emits
@@ -192,6 +194,7 @@ fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         path,
         min_len: MIN_STRING_LEN,
+        max_str_len: 0,
         max_strings: MAX_STRINGS,
         format: Format::Text,
         encoding: Encoding::All,
@@ -229,6 +232,11 @@ fn parse_args() -> Result<Args, String> {
                 args.min_len = next(&mut i)?
                     .parse()
                     .map_err(|_| "invalid --min-len".to_string())?
+            }
+            "--max-str-len" => {
+                args.max_str_len = next(&mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --max-str-len".to_string())?
             }
             "--max-strings" => {
                 args.max_strings = next(&mut i)?
@@ -1306,80 +1314,6 @@ fn print_banner(path: &str, size: u64, format: Format) {
     eprintln!("  \x1b[1;34m[..] scanning\x1b[0m");
 }
 
-fn print_selected_options(args: &Args, threads: usize) {
-    let format = match args.format {
-        Format::Text => "text",
-        Format::Json => "json",
-        Format::JsonTree => "json-tree",
-    };
-    let encoding = match args.encoding {
-        Encoding::All => "all",
-        Encoding::Ascii => "ascii",
-        Encoding::Utf16 => "utf16 (LE+BE)",
-        Encoding::Utf32 => "utf32 (LE+BE)",
-    };
-    let noise = args
-        .noise_threshold
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "default".to_string());
-    let yara = args.yar.as_deref().unwrap_or("off");
-    let brute_xor = args
-        .brute_xor
-        .as_ref()
-        .map(|sizes| {
-            sizes
-                .iter()
-                .map(|size| format!("{size}b"))
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_else(|| "off".to_string());
-    let output = args.output.as_deref().unwrap_or("stdout");
-    let auto_tune = if args.auto_tune { "on" } else { "off" };
-    let parse_pid = if args.parse_pid { "on" } else { "off" };
-    let entropy = if args.entropy { "on" } else { "off" };
-    let detector = if args.detectors.is_empty() {
-        "off".to_string()
-    } else {
-        args.detectors
-            .iter()
-            .map(|d| match d {
-                Detector::Ip => "ip",
-                Detector::Url => "url",
-                Detector::Domain => "domain",
-                Detector::Base64 => "b64",
-                Detector::Secret => "secret",
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-
-    if io::stderr().is_terminal() {
-        eprintln!("\x1b[1;36m  selected options\x1b[0m");
-    } else {
-        eprintln!("  selected options");
-    }
-    eprintln!(
-        "    format={format} encoding={encoding} min-len={} max-strings={}",
-        args.min_len, args.max_strings
-    );
-    eprintln!("    threads={threads} auto-tune={auto_tune} noise-threshold={noise}");
-    eprintln!(
-        "    entropy={entropy} yara={} brute-xor={} parse-pid={parse_pid} detector={detector} magic-bytes={}",
-        yara,
-        brute_xor,
-        if args.magic_bytes { "on" } else { "off" }
-    );
-    eprintln!(
-        "    filter-regex={}",
-        args.filter_regex.as_deref().unwrap_or("off")
-    );
-    eprintln!("    output={output}");
-}
-
-/// Warns when the scan hit `--max-strings` and therefore did not cover the whole file.
-/// `last_offset` is the offset of the last emitted result, which is a lower bound
-/// on how far the scan got; without this notice the summary looks like a full scan.
 fn print_truncation_notice(result_count: usize, max_strings: usize, last_offset: u64, size: u64) {
     if max_strings == 0 || result_count < max_strings {
         return;
@@ -1446,6 +1380,30 @@ fn print_report(
     }
 }
 
+fn display_text(text: &str, max_str_len: usize) -> String {
+    let mut s = text.to_string();
+    if max_str_len > 0 {
+        let count = s.chars().count();
+        if count > max_str_len {
+            s = s.chars().take(max_str_len).collect::<String>();
+            s.push_str("...");
+        }
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn record_result(
     result: ExtractedString,
     writer: &mut dyn Write,
@@ -1456,13 +1414,15 @@ fn record_result(
     long: &mut usize,
     important: &mut Vec<ExtractedString>,
     parse_pid: bool,
+    max_str_len: usize,
 ) -> io::Result<()> {
     match format {
         Format::Text => {
             write!(
                 writer,
                 "{:#010x}\t{}\t{}",
-                result.offset, result.encoding, result.text
+                result.offset, result.encoding,
+                display_text(&result.text, max_str_len)
             )?;
             if parse_pid {
                 match parse_pid_marker(&result.text) {
@@ -1496,6 +1456,7 @@ fn write_results(
     format: Format,
     writer: &mut dyn Write,
     parse_pid: bool,
+    max_str_len: usize,
 ) -> io::Result<()> {
     match format {
         Format::Text => {
@@ -1503,7 +1464,8 @@ fn write_results(
                 write!(
                     writer,
                     "{:#010x}\t{}\t{}",
-                    result.offset, result.encoding, result.text
+                    result.offset, result.encoding,
+                    display_text(&result.text, max_str_len)
                 )?;
                 if parse_pid {
                     match parse_pid_marker(&result.text) {
@@ -1716,6 +1678,7 @@ fn main() -> Result<(), String> {
                                 &mut long,
                                 &mut important,
                                 args.parse_pid,
+                                args.max_str_len,
                             ) {
                                 write_error = Some(error);
                             }
@@ -2000,7 +1963,7 @@ fn main() -> Result<(), String> {
         }
         writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
     } else {
-        write_results(&results, args.format, &mut writer, args.parse_pid)
+        write_results(&results, args.format, &mut writer, args.parse_pid, args.max_str_len)
             .map_err(|e| format!("write failed: {e}"))?;
         for matched in &yara_matches {
             write_yara_text(matched, &mut writer).map_err(|e| format!("write failed: {e}"))?;
