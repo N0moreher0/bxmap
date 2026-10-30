@@ -109,6 +109,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is active, and NDJSON `total_records` now counts auxiliary records (YARA,
   XOR, magic, entropy, artifacts) instead of only strings.
 
+### Added
+- `--report user|all` prints a consolidated per-user file list (one line per user)
+  when `--extract paths` is active. Shows file count, AppData count, and AppData
+  percentage. Filter with `--min-files-in-user <N>`.
+- `--filter-appdata` adjusts the AppData percentage denominator to visible files
+  (total minus AppData) for `--report user|all`. Does not remove AppData paths
+  from collection.
+- New `bxmap::chunk` module with `for_each_chunk` and `Chunk` for overlap-aware
+  window iteration (used by `--carve` and magic-byte scanning).
+- New `bxmap::magic` module with `SIGNATURES`, `MagicMatch`, `Signature`, and
+  Aho-Corasick `scan_file`; single source of truth for header signatures.
+
 ## [1.0.14] - 2026-10-30 (`bxmap-cli`)
 
 ### Changed

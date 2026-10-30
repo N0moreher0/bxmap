@@ -13,6 +13,121 @@ use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+// --- user report types ---
+/// One user and how many files belong to it.
+#[derive(Clone, Debug)]
+struct UserStat {
+    name: String,
+    file_count: usize,         // all path artifacts, including AppData
+    appdata_file_count: usize, // paths where category=appdata
+    pct_appdata: f64,          // percentage of files that are AppData
+}
+
+/// Mode for the optional stderr report.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReportMode {
+    None,
+    Summary,
+    User,
+    All,
+}
+
+/// Parse artifact detail string like "user=alice;category=desktop".
+fn parse_path_detail(detail: &str) -> Option<(String, String)> {
+    let mut user = None;
+    let mut category = None;
+    for pair in detail.split(';') {
+        if let Some((key, value)) = pair.split_once('=') {
+            match key.trim().to_lowercase().as_str() {
+                "user" => user = Some(value.to_string()),
+                "category" => category = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+    match (user, category) {
+        (Some(u), Some(c)) => Some((u, c)),
+        _ => None,
+    }
+}
+
+/// Build per-user file statistics from collected artifacts.
+/// Only considers artifacts of kind `Path`. Category-only paths (no user) are skipped.
+fn build_user_stats(artifacts: &[Artifact], filter_appdata: bool) -> Vec<UserStat> {
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Accumulator {
+        total: usize,
+        appdata: usize,
+    }
+
+    let mut map: HashMap<String, Accumulator> = HashMap::new();
+
+    for artifact in artifacts.iter() {
+        if artifact.kind != bxmap::artifacts::ArtifactKind::Path {
+            continue;
+        }
+        let detail = artifact.detail.as_deref();
+        if let Some((user, category)) = detail.and_then(parse_path_detail) {
+            let entry = map.entry(user).or_default();
+            entry.total += 1;
+            if category == "appdata" {
+                entry.appdata += 1;
+            }
+        }
+    }
+
+    let mut stats: Vec<UserStat> = map
+        .into_iter()
+        .map(|(name, acc)| {
+            let visible_total = if filter_appdata {
+                acc.total.saturating_sub(acc.appdata)
+            } else {
+                acc.total
+            };
+            let pct_appdata = if visible_total > 0 {
+                acc.appdata as f64 * 100.0 / visible_total as f64
+            } else {
+                0.0
+            };
+            UserStat {
+                name,
+                file_count: acc.total,
+                appdata_file_count: acc.appdata,
+                pct_appdata,
+            }
+        })
+        .collect();
+
+    stats.sort_by_key(|a| std::cmp::Reverse(a.file_count));
+    stats
+}
+
+/// Print consolidated per-user file list (one line per user).
+fn print_user_report(stats: &[UserStat], min_files: usize, filter_appdata: bool) {
+    if stats.is_empty() {
+        eprintln!("[user-report] no user-profile paths found");
+        return;
+    }
+
+    let label = if filter_appdata {
+        "files (excl. AppData)"
+    } else {
+        "files (incl. AppData)"
+    };
+    eprintln!("[user-report] per-user {label} (min={min_files}):");
+    for stat in stats {
+        if stat.file_count < min_files {
+            continue;
+        }
+        eprintln!(
+            "  {:<20}  {:>6} files  AppData: {:>4} ({:>5.1}%)",
+            stat.name, stat.file_count, stat.appdata_file_count, stat.pct_appdata
+        );
+    }
+}
+
 static DUMP_MAP: OnceLock<bxmap::minidump::Minidump> = OnceLock::new();
 
 /// Virtual address and a short module/region label for a file offset,
@@ -228,7 +343,7 @@ struct Args {
     dedupe: bool,
     compact: bool,
     extract: ArtifactKinds,
-    report_summary: bool,
+    report_mode: ReportMode,
     format: Format,
     detect_format: DetectFormat,
     encoding: Encoding,
@@ -247,6 +362,8 @@ struct Args {
     parse_pid: bool,
     stats: bool,
     filter_regex: Option<String>,
+    min_files_in_user: usize,
+    filter_appdata: bool,
     detectors: Vec<Detector>,
     magic_bytes: bool,
     tree: bool,
@@ -312,10 +429,19 @@ OPTIONS:
                            (DumpIt, WinPmem, FTK Imager, ...) plus default
                            .raw/.mem image names. Not supported with
                            --format json-tree.
-    --report <summary>   Print a detailed stderr summary: string counts per
-                           encoding, the scanned byte range, whether a limit
-                           stopped the scan and the top artifacts (when
-                           --extract is active). `none` disables it (default).
+    --report <mode>      Report mode: none, summary, user, or all (default none).
+                           summary: string counts per encoding, scanned range, limit
+                           status, top artifacts (requires --extract).
+                           user: consolidated per-user file list (one line per user),
+                           requires --extract paths. Shows file count, AppData count,
+                           and AppData percentage. Filter with --min-files-in-user.
+                           all: both summary and user reports.
+    --min-files-in-user <N>
+                           Minimum file count for a user to appear in --report user/all
+                           (default 0).
+    --filter-appdata     In --report user/all, compute AppData percentage using
+                           visible files (total minus AppData) as denominator.
+                           Does not remove AppData paths from collection.
     --format <text|json|json-tree|ndjson|csv>
                            Output format (default text). json-tree emits
                            grouped classification tree. ndjson emits one JSON
@@ -392,7 +518,9 @@ fn parse_args() -> Result<Args, String> {
         dedupe: false,
         compact: false,
         extract: ArtifactKinds::NONE,
-        report_summary: false,
+        report_mode: ReportMode::None,
+        min_files_in_user: 0,
+        filter_appdata: false,
         format: Format::Text,
         detect_format: DetectFormat::Flat,
         encoding: Encoding::All,
@@ -445,16 +573,24 @@ fn parse_args() -> Result<Args, String> {
             "--extract" => args.extract = ArtifactKinds::from_list(&next(&mut i)?)?,
             "--report" => {
                 let value = next(&mut i)?;
-                args.report_summary = match value.as_str() {
-                    "summary" => true,
-                    "none" => false,
+                args.report_mode = match value.as_str() {
+                    "none" => ReportMode::None,
+                    "summary" => ReportMode::Summary,
+                    "user" => ReportMode::User,
+                    "all" => ReportMode::All,
                     other => {
                         return Err(format!(
-                            "invalid --report mode '{other}' (expected summary or none)"
+                            "invalid --report mode '{other}' (expected none, summary, user or all)"
                         ))
                     }
                 };
             }
+            "--min-files-in-user" => {
+                args.min_files_in_user = next(&mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --min-files-in-user".to_string())?
+            }
+            "--filter-appdata" => args.filter_appdata = true,
             "--max-str-len" => {
                 args.max_str_len = next(&mut i)?
                     .parse()
@@ -2618,7 +2754,7 @@ fn run() -> Result<(), String> {
     // "finished the file at exactly the cap".
     let internal_limit = args.max_strings.saturating_add(1);
     print_banner(&args.path, file_size, args.format);
-    if args.report_summary {
+    if args.report_mode == ReportMode::Summary || args.report_mode == ReportMode::All {
         print_summary_header(
             range_start,
             range_end,
@@ -2998,8 +3134,13 @@ fn run() -> Result<(), String> {
             truncated,
             max_strings: args.max_strings,
             scanned_until: last_offset,
-            detailed: args.report_summary,
+            detailed: args.report_mode == ReportMode::Summary
+                || args.report_mode == ReportMode::All,
         });
+        if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
+            let stats = build_user_stats(&artifacts, args.filter_appdata);
+            print_user_report(&stats, args.min_files_in_user, args.filter_appdata);
+        }
         if truncated {
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
@@ -3155,8 +3296,13 @@ fn run() -> Result<(), String> {
             truncated,
             max_strings: args.max_strings,
             scanned_until: raw_results.iter().map(|r| r.offset).max().unwrap_or(0),
-            detailed: args.report_summary,
+            detailed: args.report_mode == ReportMode::Summary
+                || args.report_mode == ReportMode::All,
         });
+        if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
+            let stats = build_user_stats(&artifacts, args.filter_appdata);
+            print_user_report(&stats, args.min_files_in_user, args.filter_appdata);
+        }
         if truncated {
             let last_offset = raw_results.iter().map(|r| r.offset).max().unwrap_or(0);
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
@@ -3284,8 +3430,13 @@ fn run() -> Result<(), String> {
             truncated,
             max_strings: args.max_strings,
             scanned_until: last_offset,
-            detailed: args.report_summary,
+            detailed: args.report_mode == ReportMode::Summary
+                || args.report_mode == ReportMode::All,
         });
+        if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
+            let stats = build_user_stats(&artifacts, args.filter_appdata);
+            print_user_report(&stats, args.min_files_in_user, args.filter_appdata);
+        }
         if truncated {
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
@@ -3479,8 +3630,12 @@ fn run() -> Result<(), String> {
         truncated,
         max_strings: args.max_strings,
         scanned_until: results.iter().map(|r| r.offset).max().unwrap_or(0),
-        detailed: args.report_summary,
+        detailed: args.report_mode == ReportMode::Summary || args.report_mode == ReportMode::All,
     });
+    if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
+        let stats = build_user_stats(&artifacts, args.filter_appdata);
+        print_user_report(&stats, args.min_files_in_user, args.filter_appdata);
+    }
     if truncated {
         let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
         print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);

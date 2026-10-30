@@ -75,11 +75,17 @@ bxmap --help
   `ramdump.mem`). Matching is case-insensitive with word boundaries, each
   string counts once per tool, and `trace=` lists every evidence kind seen
   (`path`, `command`, `prefetch`, `filename`, `string`).
-- `--report summary` — print a detailed summary on stderr: string counts per
-  encoding, the scanned byte range (percentage of the requested window and of
-  the file), whether `--max-strings` stopped the scan early, and the top
-  artifacts when `--extract` is active. `--report none` (default) keeps the
-  compact summary.
+- `--report <mode>` — report mode: `none` (default), `summary`, `user`, `all`.
+  `summary`: string counts per encoding, scanned byte range, limit status, top
+  artifacts (requires `--extract`). `user`: consolidated per-user file list (one
+  line per user) when `--extract paths` is active; shows file count, AppData
+  count, and AppData percentage. Filter with `--min-files-in-user <N>`.
+  `all`: both summary and user reports.
+- `--min-files-in-user <N>` — minimum file count for a user to appear in
+  `--report user|all` (default 0).
+- `--filter-appdata` — in `--report user|all`, compute AppData percentage using
+  visible files (total minus AppData) as denominator. Does not remove AppData
+  paths from collection.
 - `--entropy` — report high-entropy regions.
 - `--entropy-window <BYTES>` — bytes per entropy window (default 65536).
 - `--entropy-threshold <BITS>` — minimum Shannon entropy per window, 0–8

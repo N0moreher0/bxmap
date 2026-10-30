@@ -120,7 +120,7 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì bắt analyst tự lọc (case Lab 4).
 - [x] `--extract paths`: gom đường dẫn file/thư mục (Windows và Unix, cả dạng 8.3 `GALF~1.JPE`, `\\Device\\HarddiskVolume2\\...`), chuẩn hóa chữ hoa/thường, dedupe, đếm tần suất, sắp theo độ hiếm. (Module `bxmap::artifacts`, cờ CLI `--extract paths`.)
 - [x] Gom theo **hồ sơ người dùng** (`C:\Users\<name>\...`): mỗi path có `detail` dạng `user=<name>;category=<desktop|documents|downloads|appdata|temp|other>` để lọc nhanh file người dùng. Lab 4: user `eminem`, `secrets.txt`, `galf.jpeg`, `FLAG NOT HERE.BMP`, `Screenshot1.png`, `DumpIt.zip`.
-- [ ] Danh sách user tổng hợp (một dòng/user kèm số file) và lọc hẳn nhiễu thư mục hệ thống/`AppData` khỏi kết quả — hiện mới gắn nhãn `category=appdata`.
+- [x] Danh sách user tổng hợp (một dòng/user kèm số file) và lọc hẳn nhiễu thư mục hệ thống/`AppData` khỏi kết quả — hiện mới gắn nhãn `category=appdata`. Cờ mới: `--report user|all`, `--min-files-in-user <N>`, `--filter-appdata`. `build_user_stats` / `print_user_report` in `cli/src/main.rs`.
 - [x] Nhận diện **công cụ tạo dump** (DumpIt, WinPmem, FTK Imager, `.raw`/`.mem` tên mặc định) và dấu vết khởi chạy. (Cờ `--extract tools`; artifact `tool` với `detail=evidence=...;category=capture|analysis|image;trace=path|command|prefetch|filename|string`, gộp mọi trace của cùng một tool.)
 - [x] `--extract env`: tách khối biến môi trường `NAME=value\0` (case Lab 6: `RAR password=...`); tên nhạy cảm (`password`, `token`, `secret`, ...) được đánh dấu `sensitive=true`.
 - [x] `--extract urls|emails|registry` với dedupe và đếm.
