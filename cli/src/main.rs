@@ -1533,6 +1533,34 @@ fn write_results(
     Ok(())
 }
 
+#[cfg(test)]
+mod extra_detector_tests {
+    use super::*;
+
+    #[test]
+    fn detector_helpers_do_not_panic_on_random_input() {
+        let mut state = 0xdeadbeefu64;
+        for _ in 0..2000 {
+            state = state.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            let mut s = String::new();
+            for _ in 0..(state % 96) {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let c = (state & 0x7f) as u8;
+                let c = if c < 0x20 { (c + 0x20) as char } else { c as char };
+                s.push(c);
+            }
+            let _ = important_reason(&s);
+            let _ = detected_ip_value(&s);
+            let _ = detected_url_value(&s);
+            let _ = detected_domain_value(&s);
+            let _ = detect_and_decode_base64(&s);
+            let _ = bxmap::classifier::detect_secrets(&s);
+        }
+    }
+}
+
 fn main() -> Result<(), String> {
     let args = parse_args()?;
     if args.vmware_info {
