@@ -1,3 +1,4 @@
 ﻿/target
 /fuzz/target
 sample_demo.dmp
+demo/dumps/*.dmp

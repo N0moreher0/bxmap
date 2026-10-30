@@ -162,14 +162,14 @@ Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì b
 
 Mục tiêu: có vài case thật cho thấy bxmap tìm ra thứ có ý nghĩa nhanh hơn `strings | grep`.
 
-- [ ] Bộ demo MemLabs (Lab 1, 2, 6): mỗi lab một mục "đáp án nói cần tìm X → `strings` ra N dòng → bxmap ra X trong M dòng", kèm thời gian và RAM.
-- [ ] Case Lab 6: bxmap `--extract env` bắt `RAR password=...` trong env block (UTF-16) → dẫn tới file RAR; ghi rõ bước còn lại (carve RAR, mở bằng mật khẩu).
-- [ ] Trình bày trung thực: so sánh công bằng với `strings -el | grep`, nêu rõ điểm thắng là một lần quét đủ encoding + phân loại + tốc độ, không phải "chỉ bxmap tìm được".
-- [ ] Một bài viết ngắn kể case + GIF/asciinema ở đầu README; đăng r/computerforensics, r/netsec, Show HN, This Week in Rust.
-- [ ] Case Lab 4: quét 1 GiB, lọc ra user `eminem`, công cụ DumpIt và các file đáng ngờ trên Desktop bằng một lệnh; ghi rõ giới hạn (chỉ tên file/metadata, chưa lấy nội dung — cần `--carve`).
-- [ ] Ghi lại thời gian, RAM đỉnh và kích thước output cho cả Lab 4 (1 GiB) và Lab 6 (1,6 GB) làm số liệu benchmark thật.
-- [ ] Thêm một dump `.DMP` tự tạo trong VM để demo `--map-va`, `--rwx-only`, `--heap-only` (MemLabs là `.raw`, không dùng được các cờ này).
-- [ ] Redact mọi credential thật trước khi đăng ảnh/bài.
+- [x] Bộ demo MemLabs (Lab 1, 2, 6): mỗi lab một mục "đáp án nói cần tìm X → `strings` ra N dòng → bxmap ra X trong M dòng", kèm thời gian và RAM.
+- [x] Case Lab 6: bxmap `--extract env` bắt `RAR password=...` trong env block (UTF-16) → dẫn tới file RAR; ghi rõ bước còn lại (carve RAR, mở bằng mật khẩu).
+- [x] Trình bày trung thực: so sánh công bằng với `strings -el | grep`, nêu rõ điểm thắng là một lần quét đủ encoding + phân loại + tốc độ, không phải "chỉ bxmap tìm được".
+- [x] Một bài viết ngắn kể case + GIF/asciinema ở đầu README; đăng r/computerforensics, r/netsec, Show HN, This Week in Rust.
+- [x] Case Lab 4: quét 1 GiB, lọc ra user `eminem`, công cụ DumpIt và các file đáng ngờ trên Desktop bằng một lệnh; ghi rõ giới hạn (chỉ tên file/metadata, chưa lấy nội dung — cần `--carve`).
+- [x] Ghi lại thời gian, RAM đỉnh và kích thước output cho cả Lab 4 (1 GiB) và Lab 6 (1,6 GB) làm số liệu benchmark thật.
+- [x] Thêm một dump `.DMP` tự tạo trong VM để demo `--map-va`, `--rwx-only`, `--heap-only` (MemLabs là `.raw`, không dùng được các cờ này).
+- [x] Redact mọi credential thật trước khi đăng ảnh/bài.
 
 ---
 
