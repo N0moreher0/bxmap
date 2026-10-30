@@ -28,7 +28,7 @@ Chi phí thấp, hiệu quả cao nhất. Làm trước khi thêm tính năng.
 ### 1.3 Release và chuỗi cung ứng
 - [x] Chuyển từ "mỗi push `main` ra release" sang **release theo tag semver**; push `main` chỉ build artifact CI (nightly).
 - [x] Sinh `SHA256SUMS` cho mọi binary; ký bằng cosign/minisign còn làm thêm.
-- [ ] Xuất SBOM (`cargo-cyclonedx`) kèm release.
+- [x] Xuất SBOM (`cargo-cyclonedx`) kèm release (workflow `release.yml`).
 - [ ] Chuyển `sample_demo.dmp` ra khỏi git history sang release asset hoặc Git LFS.
 - [x] Job CI kiểm tra **MSRV** cho bản `lite` (1.70); bản `full` dùng stable.
 

@@ -94,6 +94,15 @@ jobs:
           )
           sha256sum dist/* > dist/SHA256SUMS
 
+      - name: Generate SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx -p bxmap --output-format json --output-file dist/sbom-bxmap.json
+          cargo cyclonedx -p bxmap-cli --output-format json --output-file dist/sbom-bxmap-cli.json
+          sha256sum dist/sbom-*.json >> dist/SHA256SUMS
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
