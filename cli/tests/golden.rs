@@ -1074,3 +1074,233 @@ fn golden_entropy_max_data_zero_omits_payload() {
     assert!(!stdout.contains("data_hex"), "{stdout}");
     assert!(!stdout.contains("data_truncated"), "{stdout}");
 }
+
+/// Fixture with one duplicated user path plus one artifact of every other kind.
+const ARTIFACT_FIXTURE: &[u8] = b"C:\\Users\\eminem\\Desktop\\a.txt\x00\
+C:\\Users\\eminem\\Desktop\\a.txt\x00\
+RAR password=hunter2\x00\
+https://example.com/x\x00\
+admin@example.org\x00\
+HKLM\\SOFTWARE\\Foo\x00";
+
+fn artifact_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("artifacts.bin");
+    std::fs::write(&path, ARTIFACT_FIXTURE).unwrap();
+    (dir, path)
+}
+
+#[test]
+fn golden_extract_text_appends_deduped_artifacts() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--extract",
+            "all",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let artifact_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains("\tARTIFACT\t"))
+        .collect();
+    assert_eq!(artifact_lines.len(), 5, "{stdout}");
+    assert!(
+        artifact_lines.iter().any(|line| line.contains(
+            "\tpath\tcount=2\tC:\\Users\\eminem\\Desktop\\a.txt\tuser=eminem;category=desktop"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        artifact_lines.iter().any(|line| line
+            .contains("\tenv\tcount=1\tRAR password=hunter2\tname=RAR password;sensitive=true")),
+        "{stdout}"
+    );
+    assert!(
+        artifact_lines
+            .iter()
+            .any(|line| line.contains("\turl\tcount=1\thttps://example.com/x")),
+        "{stdout}"
+    );
+    assert!(
+        artifact_lines
+            .iter()
+            .any(|line| line.contains("\temail\tcount=1\tadmin@example.org")),
+        "{stdout}"
+    );
+    assert!(
+        artifact_lines
+            .iter()
+            .any(|line| line.contains("\tregistry\tcount=1\tHKLM\\SOFTWARE\\Foo")),
+        "{stdout}"
+    );
+    // Rarest-first ordering puts the twice-seen path last.
+    assert!(
+        stdout.trim_end().ends_with("user=eminem;category=desktop"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn golden_extract_json_emits_artifact_records() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--extract",
+            "paths,env",
+            "--format",
+            "json",
+            "--compact",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            r#""group":"ARTIFACT","kind":"path","value":"C:\\Users\\eminem\\Desktop\\a.txt","offset":0,"count":2,"detail":"user=eminem;category=desktop""#
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#""kind":"env","value":"RAR password=hunter2""#),
+        "{stdout}"
+    );
+    // Only the requested families are collected.
+    assert!(!stdout.contains(r#""kind":"url""#), "{stdout}");
+    assert!(!stdout.contains(r#""kind":"email""#), "{stdout}");
+    assert!(!stdout.contains(r#""kind":"registry""#), "{stdout}");
+}
+
+#[test]
+fn golden_extract_ndjson_metadata_counts_artifacts() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--extract",
+            "all",
+            "--format",
+            "ndjson",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let metadata = lines.last().copied().unwrap();
+    // 6 strings (the path is duplicated) + 5 artifacts.
+    assert!(
+        metadata.contains(r#""type":"metadata","total_records":11"#),
+        "{stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with(r#"{"type":"artifact","group":"ARTIFACT""#)),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn golden_extract_csv_emits_artifact_rows() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--extract",
+            "all",
+            "--format",
+            "csv",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "artifact,0x00000000,,C:\\Users\\eminem\\Desktop\\a.txt,path,,,,user=eminem;category=desktop,2,"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(",HKLM\\SOFTWARE\\Foo,registry,,,,,1,"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn golden_extract_rejects_json_tree() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--extract",
+            "all",
+            "--format",
+            "json-tree",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--extract does not support --format json-tree"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn golden_extract_rejects_unknown_kind() {
+    let (_dir, path) = artifact_fixture();
+
+    let output = Command::new(bin_path())
+        .args([path.to_str().unwrap(), "--extract", "bogus"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid --extract value 'bogus'"),
+        "{stderr}"
+    );
+}

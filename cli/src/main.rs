@@ -1,4 +1,5 @@
 use bxmap::{
+    artifacts::{Artifact, ArtifactCollector, ArtifactKinds},
     extract_strings_from_file_parallel_with_encodings,
     extract_strings_from_file_streaming_range_with_encodings,
     extract_strings_from_file_streaming_range_with_encodings_progress,
@@ -87,6 +88,9 @@ const MAX_XOR_CANDIDATE_LEN: usize = 100;
 const MIN_XOR_CANDIDATE_LEN: usize = 10;
 const MAX_XOR_RESULTS_PER_CANDIDATE: usize = 5;
 const MIN_XOR_ALNUM_CHARS: usize = 3;
+/// Cap on unique artifacts kept in memory. Memory dumps can contain millions of
+/// distinct paths; the cap keeps `--extract` bounded on huge inputs.
+const MAX_ARTIFACTS: usize = 20_000;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -193,6 +197,7 @@ struct Args {
     progress: Option<bool>,
     dedupe: bool,
     compact: bool,
+    extract: ArtifactKinds,
     format: Format,
     detect_format: DetectFormat,
     encoding: Encoding,
@@ -268,11 +273,16 @@ OPTIONS:
                            first offset. Buffers results in memory.
     --compact            Minify json/json-tree output (no indentation or
                            newlines). No effect on ndjson/csv/text.
+    --extract <list>     Also emit deduped artifacts: paths, env, urls, emails,
+                           registry or all (comma-separated). Artifacts are
+                           collected from the extracted strings, sorted
+                           rarest-first and appended after the normal rows.
+                           Not supported with --format json-tree.
     --format <text|json|json-tree|ndjson|csv>
                            Output format (default text). json-tree emits
                            grouped classification tree. ndjson emits one JSON
                            object per line with a `type` field. csv emits
-                           string/finding rows with a header.
+                           string/finding/artifact rows with a header.
     --encoding <all|ascii|utf16|utf32>
                           Restrict output by encoding (default all). utf-16 includes both LE & BE; utf-32 includes both LE & BE
     -o, --output <PATH>  Write results to a file
@@ -343,6 +353,7 @@ fn parse_args() -> Result<Args, String> {
         progress: None,
         dedupe: false,
         compact: false,
+        extract: ArtifactKinds::NONE,
         format: Format::Text,
         detect_format: DetectFormat::Flat,
         encoding: Encoding::All,
@@ -392,6 +403,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-progress" => args.progress = Some(false),
             "--dedupe" => args.dedupe = true,
             "--compact" => args.compact = true,
+            "--extract" => args.extract = ArtifactKinds::from_list(&next(&mut i)?)?,
             "--max-str-len" => {
                 args.max_str_len = next(&mut i)?
                     .parse()
@@ -1002,6 +1014,112 @@ fn write_magic_json(
         json_escape(magic.kind)
     )?;
     *result_count += 1;
+    Ok(())
+}
+
+/// Collect artifacts from an already-materialised result list.
+fn collect_artifacts<'a, I>(kinds: ArtifactKinds, results: I) -> Vec<Artifact>
+where
+    I: IntoIterator<Item = &'a ExtractedString>,
+{
+    if kinds.is_empty() {
+        return Vec::new();
+    }
+    let mut collector = ArtifactCollector::new(kinds, MAX_ARTIFACTS);
+    for result in results {
+        collector.observe(&result.text, result.offset);
+    }
+    collector.finish()
+}
+
+fn write_artifact_text(artifact: &Artifact, writer: &mut dyn Write) -> io::Result<()> {
+    write!(
+        writer,
+        "{:#010x}\tARTIFACT\t{}\tcount={}\t{}",
+        artifact.offset,
+        artifact.kind.as_str(),
+        artifact.count,
+        artifact.value
+    )?;
+    if let Some(detail) = &artifact.detail {
+        write!(writer, "\t{detail}")?;
+    }
+    writeln!(writer)
+}
+
+fn write_artifact_json(
+    artifact: &Artifact,
+    writer: &mut dyn Write,
+    result_count: &mut usize,
+    layout: JsonLayout,
+) -> io::Result<()> {
+    json_record_open(writer, result_count, layout, Some("artifact"))?;
+    write!(
+        writer,
+        "\"group\":\"ARTIFACT\",\"kind\":{},\"value\":{},\"offset\":{},\"count\":{}",
+        json_escape(artifact.kind.as_str()),
+        json_escape(&artifact.value),
+        artifact.offset,
+        artifact.count
+    )?;
+    if let Some(detail) = &artifact.detail {
+        write!(writer, ",\"detail\":{}", json_escape(detail))?;
+    }
+    write!(writer, "}}")?;
+    *result_count += 1;
+    Ok(())
+}
+
+/// Artifact rows reuse the fixed CSV header: `text` holds the artifact value,
+/// `rule` the artifact kind and `context` the optional detail string.
+fn write_artifact_csv_row(artifact: &Artifact, writer: &mut dyn Write) -> io::Result<()> {
+    let offset = format!("{:#010x}", artifact.offset);
+    let count = artifact.count.to_string();
+    let detail = artifact.detail.as_deref().unwrap_or("");
+    write_csv_row(
+        writer,
+        &[
+            "artifact",
+            &offset,
+            "",
+            &artifact.value,
+            artifact.kind.as_str(),
+            "",
+            "",
+            "",
+            detail,
+            &count,
+            "",
+        ],
+    )
+}
+
+/// Append artifacts in the format-specific shape. JSON needs the shared record
+/// counter so `total_records` in the trailing metadata stays accurate.
+fn write_artifacts(
+    artifacts: &[Artifact],
+    writer: &mut dyn Write,
+    format: Format,
+    layout: JsonLayout,
+    result_count: &mut usize,
+) -> io::Result<()> {
+    match format {
+        Format::Json | Format::Ndjson => {
+            for artifact in artifacts {
+                write_artifact_json(artifact, writer, result_count, layout)?;
+            }
+        }
+        Format::Csv => {
+            for artifact in artifacts {
+                write_artifact_csv_row(artifact, writer)?;
+            }
+        }
+        Format::Text | Format::JsonTree => {
+            for artifact in artifacts {
+                write_artifact_text(artifact, writer)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1943,6 +2061,7 @@ fn print_report(
     size: u64,
     elapsed: f64,
     threads: usize,
+    artifacts: usize,
 ) {
     let color = io::stderr().is_terminal();
     if color {
@@ -1953,6 +2072,9 @@ fn print_report(
         eprintln!("+-------------------- summary -----------------------------+");
     }
     eprintln!("  results    : {result_count}");
+    if artifacts > 0 {
+        eprintln!("  artifacts  : {artifacts} unique");
+    }
     eprintln!("  length     : {short} short | {medium} medium | {long} long");
     eprintln!("  threads    : {threads}");
     eprintln!("  file size  : {size} bytes");
@@ -2323,6 +2445,12 @@ fn run() -> Result<(), String> {
             }
         }
     }
+    if !args.extract.is_empty() && args.format == Format::JsonTree {
+        return Err(
+            "--extract does not support --format json-tree; use text, json, ndjson or csv"
+                .to_string(),
+        );
+    }
     if args.entropy_window == Some(0) {
         return Err("--entropy-window must be greater than 0".to_string());
     }
@@ -2335,8 +2463,8 @@ fn run() -> Result<(), String> {
         && (args.magic_bytes || args.yar.is_some() || args.brute_xor.is_some() || args.entropy)
     {
         return Err(
-            "--format csv supports strings and findings only; use --format json or ndjson for \
-             --magic-bytes/--yar/--brute-xor/--entropy"
+            "--format csv supports strings, findings and artifacts only; use --format json or \
+             ndjson for --magic-bytes/--yar/--brute-xor/--entropy"
                 .to_string(),
         );
     }
@@ -2481,6 +2609,7 @@ fn run() -> Result<(), String> {
         let mut last_offset = 0u64;
         let mut raw_count = 0usize;
         let mut truncated = false;
+        let mut artifacts = ArtifactCollector::new(args.extract, MAX_ARTIFACTS);
         let progress_results = std::cell::Cell::new(0usize);
         let mut handle = |result: ExtractedString| {
             if write_error.is_some() {
@@ -2493,6 +2622,18 @@ fn run() -> Result<(), String> {
                 return;
             }
             last_offset = last_offset.max(result.offset);
+            // Region filters (minidump only) apply to the streaming path too;
+            // previously they were silently ignored unless the buffered path
+            // ran, so `--in-module`/`--rwx-only`/`--heap-only` emitted
+            // everything with the default single-thread scanner.
+            if !passes_region_filter(
+                result.offset,
+                &args.in_module,
+                args.rwx_only,
+                args.heap_only,
+            ) {
+                return;
+            }
             if matches!(args.encoding, Encoding::All)
                 || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
                 || (args.encoding == Encoding::Utf16
@@ -2500,6 +2641,7 @@ fn run() -> Result<(), String> {
                 || (args.encoding == Encoding::Utf32
                     && (result.encoding == "utf32le" || result.encoding == "utf32be"))
             {
+                artifacts.observe(&result.text, result.offset);
                 if args.detect_format == DetectFormat::Rich {
                     let findings = detect_findings(&result, &args.detectors);
                     for finding in &findings {
@@ -2580,6 +2722,7 @@ fn run() -> Result<(), String> {
         if show_progress {
             eprintln!();
         }
+        let artifacts = artifacts.finish();
         if let Some(error) = write_error {
             return Err(format!("write failed: {error}"));
         }
@@ -2626,6 +2769,14 @@ fn run() -> Result<(), String> {
             if let Some(error) = write_error {
                 return Err(format!("write failed: {error}"));
             }
+            write_artifacts(
+                &artifacts,
+                &mut writer,
+                args.format,
+                json_layout,
+                &mut json_count,
+            )
+            .map_err(|e| format!("write failed: {e}"))?;
             match json_layout {
                 JsonLayout::Lines => {
                     write_ndjson_metadata(&mut writer, json_count, truncated, last_offset)
@@ -2676,6 +2827,14 @@ fn run() -> Result<(), String> {
                     return Err(format!("write failed: {error}"));
                 }
             }
+            write_artifacts(
+                &artifacts,
+                &mut writer,
+                args.format,
+                json_layout,
+                &mut result_count,
+            )
+            .map_err(|e| format!("write failed: {e}"))?;
         }
         writer.finish().map_err(|e| format!("write failed: {e}"))?;
         if let Some(path) = args.output {
@@ -2691,6 +2850,7 @@ fn run() -> Result<(), String> {
             file_size,
             start.elapsed().as_secs_f64(),
             threads,
+            artifacts.len(),
         );
         if truncated {
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
@@ -2762,6 +2922,7 @@ fn run() -> Result<(), String> {
         .collect();
 
     if args.detect_format == DetectFormat::Rich {
+        let artifacts = collect_artifacts(args.extract, raw_results.iter());
         let findings: Vec<bxmap::classifier::DetectedFinding> = raw_results
             .iter()
             .flat_map(|result| detect_findings(result, &args.detectors))
@@ -2772,13 +2933,14 @@ fn run() -> Result<(), String> {
             findings.into_iter().map(|finding| (finding, 1)).collect()
         };
         let mut writer = Sink::open(args.output.as_deref())?;
-        let json_layout = if args.format == Format::Ndjson {
-            JsonLayout::Lines
-        } else {
-            JsonLayout::Array
-        };
+        let json_layout = json_layout_for(args.format, args.compact);
         if args.format == Format::Json {
-            writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
+            match json_layout {
+                JsonLayout::Array => {
+                    writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?
+                }
+                _ => write!(writer, "[").map_err(|e| format!("write failed: {e}"))?,
+            }
         }
         if args.format == Format::Csv {
             write_csv_header(&mut writer).map_err(|e| format!("write failed: {e}"))?;
@@ -2796,6 +2958,14 @@ fn run() -> Result<(), String> {
             )
             .map_err(|e| format!("write failed: {e}"))?;
         }
+        write_artifacts(
+            &artifacts,
+            &mut writer,
+            args.format,
+            json_layout,
+            &mut result_count,
+        )
+        .map_err(|e| format!("write failed: {e}"))?;
         match json_layout {
             JsonLayout::Lines => {
                 let last_offset = raw_results.iter().map(|r| r.offset).max().unwrap_or(0);
@@ -2830,6 +3000,7 @@ fn run() -> Result<(), String> {
             file_size,
             start.elapsed().as_secs_f64(),
             threads,
+            artifacts.len(),
         );
         if truncated {
             let last_offset = raw_results.iter().map(|r| r.offset).max().unwrap_or(0);
@@ -2839,6 +3010,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    let artifacts = collect_artifacts(args.extract, raw_results.iter());
     let mut results: Vec<ExtractedString> = raw_results
         .into_iter()
         .flat_map(|result| apply_detectors(result, &args.detectors))
@@ -2950,6 +3122,7 @@ fn run() -> Result<(), String> {
             file_size,
             start.elapsed().as_secs_f64(),
             threads,
+            artifacts.len(),
         );
         if truncated {
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
@@ -3026,10 +3199,18 @@ fn run() -> Result<(), String> {
                 return Err(format!("write failed: {error}"));
             }
         }
+        write_artifacts(
+            &artifacts,
+            &mut writer,
+            args.format,
+            json_layout,
+            &mut json_count,
+        )
+        .map_err(|e| format!("write failed: {e}"))?;
         match json_layout {
             JsonLayout::Lines => {
                 let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);
-                write_ndjson_metadata(&mut writer, results.len(), truncated, last_offset)
+                write_ndjson_metadata(&mut writer, json_count, truncated, last_offset)
                     .map_err(|e| format!("write failed: {e}"))?;
             }
             JsonLayout::Array => {
@@ -3090,6 +3271,15 @@ fn run() -> Result<(), String> {
                 return Err(format!("write failed: {error}"));
             }
         }
+        let mut written = 0usize;
+        write_artifacts(
+            &artifacts,
+            &mut writer,
+            args.format,
+            json_layout_for(args.format, args.compact),
+            &mut written,
+        )
+        .map_err(|e| format!("write failed: {e}"))?;
     }
     writer.finish().map_err(|e| format!("write failed: {e}"))?;
     if let Some(path) = output_path {
@@ -3120,6 +3310,7 @@ fn run() -> Result<(), String> {
         file_size,
         start.elapsed().as_secs_f64(),
         threads,
+        artifacts.len(),
     );
     if truncated {
         let last_offset = results.iter().map(|r| r.offset).max().unwrap_or(0);

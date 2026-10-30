@@ -43,12 +43,12 @@ bxmap --help
   results are not going to the terminal.
 - `--format <text|json|json-tree|ndjson|csv>` — output format. `ndjson` emits one
   JSON object per line with a `type` field (`string`, `finding`, `magic`,
-  `yara`, `xor`, `entropy`) and a final `{"type":"metadata",...}` line carrying
-  `total_records`, `truncated` and `scanned_until`. Prefer it for very large
-  dumps: it streams and avoids the array wrapper of `json`. `csv` emits a fixed
-  header plus `string`/`finding` rows (RFC 4180 quoting) for spreadsheets and
-  pandas; it cannot be combined with `--magic-bytes`, `--yar`, `--brute-xor` or
-  `--entropy`.
+  `yara`, `xor`, `entropy`, `artifact`) and a final `{"type":"metadata",...}`
+  line carrying `total_records`, `truncated` and `scanned_until`. Prefer it for
+  very large dumps: it streams and avoids the array wrapper of `json`. `csv`
+  emits a fixed header plus `string`/`finding`/`artifact` rows (RFC 4180
+  quoting) for spreadsheets and pandas; it cannot be combined with
+  `--magic-bytes`, `--yar`, `--brute-xor` or `--entropy`.
 - `-o, --output <PATH>` — write results to a file. A path ending in `.gz` is
   gzip-compressed on the fly, which keeps multi-hundred-MB JSON outputs small
   and the gzip stream stays valid even when the scan exits early.
@@ -58,6 +58,15 @@ bxmap --help
 - `--auto-tune` — choose a worker count for this machine.
 - `--compact` — minify `json`/`json-tree` output: one line, no indentation.
   Handy for large exports and for piping into other tools.
+- `--extract <list>` — also emit deduped artifacts collected from the
+  extracted strings: `paths`, `env`, `urls`, `emails`, `registry` or `all`
+  (comma-separated). Each artifact carries the first offset, an occurrence
+  count and an optional `detail` string (`user=<name>;category=<...>` for
+  paths, `name=...;sensitive=true` for credentials). Artifacts are sorted
+  rarest-first and appended after the normal rows. Supported with `text`,
+  `json`, `ndjson` and `csv`; `json-tree` is rejected because artifacts are a
+  flat record type. The library equivalent is
+  `bxmap::artifacts::ArtifactCollector`.
 - `--entropy` — report high-entropy regions.
 - `--entropy-window <BYTES>` — bytes per entropy window (default 65536).
 - `--entropy-threshold <BITS>` — minimum Shannon entropy per window, 0–8

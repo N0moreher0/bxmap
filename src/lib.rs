@@ -50,6 +50,7 @@
 //! filter more broadly (no entropy/complex statistics) to avoid false
 //! negatives (missing real strings), staying true to the "only filter
 //! what's certainly noise" spirit.
+pub mod artifacts;
 pub mod classifier;
 pub mod minidump;
 pub mod vmware;

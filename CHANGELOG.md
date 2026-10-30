@@ -42,8 +42,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from the whole file.
 - `--format csv` writes RFC 4180 CSV with a fixed header
   (`type,offset,encoding,text,rule,value,severity,confidence,context,count,pid`).
-  Strings and rich findings are supported; combining it with `--magic-bytes`,
-  `--yar`, `--brute-xor` or `--entropy` is rejected, use json/ndjson for those.
+  Strings, rich findings and `--extract` artifacts are supported; combining it
+  with `--magic-bytes`, `--yar`, `--brute-xor` or `--entropy` is rejected, use
+  json/ndjson for those.
 - `--compact` minifies `--format json` / `json-tree` output (no indentation or
   newlines), which keeps large exports smaller and easier to pipe.
 - `--entropy-no-data` omits the `data_hex` payload from `--entropy` records, so
@@ -65,12 +66,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and results are not going to the terminal. The new
   `extract_strings_from_file_streaming_range_with_encodings_progress` API
   reports consumed bytes per chunk.
+- `--extract <paths|env|urls|emails|registry|all>` appends deduped structured
+  artifacts (file paths, environment assignments, URLs, e-mails, registry keys)
+  after the normal rows for `text`, `json`, `ndjson` and `csv`. Each artifact
+  keeps its first offset, an occurrence count and optional `detail`
+  (`user=<name>;category=<...>` for paths, `name=...;sensitive=true` for
+  credential-like env names); the list is sorted rarest-first so unusual
+  evidence floats to the top. The new `bxmap::artifacts` module
+  (`ArtifactCollector`, `ArtifactKinds`, `Artifact`) exposes the same logic to
+  library users. `--format json-tree` rejects `--extract` because artifacts are
+  a flat record type.
 
 ### Changed
 - `apply_detectors` allocates output capacity up front and clones lazily.
 - Flat detector output (`--detect-format flat`, default) is unchanged.
 - `--start`/`--end` force the sequential streaming scanner even when
   `--threads` is greater than 1.
+- The stderr summary reports the number of unique artifacts when `--extract`
+  is active, and NDJSON `total_records` now counts auxiliary records (YARA,
+  XOR, magic, entropy, artifacts) instead of only strings.
 
 ## [1.0.14] - 2026-10-30 (`bxmap-cli`)
 

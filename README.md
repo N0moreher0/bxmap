@@ -279,6 +279,10 @@ The CLI adds:
 - `--encoding all|ascii|utf16|utf32` — utf-16/utf-32 cover both LE and BE in one pass.
 - `--map-va`, `--in-module`, `--rwx-only` for minidump-aware filtering.
 - `--magic-bytes` reports PE/ELF/ZIP-Office/PDF/PNG signatures.
+- `--extract <paths|env|urls|emails|registry|all>` appends deduped artifacts
+  (paths with `user=`/`category=` detail, environment assignments, URLs,
+  e-mails, registry keys) sorted rarest-first; works with `text`, `json`,
+  `ndjson` and `csv`.
 - IOC triage refangs `[.]`/`[at]`, validates public IPv4, drops private IP noise, uses entropy to reject base64 filler.
   only the selected IOC type; Base64 mode decodes printable UTF-8 payloads
 - `--magic-bytes` to report bounded executable/document signatures such as PE
