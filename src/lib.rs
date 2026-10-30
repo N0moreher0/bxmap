@@ -1846,4 +1846,30 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn utf16_ascii_le_does_not_emit_duplicate_be() {
+        // "hello" stored as UTF-16LE must not also be reported as UTF-16BE
+        // starting one byte later.
+        let mut data = Vec::new();
+        for c in b"hello" {
+            data.push(*c);
+            data.push(0);
+        }
+        let out = extract_strings(&data, 4, 1000);
+        assert!(out.iter().any(|s| s.encoding == "utf16le" && s.text == "hello"));
+        assert!(!out.iter().any(|s| s.encoding == "utf16be" && s.text == "hello"));
+    }
+
+    #[test]
+    fn utf32_ascii_le_does_not_emit_duplicate_be() {
+        let mut data = Vec::new();
+        for c in b"hello" {
+            data.push(*c);
+            data.extend_from_slice(&[0, 0, 0]);
+        }
+        let out = extract_strings(&data, 4, 1000);
+        assert!(out.iter().any(|s| s.encoding == "utf32le" && s.text == "hello"));
+        assert!(!out.iter().any(|s| s.encoding == "utf32be" && s.text == "hello"));
+    }
 }
