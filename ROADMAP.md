@@ -134,7 +134,7 @@ Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì b
 - [ ] Ổn định API trước `1.0`: tài liệu hóa quy ước semver, đánh dấu phần chưa ổn định bằng feature flag.
 
 ### 5.2 CLI
-- [~] Output `ndjson` và `csv`. (`ndjson` đã xong, kèm `type` và dòng `metadata`; `csv` chưa.)
+- [x] Output `ndjson` và `csv` (ndjson kèm `type` + dòng `metadata`; csv có header cố định, hỗ trợ string/finding, không đi cùng stage phụ).
 - [ ] Thanh tiến độ trên stderr (tắt được khi pipe).
 - [ ] Shell completions (bash/zsh/fish/pwsh), man page, `--version` chi tiết (commit, feature build: full/lite).
 - [ ] Exit code rõ ràng (0 sạch, 1 lỗi, 2 có phát hiện nghiêm trọng nếu bật cờ).

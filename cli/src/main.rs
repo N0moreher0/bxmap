@@ -92,6 +92,8 @@ enum Format {
     /// Newline-delimited JSON: one self-contained record per line, with a
     /// `"type"` discriminator so mixed record kinds stay parseable.
     Ndjson,
+    /// RFC 4180 CSV with a fixed header; strings and findings only.
+    Csv,
 }
 
 /// How a JSON record is framed when written one at a time.
@@ -243,10 +245,11 @@ OPTIONS:
     --no-progress        Disable the progress line.
     --dedupe             Emit each unique string once with `count=` and the
                            first offset. Buffers results in memory.
-    --format <text|json|json-tree|ndjson>
+    --format <text|json|json-tree|ndjson|csv>
                            Output format (default text). json-tree emits
                            grouped classification tree. ndjson emits one JSON
-                           object per line with a `type` field.
+                           object per line with a `type` field. csv emits
+                           string/finding rows with a header.
     --encoding <all|ascii|utf16|utf32>
                           Restrict output by encoding (default all). utf-16 includes both LE & BE; utf-32 includes both LE & BE
     -o, --output <PATH>  Write results to a file
@@ -367,6 +370,7 @@ fn parse_args() -> Result<Args, String> {
                     "json" => Format::Json,
                     "json-tree" => Format::JsonTree,
                     "ndjson" => Format::Ndjson,
+                    "csv" => Format::Csv,
                     other => return Err(format!("invalid format '{other}'")),
                 };
             }
@@ -1215,6 +1219,103 @@ fn write_ndjson_metadata(
     )
 }
 
+/// Fixed CSV header. Rows always emit all columns so spreadsheet/pandas
+/// imports stay rectangular; columns that do not apply to a row stay empty.
+const CSV_HEADER: &str =
+    "type,offset,encoding,text,rule,value,severity,confidence,context,count,pid";
+
+fn write_csv_header(writer: &mut dyn Write) -> io::Result<()> {
+    writeln!(writer, "{CSV_HEADER}")
+}
+
+/// Write one RFC 4180 field, quoting when it contains a separator or quote.
+/// Control characters are already escaped by `display_text`, so a record never
+/// spans multiple lines.
+fn write_csv_field(writer: &mut dyn Write, field: &str) -> io::Result<()> {
+    if field
+        .chars()
+        .any(|c| c == ',' || c == '"' || c == '\n' || c == '\r')
+    {
+        write!(writer, "\"{}\"", field.replace('"', "\"\""))
+    } else {
+        write!(writer, "{field}")
+    }
+}
+
+fn write_csv_row(writer: &mut dyn Write, fields: &[&str]) -> io::Result<()> {
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            write!(writer, ",")?;
+        }
+        write_csv_field(writer, field)?;
+    }
+    writeln!(writer)
+}
+
+fn write_csv_string_row(
+    result: &ExtractedString,
+    writer: &mut dyn Write,
+    parse_pid: bool,
+    max_str_len: usize,
+    count: Option<usize>,
+) -> io::Result<()> {
+    let offset = format!("{:#010x}", result.offset);
+    let text = display_text(&result.text, max_str_len);
+    let count_text = count.map(|value| value.to_string()).unwrap_or_default();
+    let pid_text = if parse_pid {
+        parse_pid_marker(&result.text)
+            .map(|pid| pid.to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    write_csv_row(
+        writer,
+        &[
+            "string",
+            &offset,
+            result.encoding,
+            &text,
+            "",
+            "",
+            "",
+            "",
+            "",
+            &count_text,
+            &pid_text,
+        ],
+    )
+}
+
+fn write_csv_finding_row(
+    finding: &bxmap::classifier::DetectedFinding,
+    writer: &mut dyn Write,
+    max_str_len: usize,
+    count: Option<usize>,
+) -> io::Result<()> {
+    let offset = format!("{:#010x}", finding.offset);
+    let confidence = format!("{:.4}", finding.confidence);
+    let text = display_text(&finding.text, max_str_len);
+    let context = display_text(&finding.context, max_str_len);
+    let count_text = count.map(|value| value.to_string()).unwrap_or_default();
+    write_csv_row(
+        writer,
+        &[
+            "finding",
+            &offset,
+            finding.encoding,
+            &text,
+            finding.rule,
+            &finding.value,
+            finding.severity,
+            &confidence,
+            &context,
+            &count_text,
+            "",
+        ],
+    )
+}
+
 fn write_string_json(
     result: &ExtractedString,
     writer: &mut dyn Write,
@@ -1674,6 +1775,7 @@ fn print_banner(path: &str, size: u64, format: Format) {
         Format::Json => "json",
         Format::JsonTree => "json-tree",
         Format::Ndjson => "ndjson",
+        Format::Csv => "csv",
     };
     eprintln!("\x1b[1;36m+------------------------------------------------------------+\x1b[0m");
     eprintln!(
@@ -1892,6 +1994,9 @@ fn record_result(
         Format::JsonTree => {
             // handled separately in main(); no-op here
         }
+        Format::Csv => {
+            write_csv_string_row(&result, writer, parse_pid, max_str_len, count)?;
+        }
     }
     // `write_string_json` already bumps the counter for JSON/NDJSON records;
     // counting again here would skew record totals and separators.
@@ -1956,6 +2061,9 @@ fn record_finding(
         Format::JsonTree => {
             // rejected during argument validation
         }
+        Format::Csv => {
+            write_csv_finding_row(finding, writer, max_str_len, count)?;
+        }
     }
     *result_count += 1;
     Ok(())
@@ -2016,6 +2124,13 @@ fn write_results(
             }
         }
         Format::JsonTree => {}
+        Format::Csv => {
+            write_csv_header(writer)?;
+            for result in results {
+                let count = counts.and_then(|map| map.get(&result.text).copied());
+                write_csv_string_row(result, writer, parse_pid, max_str_len, count)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2070,7 +2185,14 @@ mod extra_detector_tests {
     }
 }
 
-fn main() -> Result<(), String> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
     let args = parse_args()?;
     if args.vmware_info {
         let state = bxmap::vmware::VmwareState::open(&args.path)
@@ -2112,6 +2234,15 @@ fn main() -> Result<(), String> {
         if args.format == Format::JsonTree {
             return Err("--detect-format rich supports --format text or json".to_string());
         }
+    }
+    if args.format == Format::Csv
+        && (args.magic_bytes || args.yar.is_some() || args.brute_xor.is_some() || args.entropy)
+    {
+        return Err(
+            "--format csv supports strings and findings only; use --format json or ndjson for \
+             --magic-bytes/--yar/--brute-xor/--entropy"
+                .to_string(),
+        );
     }
     let file_size = std::fs::metadata(&args.path)
         .map_err(|e| format!("cannot inspect '{}': {e}", args.path))?
@@ -2218,14 +2349,17 @@ fn main() -> Result<(), String> {
     }
     if (threads == 1 || range_active) && args.format != Format::JsonTree && !args.dedupe {
         let mut writer = Sink::open(args.output.as_deref())?;
+        if args.format == Format::Json {
+            writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
+        }
+        if args.format == Format::Csv {
+            write_csv_header(&mut writer).map_err(|e| format!("write failed: {e}"))?;
+        }
         let json_layout = if args.format == Format::Ndjson {
             JsonLayout::Lines
         } else {
             JsonLayout::Array
         };
-        if args.format == Format::Json {
-            writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
-        }
         let mut result_count = 0;
         let mut short = 0;
         let mut medium = 0;
@@ -2517,6 +2651,9 @@ fn main() -> Result<(), String> {
         };
         if args.format == Format::Json {
             writeln!(writer, "[").map_err(|e| format!("write failed: {e}"))?;
+        }
+        if args.format == Format::Csv {
+            write_csv_header(&mut writer).map_err(|e| format!("write failed: {e}"))?;
         }
         let mut result_count = 0;
         for (finding, count) in &findings {

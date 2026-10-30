@@ -41,11 +41,14 @@ bxmap --help
 - `--progress` / `--no-progress` — show or hide a live status line on stderr
   (percent, MiB/s, scanned offset). Auto-enabled when stderr is a terminal and
   results are not going to the terminal.
-- `--format <text|json|json-tree|ndjson>` — output format. `ndjson` emits one
+- `--format <text|json|json-tree|ndjson|csv>` — output format. `ndjson` emits one
   JSON object per line with a `type` field (`string`, `finding`, `magic`,
   `yara`, `xor`, `entropy`) and a final `{"type":"metadata",...}` line carrying
   `total_records`, `truncated` and `scanned_until`. Prefer it for very large
-  dumps: it streams and avoids the array wrapper of `json`.
+  dumps: it streams and avoids the array wrapper of `json`. `csv` emits a fixed
+  header plus `string`/`finding` rows (RFC 4180 quoting) for spreadsheets and
+  pandas; it cannot be combined with `--magic-bytes`, `--yar`, `--brute-xor` or
+  `--entropy`.
 - `-o, --output <PATH>` — write results to a file. A path ending in `.gz` is
   gzip-compressed on the fly, which keeps multi-hundred-MB JSON outputs small
   and the gzip stream stays valid even when the scan exits early.

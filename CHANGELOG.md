@@ -40,6 +40,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Auxiliary stages (`--magic-bytes`, `--yar`, `--brute-xor`, `--entropy`) now
   filter their output to the `--start`/`--end` window instead of reporting hits
   from the whole file.
+- `--format csv` writes RFC 4180 CSV with a fixed header
+  (`type,offset,encoding,text,rule,value,severity,confidence,context,count,pid`).
+  Strings and rich findings are supported; combining it with `--magic-bytes`,
+  `--yar`, `--brute-xor` or `--entropy` is rejected, use json/ndjson for those.
+- Errors are printed as `Error: <message>` without the `Debug` quoting.
 - `-o out.json.gz` gzip-compresses output on the fly (any `--format`). The
   gzip trailer is written even when the scan exits early with truncation.
 - `--progress` / `--no-progress` print a live status line on stderr (percent,

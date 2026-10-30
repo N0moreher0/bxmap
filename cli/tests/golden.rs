@@ -646,3 +646,86 @@ fn golden_gzip_output_is_written_and_finished_on_truncation() {
     assert_eq!(lines.len(), 3, "{text}");
     assert!(lines[2].contains("\"truncated\":true"), "{text}");
 }
+
+#[test]
+fn golden_csv_emits_header_and_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00aaaa\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--format",
+            "csv",
+            "--dedupe",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0], "type,offset,encoding,text,rule,value,severity,confidence,context,count,pid",
+        "{stdout}"
+    );
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert_eq!(lines[1], "string,0x00000000,ascii,aaaa,,,,,,2,", "{stdout}");
+}
+
+#[test]
+fn golden_csv_quotes_commas_and_quotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"he said \"hi\", ok\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--format",
+            "csv",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"he said \"\"hi\"\", ok\""),
+        "comma/quote field must be RFC 4180 quoted: {stdout}"
+    );
+}
+
+#[test]
+fn golden_csv_rejects_auxiliary_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--format",
+            "csv",
+            "--entropy",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--format csv supports strings"), "{stderr}");
+}
