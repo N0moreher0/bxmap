@@ -467,10 +467,10 @@ impl<'a> StringRunScanner<'a> {
         let mut candidate_start = [false; 256];
         let le_enabled = encodings.ascii || encodings.utf16le || encodings.utf32le;
         let be_enabled = encodings.utf16be || encodings.utf32be;
-        for i in 0..256usize {
+        for (i, slot) in candidate_start.iter_mut().enumerate() {
             let b = i as u8;
-            candidate_start[i] = (le_enabled && is_printable(b))
-                || (be_enabled && (b == 0 || is_printable(b)));
+            *slot =
+                (le_enabled && is_printable(b)) || (be_enabled && (b == 0 || is_printable(b)));
         }
         Self {
             min_len,
@@ -652,43 +652,41 @@ impl<'a> StringRunScanner<'a> {
             }
 
             if self.encodings.utf16be {
-            if i + 1 < (offset + buffer_valid_len) {
-                let aligned = self.u16be_start < 0 || g as i64 == self.u16be_next_pos;
-                if aligned {
-                    let lo = buffer[i + 1];
-                    if buffer[i] == 0x00 && is_printable(lo) {
-                        if self.u16be_start < 0 {
-                            self.u16be_start = g as i64;
-                            self.u16be_buf.clear();
+                if i + 1 < (offset + buffer_valid_len) {
+                    let aligned = self.u16be_start < 0 || g as i64 == self.u16be_next_pos;
+                    if aligned {
+                        let lo = buffer[i + 1];
+                        if buffer[i] == 0x00 && is_printable(lo) {
+                            if self.u16be_start < 0 {
+                                self.u16be_start = g as i64;
+                                self.u16be_buf.clear();
+                            }
+                            self.u16be_buf.push(lo as u16);
+                            self.u16be_next_pos = g as i64 + 2;
+                            if self.u16be_buf.len() >= MAX_RUN_CHARS {
+                                self.flush_u16be();
+                            }
+                        } else {
+                            // only flush if we were at an aligned boundary position
+                            if self.u16be_start >= 0 && g as i64 == self.u16be_next_pos - 2 {
+                                // fall through to flush below
+                            }
                         }
-                        self.u16be_buf.push(lo as u16);
-                        self.u16be_next_pos = g as i64 + 2;
-                        if self.u16be_buf.len() >= MAX_RUN_CHARS {
+                    }
+                }
+                // flush u16be if not aligned continuation
+                if !(i + 1 < (offset + buffer_valid_len)) {
+                    self.flush_u16be();
+                } else {
+                    let aligned = self.u16be_start < 0 || g as i64 == self.u16be_next_pos;
+                    if aligned {
+                        let lo = buffer[i + 1];
+                        let cond = buffer[i] == 0x00 && is_printable(lo);
+                        if !cond {
                             self.flush_u16be();
                         }
-                    } else {
-                        // only flush if we were at an aligned boundary position
-                        if self.u16be_start >= 0 && g as i64 == self.u16be_next_pos - 2 {
-                            // fall through to flush below
-                        }
                     }
                 }
-            }
-            // flush u16be if not aligned continuation
-            if !(i + 1 < (offset + buffer_valid_len)) {
-                self.flush_u16be();
-            } else {
-                let aligned = self.u16be_start < 0 || g as i64 == self.u16be_next_pos;
-                if aligned {
-                    let lo = buffer[i + 1];
-                    let cond = buffer[i] == 0x00 && is_printable(lo);
-                    if !cond {
-                        self.flush_u16be();
-                    }
-                }
-            }
-
-
             } else if self.u16be_start >= 0 {
                 self.u16be_start = -1;
                 self.u16be_next_pos = -1;
@@ -696,34 +694,32 @@ impl<'a> StringRunScanner<'a> {
             }
 
             if self.encodings.utf32le {
-            if i + 3 < (offset + buffer_valid_len) {
-                let aligned = self.u32le_start < 0 || g as i64 == self.u32le_next_pos;
-                if aligned {
-                    let b1 = buffer[i + 1];
-                    let b2 = buffer[i + 2];
-                    let b3 = buffer[i + 3];
-                    if printable_b && b1 == 0 && b2 == 0 && b3 == 0 {
-                        if self.u32le_start < 0 {
-                            self.u32le_start = g as i64;
-                            self.u32le_buf.clear();
-                        }
-                        self.u32le_buf.push(b as u32);
-                        self.u32le_next_pos = g as i64 + 4;
-                        if self.u32le_buf.len() >= MAX_RUN_CHARS {
-                            self.flush_u32le();
-                        }
-                    } else {
-                        // flush if currently open and aligned
-                        if self.u32le_start >= 0 {
-                            self.flush_u32le();
+                if i + 3 < (offset + buffer_valid_len) {
+                    let aligned = self.u32le_start < 0 || g as i64 == self.u32le_next_pos;
+                    if aligned {
+                        let b1 = buffer[i + 1];
+                        let b2 = buffer[i + 2];
+                        let b3 = buffer[i + 3];
+                        if printable_b && b1 == 0 && b2 == 0 && b3 == 0 {
+                            if self.u32le_start < 0 {
+                                self.u32le_start = g as i64;
+                                self.u32le_buf.clear();
+                            }
+                            self.u32le_buf.push(b as u32);
+                            self.u32le_next_pos = g as i64 + 4;
+                            if self.u32le_buf.len() >= MAX_RUN_CHARS {
+                                self.flush_u32le();
+                            }
+                        } else {
+                            // flush if currently open and aligned
+                            if self.u32le_start >= 0 {
+                                self.flush_u32le();
+                            }
                         }
                     }
+                } else if self.u32le_start >= 0 {
+                    self.flush_u32le();
                 }
-            } else if self.u32le_start >= 0 {
-                self.flush_u32le();
-            }
-
-
             } else if self.u32le_start >= 0 {
                 self.u32le_start = -1;
                 self.u32le_next_pos = -1;
@@ -966,7 +962,8 @@ pub fn extract_strings_with_noise_config(
                 results.push(s);
             }
         };
-        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
+        let mut scanner =
+            StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
         scanner.feed(data, 0, data.len(), data.len(), 0);
         scanner.flush_all();
     }
@@ -1007,7 +1004,13 @@ pub fn extract_strings_with_encodings(
     max_strings: usize,
     encodings: EncodingFilter,
 ) -> Vec<ExtractedString> {
-    extract_strings_with_noise_config_and_encodings(data, min_len, max_strings, NoiseConfig::default(), encodings)
+    extract_strings_with_noise_config_and_encodings(
+        data,
+        min_len,
+        max_strings,
+        NoiseConfig::default(),
+        encodings,
+    )
 }
 
 // Borrow-checker note: in `extract_strings_from_reader` below, the outer
@@ -1058,7 +1061,8 @@ pub fn extract_strings_from_reader_with_noise_config<R: Read>(
                 count.set(count.get() + 1);
             }
         };
-        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
+        let mut scanner =
+            StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
 
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut global_base: u64 = 0;
@@ -1172,7 +1176,12 @@ pub fn extract_strings_from_reader_with_encodings<R: Read>(
     encodings: EncodingFilter,
 ) -> std::io::Result<Vec<ExtractedString>> {
     extract_strings_from_reader_with_noise_config_and_encodings(
-        reader, min_len, max_strings, estimated_len, NoiseConfig::default(), encodings,
+        reader,
+        min_len,
+        max_strings,
+        estimated_len,
+        NoiseConfig::default(),
+        encodings,
     )
 }
 
@@ -1195,7 +1204,12 @@ pub fn extract_strings_from_reader_streaming<R: Read, F: FnMut(ExtractedString)>
             on_found(s);
         }
     };
-    let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut scanner_callback, EncodingFilter::all());
+    let mut scanner = StringRunScanner::new(
+        min_len,
+        noise_cfg,
+        &mut scanner_callback,
+        EncodingFilter::all(),
+    );
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut global_base = 0u64;
     let mut carry_len = 0usize;
@@ -1294,7 +1308,14 @@ pub fn extract_strings_from_file_streaming_with_encodings<F: FnMut(ExtractedStri
 ) -> std::io::Result<usize> {
     let file = File::open(dump_path)?;
     let reader = BufReader::with_capacity(1 << 16, file);
-    extract_strings_from_reader_streaming_with_encodings(reader, min_len, max_strings, noise_cfg, encodings, on_found)
+    extract_strings_from_reader_streaming_with_encodings(
+        reader,
+        min_len,
+        max_strings,
+        noise_cfg,
+        encodings,
+        on_found,
+    )
 }
 
 /// File-based streaming variant of [`extract_strings_from_reader_streaming`].
@@ -1378,7 +1399,11 @@ pub fn extract_strings_from_file_with_encodings(
     encodings: EncodingFilter,
 ) -> std::io::Result<Vec<ExtractedString>> {
     extract_strings_from_file_with_noise_config_and_encodings(
-        dump_path, min_len, max_strings, NoiseConfig::default(), encodings,
+        dump_path,
+        min_len,
+        max_strings,
+        NoiseConfig::default(),
+        encodings,
     )
 }
 
@@ -1456,7 +1481,8 @@ pub fn extract_strings_from_file_parallel(
                         local.push(s);
                     }
                 };
-                let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
+                let mut scanner =
+                    StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
                 scanner.feed(&buf, 0, buf.len(), buf.len(), start);
                 scanner.flush_all();
             }
@@ -1514,7 +1540,8 @@ pub fn extract_strings_from_file_parallel_with_encodings(
                         local.push(s);
                     }
                 };
-                let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, encodings);
+                let mut scanner =
+                    StringRunScanner::new(min_len, noise_cfg, &mut on_found, encodings);
                 scanner.feed(&buf, 0, buf.len(), buf.len(), start);
                 scanner.flush_all();
             }
@@ -1533,6 +1560,7 @@ pub fn extract_strings_from_file_parallel_with_encodings(
     Ok(results)
 }
 
+pub const VERSION: &str = "1.0.4";
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1633,7 +1661,12 @@ mod tests {
         let mut results = Vec::new();
         {
             let mut on_found = |s: ExtractedString| results.push(s);
-            let mut scanner = StringRunScanner::new(4, NoiseConfig::default(), &mut on_found, EncodingFilter::all());
+            let mut scanner = StringRunScanner::new(
+                4,
+                NoiseConfig::default(),
+                &mut on_found,
+                EncodingFilter::all(),
+            );
             // Chunk 1: bytes 0..=5 (feed 5, valid_len 6) -- carry byte 6 (index 5)
             scanner.feed(&full[0..6], 0, 5, 6, 0);
             // Chunk 2 starts with the carry (full[5]) then the rest full[6..]
@@ -1759,4 +1792,3 @@ mod tests {
             .any(|s| s.encoding == "utf16le" && s.text == "aaaaaaaa"));
     }
 }
-pub const VERSION: &str = "1.0.4";

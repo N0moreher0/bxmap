@@ -6,42 +6,56 @@ on:
   pull_request:
 
 jobs:
-  msrv:
-    name: msrv
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install Rust 1.70
-        uses: dtolnay/rust-toolchain@1.70
-      - name: Check core (MSRV)
-        run: cargo check --all-targets --locked
-      - name: Check CLI (MSRV)
-        run: cargo check --manifest-path cli/Cargo.toml
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: cargo fmt --check --manifest-path cli/Cargo.toml
+
+  msrv:
+    name: msrv (lite)
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.70
+      - name: Check core (lite, MSRV)
+        run: cargo check --locked --no-default-features
+      - name: Check CLI (lite, MSRV)
+        run: cargo check --locked --manifest-path cli/Cargo.toml --no-default-features
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked --all-targets
+      - run: cargo clippy --locked --manifest-path cli/Cargo.toml --all-targets
 
-      - name: Check
-        run: cargo check --all-targets --locked
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --manifest-path cli/Cargo.toml
+      - run: cargo test --locked --no-default-features --all-targets
+      - run: cargo test --locked --manifest-path cli/Cargo.toml --no-default-features
 
-      - name: Test
-        run: cargo test --all-targets --locked
-
-      - name: Package
-        run: cargo package --locked
-
-      - name: Check CLI
-        run: cargo check --manifest-path cli/Cargo.toml
-
-      - name: Test CLI
-        run: cargo test --manifest-path cli/Cargo.toml
-
-      - name: Test lite build (no YARA)
-        run: cargo test --no-default-features --locked
-
-      - name: Test CLI lite build (no YARA)
-        run: cargo test --manifest-path cli/Cargo.toml --no-default-features --locked
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked -p bxmap
+      - run: cargo package --locked -p bxmap-cli
+PY
