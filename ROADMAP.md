@@ -39,7 +39,7 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 ### 2.1 Fuzzing và hardening
 - [ ] `cargo-fuzz` cho: parser minidump, parser `.vmss`, reader chunk/overlap, các detector regex.
 - [ ] Giới hạn cấp phát: header khai báo số stream/region/size quá lớn không được gây OOM.
-- [ ] Kiểm tra bounds, tránh `unwrap`/panic trên đường parse; dump cắt cụt hoặc hỏng phải trả lỗi rõ ràng, không crash.
+- [~] Kiểm tra bounds, tránh `unwrap`/panic trên đường parse (minidump hardening + mini-fuzz no-panic); dump cắt cụt/hỏng trả lỗi rõ ràng, không crash.
 - [ ] Chạy `clippy -D warnings`, `cargo audit`, `cargo deny` trong CI.
 
 ### 2.2 Bộ test

@@ -60,7 +60,10 @@ impl<R: Read + Seek> Src<R> {
     fn utf16_string(&mut self, rva: u64) -> io::Result<String> {
         let l = u32le(&self.bytes(rva, 4)?, 0) as u64;
         let raw = self.bytes(rva + 4, l)?;
-        let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         Ok(String::from_utf16_lossy(&units))
     }
 }
@@ -206,6 +209,9 @@ impl Minidump {
             timestamp: u32le(&h, 20),
             flags: u64le(&h, 24),
         };
+        if n > 65536 {
+            return Err(bad("too many streams"));
+        }
         let dir = s.bytes(dir_rva, n * 12)?;
         let streams: Vec<StreamEntry> = (0..n as usize)
             .map(|i| StreamEntry {
@@ -217,7 +223,11 @@ impl Minidump {
             .collect();
         let find = |t: u32| streams.iter().find(|e| e.stream_type == t).copied();
 
-        let mut md = Minidump { header: Some(header), streams: streams.clone(), ..Default::default() };
+        let mut md = Minidump {
+            header: Some(header),
+            streams: streams.clone(),
+            ..Default::default()
+        };
 
         if let Some(e) = find(ST_SYSTEM_INFO) {
             let b = s.bytes(e.rva as u64, e.size.min(28) as u64)?;
@@ -240,7 +250,11 @@ impl Minidump {
         if let Some(e) = find(ST_MODULE_LIST) {
             let b = s.bytes(e.rva as u64, e.size as u64)?;
             let cnt = u32le(&b, 0) as usize;
-            if 4 + cnt * 108 > b.len() {
+            let needed = cnt
+                .checked_mul(108)
+                .and_then(|v| v.checked_add(4))
+                .ok_or_else(|| bad("module list count overflow"))?;
+            if needed > b.len() {
                 return Err(bad("module list truncated"));
             }
             for i in 0..cnt {
@@ -257,7 +271,11 @@ impl Minidump {
         if let Some(e) = find(ST_THREAD_LIST) {
             let b = s.bytes(e.rva as u64, e.size as u64)?;
             let cnt = u32le(&b, 0) as usize;
-            if 4 + cnt * 48 > b.len() {
+            let needed = cnt
+                .checked_mul(48)
+                .and_then(|v| v.checked_add(4))
+                .ok_or_else(|| bad("thread list count overflow"))?;
+            if needed > b.len() {
                 return Err(bad("thread list truncated"));
             }
             for i in 0..cnt {
@@ -274,12 +292,22 @@ impl Minidump {
             let hdr = s.bytes(e.rva as u64, 16)?;
             let cnt = u64le(&hdr, 0);
             let mut off = u64le(&hdr, 8);
-            let b = s.bytes(e.rva as u64 + 16, cnt.checked_mul(16).ok_or_else(|| bad("range count overflow"))?)?;
+            let b = s.bytes(
+                e.rva as u64 + 16,
+                cnt.checked_mul(16)
+                    .ok_or_else(|| bad("range count overflow"))?,
+            )?;
             for i in 0..cnt as usize {
                 let start = u64le(&b, i * 16);
                 let size = u64le(&b, i * 16 + 8);
-                md.ranges.push(MemoryRange { start, size, file_offset: off });
-                off = off.checked_add(size).ok_or_else(|| bad("range offset overflow"))?;
+                md.ranges.push(MemoryRange {
+                    start,
+                    size,
+                    file_offset: off,
+                });
+                off = off
+                    .checked_add(size)
+                    .ok_or_else(|| bad("range offset overflow"))?;
             }
             md.ranges.sort_by_key(|r| r.start);
         }
@@ -288,7 +316,11 @@ impl Minidump {
             let hs = u32le(&b, 0) as usize;
             let es = u32le(&b, 4) as usize;
             let cnt = u64le(&b, 8) as usize;
-            if es < 48 || hs.checked_add(cnt.saturating_mul(es)).map_or(true, |t| t > b.len()) {
+            if es < 48
+                || hs
+                    .checked_add(cnt.saturating_mul(es))
+                    .map_or(true, |t| t > b.len())
+            {
                 return Err(bad("memory info list truncated"));
             }
             for i in 0..cnt {
@@ -323,7 +355,9 @@ impl Minidump {
     }
 
     pub fn module_for_va(&self, va: u64) -> Option<&Module> {
-        self.modules.iter().find(|m| va >= m.base && va - m.base < m.size as u64)
+        self.modules
+            .iter()
+            .find(|m| va >= m.base && va - m.base < m.size as u64)
     }
 
     pub fn region_for_va(&self, va: u64) -> Option<&MemoryRegion> {
@@ -346,7 +380,15 @@ impl Minidump {
         let pid = self.pid.map_or("?".to_string(), |p| p.to_string());
         match &self.system {
             Some(s) => {
-                let _ = writeln!(o, "Process pid={pid} [{} | Windows {}.{}.{} | {} CPU]", s.arch_name(), s.major, s.minor, s.build, s.cpu_count);
+                let _ = writeln!(
+                    o,
+                    "Process pid={pid} [{} | Windows {}.{}.{} | {} CPU]",
+                    s.arch_name(),
+                    s.major,
+                    s.minor,
+                    s.build,
+                    s.cpu_count
+                );
             }
             None => {
                 let _ = writeln!(o, "Process pid={pid}");
@@ -358,10 +400,19 @@ impl Minidump {
         }
         let _ = writeln!(o, "|- Threads ({})", self.threads.len());
         for t in self.threads.iter().take(max_items) {
-            let _ = writeln!(o, "|  |- tid={} teb={:#x} stack={:#x}+{:#x}", t.id, t.teb, t.stack_start, t.stack_size);
+            let _ = writeln!(
+                o,
+                "|  |- tid={} teb={:#x} stack={:#x}+{:#x}",
+                t.id, t.teb, t.stack_start, t.stack_size
+            );
         }
         let captured: u64 = self.ranges.iter().map(|r| r.size).sum();
-        let _ = writeln!(o, "|- Memory ({} captured ranges, {:.1} MiB)", self.ranges.len(), captured as f64 / 1_048_576.0);
+        let _ = writeln!(
+            o,
+            "|- Memory ({} captured ranges, {:.1} MiB)",
+            self.ranges.len(),
+            captured as f64 / 1_048_576.0
+        );
         let (mut c, mut r, mut f) = (0, 0, 0);
         for g in &self.regions {
             match g.state {
@@ -371,11 +422,22 @@ impl Minidump {
                 _ => {}
             }
         }
-        let _ = writeln!(o, "|  |- regions: {} committed, {} reserved, {} free", c, r, f);
+        let _ = writeln!(
+            o,
+            "|  |- regions: {} committed, {} reserved, {} free",
+            c, r, f
+        );
         let rwx = self.rwx_regions();
         let _ = writeln!(o, "|  `- RWX committed regions: {}", rwx.len());
         for g in rwx.iter().take(max_items) {
-            let _ = writeln!(o, "|       |- {:#018x} +{:#x} {} {}", g.base, g.size, protect_name(g.protect), g.kind_name());
+            let _ = writeln!(
+                o,
+                "|       |- {:#018x} +{:#x} {} {}",
+                g.base,
+                g.size,
+                protect_name(g.protect),
+                g.kind_name()
+            );
         }
         o
     }
@@ -437,7 +499,10 @@ mod tests {
         let data_off = v.len();
         v.extend_from_slice(&[0xAA; 16]);
         assert_eq!(data_off, m64 + 32);
-        for (i, (t, sz, rva)) in [(7u32, 56usize, sys), (4, 4 + 108, ml), (9, 48, m64)].iter().enumerate() {
+        for (i, (t, sz, rva)) in [(7u32, 56usize, sys), (4, 4 + 108, ml), (9, 48, m64)]
+            .iter()
+            .enumerate()
+        {
             let d = dir + i * 12;
             v[d..d + 4].copy_from_slice(&t.to_le_bytes());
             v[d + 4..d + 8].copy_from_slice(&(*sz as u32).to_le_bytes());
@@ -457,6 +522,27 @@ mod tests {
         assert!(md.va_to_offset(0x1010).is_none());
         assert_eq!(md.module_for_va(0x1800).unwrap().base, 0x1000);
         assert!(md.render_tree(5).contains("a.exe"));
+    }
+
+    #[test]
+    fn truncated_and_random_inputs_do_not_panic() {
+        // Deterministic mini-fuzz over random-ish (PRNG) byte streams.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        for len in [0, 1, 4, 31, 32, 33, 100, 1000] {
+            for _ in 0..200 {
+                state = state.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                let mut buf = vec![0u8; len];
+                for b in buf.iter_mut() {
+                    state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                    *b = (state & 0xFF) as u8;
+                }
+                // Force a valid-ish MDMP signature occasionally so the parser runs deeper.
+                if len >= 4 && state & 1 == 0 {
+                    buf[0..4].copy_from_slice(b"MDMP");
+                }
+                let _ = Minidump::from_reader(std::io::Cursor::new(buf));
+            }
+        }
     }
 
     #[test]
