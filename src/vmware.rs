@@ -103,9 +103,11 @@ impl VmwareState {
             }
             pos += 2;
             let n_idx = ((flags >> 6) & 3) as u64;
-            let need = match (name_len
-                .checked_add(n_idx.checked_mul(4).ok_or_else(|| bad("tag index count overflow"))?))
-            {
+            let need = match name_len.checked_add(
+                n_idx
+                    .checked_mul(4)
+                    .ok_or_else(|| bad("tag index count overflow"))?,
+            ) {
                 Some(v) => v,
                 None => break,
             };
@@ -275,10 +277,14 @@ mod tests {
         let dir = std::env::temp_dir().join("bxmap_vmware_fuzz.vmss");
         for len in [0, 1, 4, 11, 12, 13, 64, 512] {
             for _ in 0..300 {
-                state = state.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493);
                 let mut buf = vec![0u8; len];
                 for b in buf.iter_mut() {
-                    state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
                     *b = (state & 0xFF) as u8;
                 }
                 if len >= 4 {
@@ -298,5 +304,4 @@ mod tests {
         }
         let _ = std::fs::remove_file(&dir);
     }
-
 }

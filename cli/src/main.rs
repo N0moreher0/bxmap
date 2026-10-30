@@ -91,12 +91,22 @@ enum Format {
     JsonTree,
 }
 
+/// Detector output shape. `Flat` preserves the historical behaviour (replace
+/// the source string with the matched token); `Rich` emits `DetectedFinding`
+/// records with rule/confidence/severity/context.
+#[derive(Clone, Copy, PartialEq)]
+enum DetectFormat {
+    Flat,
+    Rich,
+}
+
 struct Args {
     path: String,
     min_len: usize,
     max_str_len: usize,
     max_strings: usize,
     format: Format,
+    detect_format: DetectFormat,
     encoding: Encoding,
     output: Option<String>,
     noise_threshold: Option<usize>,
@@ -168,6 +178,9 @@ OPTIONS:
                           Brute-force XOR candidates using selected key sizes
     --parse-pid          Map PID markers in extracted strings
     --detect <list>       Detect IOCs: ip, url, domain, b64, secret, all (comma-separated)
+    --detect-format <flat|rich>
+                           Detector output shape (default flat). rich keeps the
+                           original text and adds rule/confidence/severity/context.
     --magic-bytes         Report executable/document magic-byte signatures
     --tree                Parse a Windows minidump and print its process tree
                           (modules, threads, memory regions), then exit
@@ -197,6 +210,7 @@ fn parse_args() -> Result<Args, String> {
         max_str_len: 0,
         max_strings: MAX_STRINGS,
         format: Format::Text,
+        detect_format: DetectFormat::Flat,
         encoding: Encoding::All,
         output: None,
         noise_threshold: None,
@@ -328,6 +342,13 @@ fn parse_args() -> Result<Args, String> {
                     push_detector(&mut args.detectors, d)?;
                 }
             }
+            "--detect-format" => {
+                args.detect_format = match next(&mut i)?.as_str() {
+                    "flat" => DetectFormat::Flat,
+                    "rich" => DetectFormat::Rich,
+                    other => return Err(format!("invalid detect format '{other}'")),
+                };
+            }
             other => return Err(format!("unknown option '{other}'")),
         }
 
@@ -375,7 +396,7 @@ fn matches_filter(regex: Option<&Regex>, text: &str) -> bool {
     regex.map_or(true, |regex| regex.is_match(text))
 }
 
-fn detected_ip_value(text: &str) -> Option<String> {
+fn detected_ip_match(text: &str) -> Option<(String, usize, usize)> {
     static IPV4: OnceLock<Regex> = OnceLock::new();
     let ipv4 = IPV4.get_or_init(|| {
         Regex::new(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
@@ -385,33 +406,54 @@ fn detected_ip_value(text: &str) -> Option<String> {
         .find_iter(text)
         .find(|matched| is_public_ipv4(matched.as_str()))
     {
-        return Some(value.as_str().to_string());
+        return Some((value.as_str().to_string(), value.start(), value.end()));
     }
-    text.split(|character: char| character.is_whitespace() || "\"'<>(),;[]{}".contains(character))
-        .find(|token| token.parse::<std::net::Ipv6Addr>().is_ok())
-        .map(str::to_string)
+    for token in text
+        .split(|character: char| character.is_whitespace() || "\"'<>(),;[]{}".contains(character))
+    {
+        if token.parse::<std::net::Ipv6Addr>().is_ok() {
+            if let Some(start) = text.find(token) {
+                return Some((token.to_string(), start, start + token.len()));
+            }
+        }
+    }
+    None
+}
+
+fn detected_ip_value(text: &str) -> Option<String> {
+    detected_ip_match(text).map(|(value, _, _)| value)
+}
+
+fn detected_url_match(text: &str) -> Option<(String, usize, usize)> {
+    static URL: OnceLock<Regex> = OnceLock::new();
+    let matched = URL
+        .get_or_init(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>]+"#).unwrap())
+        .find(text)?;
+    let raw = matched.as_str();
+    let trimmed = raw.trim_end_matches(['.', ',', ';', ')', ']', '}']);
+    Some((
+        trimmed.to_string(),
+        matched.start(),
+        matched.start() + trimmed.len(),
+    ))
 }
 
 fn detected_url_value(text: &str) -> Option<String> {
-    static URL: OnceLock<Regex> = OnceLock::new();
-    URL.get_or_init(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>]+"#).unwrap())
-        .find(text)
-        .map(|matched| {
-            matched
-                .as_str()
-                .trim_end_matches(['.', ',', ';', ')', ']', '}'])
-                .to_string()
-        })
+    detected_url_match(text).map(|(value, _, _)| value)
 }
 
-fn detected_domain_value(text: &str) -> Option<String> {
+fn detected_domain_match(text: &str) -> Option<(String, usize, usize)> {
     static DOMAIN: OnceLock<Regex> = OnceLock::new();
-    DOMAIN
+    let matched = DOMAIN
         .get_or_init(|| {
             Regex::new(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b").unwrap()
         })
-        .find(text)
-        .map(|matched| matched.as_str().to_string())
+        .find(text)?;
+    Some((matched.as_str().to_string(), matched.start(), matched.end()))
+}
+
+fn detected_domain_value(text: &str) -> Option<String> {
+    detected_domain_match(text).map(|(value, _, _)| value)
 }
 
 fn base64_value(byte: u8) -> Option<u8> {
@@ -455,7 +497,7 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
     Some(output)
 }
 
-fn detect_and_decode_base64(text: &str) -> Option<String> {
+fn detect_and_decode_base64_match(text: &str) -> Option<(String, usize, usize)> {
     static B64: OnceLock<Regex> = OnceLock::new();
     let regex = B64.get_or_init(|| {
         Regex::new(r"(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?").unwrap()
@@ -467,11 +509,15 @@ fn detect_and_decode_base64(text: &str) -> Option<String> {
             .chars()
             .any(|character| character.is_ascii_alphanumeric())
         {
-            Some(decoded)
+            Some((decoded, matched.start(), matched.end()))
         } else {
             None
         }
     })
+}
+
+fn detect_and_decode_base64(text: &str) -> Option<String> {
+    detect_and_decode_base64_match(text).map(|(value, _, _)| value)
 }
 
 fn apply_detectors(result: ExtractedString, detectors: &[Detector]) -> Vec<ExtractedString> {
@@ -514,6 +560,80 @@ fn apply_detectors(result: ExtractedString, detectors: &[Detector]) -> Vec<Extra
                     let mut r = result.clone();
                     r.text = m.value;
                     out.push(r);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn push_finding(
+    out: &mut Vec<bxmap::classifier::DetectedFinding>,
+    result: &ExtractedString,
+    rule: &'static str,
+    value: String,
+    start: usize,
+    end: usize,
+) {
+    out.push(bxmap::classifier::DetectedFinding {
+        offset: result.offset,
+        encoding: result.encoding,
+        rule,
+        value,
+        text: result.text.clone(),
+        context: bxmap::classifier::context_around(&result.text, start, end, 32),
+        confidence: bxmap::classifier::confidence_for(rule),
+        severity: bxmap::classifier::severity_for(rule),
+    });
+}
+
+/// Structured detector output: keep the original string and annotate each match
+/// with its rule, confidence, severity and surrounding context.
+fn detect_findings(
+    result: &ExtractedString,
+    detectors: &[Detector],
+) -> Vec<bxmap::classifier::DetectedFinding> {
+    let mut out = Vec::new();
+    for det in detectors {
+        match det {
+            Detector::Ip => {
+                if let Some((value, start, end)) = detected_ip_match(&result.text) {
+                    let rule = if value.contains(':') { "IPV6" } else { "IPV4" };
+                    push_finding(&mut out, result, rule, value, start, end);
+                }
+            }
+            Detector::Url => {
+                if let Some((value, start, end)) = detected_url_match(&result.text) {
+                    push_finding(&mut out, result, "URL", value, start, end);
+                }
+            }
+            Detector::Domain => {
+                if let Some((value, start, end)) = detected_domain_match(&result.text) {
+                    push_finding(&mut out, result, "DOMAIN", value, start, end);
+                }
+            }
+            Detector::Base64 => {
+                if let Some((value, start, end)) = detect_and_decode_base64_match(&result.text) {
+                    push_finding(&mut out, result, "BASE64_DECODED", value, start, end);
+                }
+            }
+            Detector::Secret => {
+                for finding in bxmap::classifier::detect_secrets_detailed(&result.text) {
+                    out.push(bxmap::classifier::DetectedFinding {
+                        offset: result.offset,
+                        encoding: result.encoding,
+                        rule: finding.rule,
+                        value: finding.value,
+                        text: result.text.clone(),
+                        context: bxmap::classifier::context_around(
+                            &result.text,
+                            finding.start,
+                            finding.end,
+                            32,
+                        ),
+                        confidence: finding.confidence,
+                        severity: finding.severity,
+                    });
                 }
             }
         }
@@ -1261,6 +1381,40 @@ mod tests {
     }
 
     #[test]
+    fn rich_detectors_keep_original_text_and_context() {
+        let result = ExtractedString {
+            offset: 4,
+            encoding: "ascii",
+            text: "prefix AKIAIOSFODNN7EXAMPLE suffix".to_string(),
+        };
+        let findings = super::detect_findings(&result, &[super::Detector::Secret]);
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding.rule, "AWS_ACCESS_KEY");
+        assert_eq!(finding.value, "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(finding.text, result.text);
+        assert!(finding.context.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(finding.confidence >= 0.9);
+        assert_eq!(finding.severity, "high");
+        assert_eq!(finding.offset, 4);
+        assert_eq!(finding.encoding, "ascii");
+    }
+
+    #[test]
+    fn rich_ip_detector_uses_ipv4_rule() {
+        let result = ExtractedString {
+            offset: 0,
+            encoding: "ascii",
+            text: "beacon 8.8.8.8:443".to_string(),
+        };
+        let findings = super::detect_findings(&result, &[super::Detector::Ip]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "IPV4");
+        assert_eq!(findings[0].value, "8.8.8.8");
+        assert_eq!(findings[0].severity, "medium");
+    }
+
+    #[test]
     fn magic_scan_handles_chunk_boundaries_without_duplicates() {
         let path =
             std::env::temp_dir().join(format!("bxmap-magic-test-{}.dmp", std::process::id()));
@@ -1404,6 +1558,23 @@ fn display_text(text: &str, max_str_len: usize) -> String {
     out
 }
 
+fn update_stats(
+    result: &ExtractedString,
+    short: &mut usize,
+    medium: &mut usize,
+    long: &mut usize,
+    important: &mut Vec<ExtractedString>,
+) {
+    match result.text.chars().count() {
+        0..=7 => *short += 1,
+        8..=31 => *medium += 1,
+        _ => *long += 1,
+    }
+    if important.len() < 12 && important_reason(&result.text).is_some() {
+        important.push(result.clone());
+    }
+}
+
 fn record_result(
     result: ExtractedString,
     writer: &mut dyn Write,
@@ -1421,7 +1592,8 @@ fn record_result(
             write!(
                 writer,
                 "{:#010x}\t{}\t{}",
-                result.offset, result.encoding,
+                result.offset,
+                result.encoding,
                 display_text(&result.text, max_str_len)
             )?;
             if parse_pid {
@@ -1440,14 +1612,54 @@ fn record_result(
         }
     }
     *result_count += 1;
-    match result.text.chars().count() {
-        0..=7 => *short += 1,
-        8..=31 => *medium += 1,
-        _ => *long += 1,
+    update_stats(&result, short, medium, long, important);
+    Ok(())
+}
+
+fn record_finding(
+    finding: &bxmap::classifier::DetectedFinding,
+    writer: &mut dyn Write,
+    format: Format,
+    result_count: &mut usize,
+    max_str_len: usize,
+) -> io::Result<()> {
+    match format {
+        Format::Text => {
+            writeln!(
+                writer,
+                "{:#010x}\t{}\trule={}\tconf={:.2}\tsev={}\tvalue={}\tcontext={}\ttext={}",
+                finding.offset,
+                finding.encoding,
+                finding.rule,
+                finding.confidence,
+                finding.severity,
+                display_text(&finding.value, max_str_len),
+                display_text(&finding.context, max_str_len),
+                display_text(&finding.text, max_str_len)
+            )?;
+        }
+        Format::Json => {
+            if *result_count > 0 {
+                write!(writer, ",\n")?;
+            }
+            write!(
+                writer,
+                "  {{\"offset\":{},\"encoding\":{},\"rule\":{},\"value\":{},\"confidence\":{:.4},\"severity\":{},\"context\":{},\"text\":{}}}",
+                finding.offset,
+                json_escape(finding.encoding),
+                json_escape(finding.rule),
+                json_escape(&finding.value),
+                finding.confidence,
+                json_escape(finding.severity),
+                json_escape(&finding.context),
+                json_escape(&finding.text)
+            )?;
+        }
+        Format::JsonTree => {
+            // rejected during argument validation
+        }
     }
-    if important.len() < 12 && important_reason(&result.text).is_some() {
-        important.push(result);
-    }
+    *result_count += 1;
     Ok(())
 }
 
@@ -1464,7 +1676,8 @@ fn write_results(
                 write!(
                     writer,
                     "{:#010x}\t{}\t{}",
-                    result.offset, result.encoding,
+                    result.offset,
+                    result.encoding,
                     display_text(&result.text, max_str_len)
                 )?;
                 if parse_pid {
@@ -1503,14 +1716,20 @@ mod extra_detector_tests {
     fn detector_helpers_do_not_panic_on_random_input() {
         let mut state = 0xdeadbeefu64;
         for _ in 0..2000 {
-            state = state.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            state = state
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
             let mut s = String::new();
             for _ in 0..(state % 96) {
                 state ^= state >> 12;
                 state ^= state << 25;
                 state ^= state >> 27;
                 let c = (state & 0x7f) as u8;
-                let c = if c < 0x20 { (c + 0x20) as char } else { c as char };
+                let c = if c < 0x20 {
+                    (c + 0x20) as char
+                } else {
+                    c as char
+                };
                 s.push(c);
             }
             let _ = important_reason(&s);
@@ -1519,6 +1738,22 @@ mod extra_detector_tests {
             let _ = detected_domain_value(&s);
             let _ = detect_and_decode_base64(&s);
             let _ = bxmap::classifier::detect_secrets(&s);
+            let _ = bxmap::classifier::detect_secrets_detailed(&s);
+            let result = ExtractedString {
+                offset: 0,
+                encoding: "ascii",
+                text: s,
+            };
+            let _ = detect_findings(
+                &result,
+                &[
+                    Detector::Ip,
+                    Detector::Url,
+                    Detector::Domain,
+                    Detector::Base64,
+                    Detector::Secret,
+                ],
+            );
         }
     }
 }
@@ -1557,6 +1792,14 @@ fn main() -> Result<(), String> {
         .map_err(|error| format!("invalid --filter-regex: {error}"))?;
     if !args.detectors.is_empty() && filter_regex.is_some() {
         return Err("--filter-regex cannot be combined with a detector".to_string());
+    }
+    if args.detect_format == DetectFormat::Rich {
+        if args.detectors.is_empty() {
+            return Err("--detect-format rich requires --detect".to_string());
+        }
+        if args.format == Format::JsonTree {
+            return Err("--detect-format rich supports --format text or json".to_string());
+        }
     }
     let file_size = std::fs::metadata(&args.path)
         .map_err(|e| format!("cannot inspect '{}': {e}", args.path))?
@@ -1666,21 +1909,37 @@ fn main() -> Result<(), String> {
                     || (args.encoding == Encoding::Utf32
                         && (result.encoding == "utf32le" || result.encoding == "utf32be"))
                 {
-                    for result in apply_detectors(result, &args.detectors) {
-                        if matches_filter(filter_regex.as_ref(), &result.text) {
-                            if let Err(error) = record_result(
-                                result,
+                    if args.detect_format == DetectFormat::Rich {
+                        let findings = detect_findings(&result, &args.detectors);
+                        for finding in &findings {
+                            if let Err(error) = record_finding(
+                                finding,
                                 &mut writer,
                                 args.format,
                                 &mut result_count,
-                                &mut short,
-                                &mut medium,
-                                &mut long,
-                                &mut important,
-                                args.parse_pid,
                                 args.max_str_len,
                             ) {
                                 write_error = Some(error);
+                            }
+                        }
+                        update_stats(&result, &mut short, &mut medium, &mut long, &mut important);
+                    } else {
+                        for result in apply_detectors(result, &args.detectors) {
+                            if matches_filter(filter_regex.as_ref(), &result.text) {
+                                if let Err(error) = record_result(
+                                    result,
+                                    &mut writer,
+                                    args.format,
+                                    &mut result_count,
+                                    &mut short,
+                                    &mut medium,
+                                    &mut long,
+                                    &mut important,
+                                    args.parse_pid,
+                                    args.max_str_len,
+                                ) {
+                                    write_error = Some(error);
+                                }
                             }
                         }
                     }
@@ -1805,7 +2064,7 @@ fn main() -> Result<(), String> {
         )
     }
     .map_err(|e| format!("scan failed: {e}"))?;
-    let results: Vec<ExtractedString> = results
+    let raw_results: Vec<ExtractedString> = results
         .into_iter()
         .filter(|result| match args.encoding {
             Encoding::All => true,
@@ -1821,6 +2080,63 @@ fn main() -> Result<(), String> {
                 args.heap_only,
             )
         })
+        .collect();
+
+    if args.detect_format == DetectFormat::Rich {
+        let findings: Vec<bxmap::classifier::DetectedFinding> = raw_results
+            .iter()
+            .flat_map(|result| detect_findings(result, &args.detectors))
+            .collect();
+        let mut writer: Box<dyn Write> = match args.output.as_ref() {
+            Some(path) => Box::new(BufWriter::new(
+                File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
+            )),
+            None => Box::new(BufWriter::new(io::stdout().lock())),
+        };
+        if args.format == Format::Json {
+            write!(writer, "[\n").map_err(|e| format!("write failed: {e}"))?;
+        }
+        let mut result_count = 0;
+        for finding in &findings {
+            record_finding(
+                finding,
+                &mut writer,
+                args.format,
+                &mut result_count,
+                args.max_str_len,
+            )
+            .map_err(|e| format!("write failed: {e}"))?;
+        }
+        if args.format == Format::Json {
+            write!(writer, "\n]\n").map_err(|e| format!("write failed: {e}"))?;
+        }
+        writer.flush().map_err(|e| format!("write failed: {e}"))?;
+        if let Some(path) = args.output {
+            eprintln!("wrote {result_count} findings to '{path}'");
+        }
+        let mut short = 0;
+        let mut medium = 0;
+        let mut long = 0;
+        let mut important = Vec::new();
+        for result in &raw_results {
+            update_stats(result, &mut short, &mut medium, &mut long, &mut important);
+        }
+        print_report(
+            result_count,
+            short,
+            medium,
+            long,
+            &important,
+            &entropy_regions,
+            file_size,
+            start.elapsed().as_secs_f64(),
+            threads,
+        );
+        return Ok(());
+    }
+
+    let results: Vec<ExtractedString> = raw_results
+        .into_iter()
         .flat_map(|result| apply_detectors(result, &args.detectors))
         .filter(|result| {
             filter_regex
@@ -1963,8 +2279,14 @@ fn main() -> Result<(), String> {
         }
         writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
     } else {
-        write_results(&results, args.format, &mut writer, args.parse_pid, args.max_str_len)
-            .map_err(|e| format!("write failed: {e}"))?;
+        write_results(
+            &results,
+            args.format,
+            &mut writer,
+            args.parse_pid,
+            args.max_str_len,
+        )
+        .map_err(|e| format!("write failed: {e}"))?;
         for matched in &yara_matches {
             write_yara_text(matched, &mut writer).map_err(|e| format!("write failed: {e}"))?;
         }

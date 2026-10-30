@@ -530,10 +530,14 @@ mod tests {
         let mut state = 0x9e3779b97f4a7c15u64;
         for len in [0, 1, 4, 31, 32, 33, 100, 1000] {
             for _ in 0..200 {
-                state = state.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493);
                 let mut buf = vec![0u8; len];
                 for b in buf.iter_mut() {
-                    state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
                     *b = (state & 0xFF) as u8;
                 }
                 // Force a valid-ish MDMP signature occasionally so the parser runs deeper.

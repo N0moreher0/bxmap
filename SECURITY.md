@@ -35,4 +35,3 @@ hints, not malware verdicts.
 
 We aim to acknowledge reports within 7 days and ship a fix or mitigation
 within 30 days.
-PY

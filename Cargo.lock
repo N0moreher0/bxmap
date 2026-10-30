@@ -239,6 +239,7 @@ dependencies = [
  "bxmap",
  "rayon",
  "regex",
+ "tempfile",
 ]
 
 [[package]]

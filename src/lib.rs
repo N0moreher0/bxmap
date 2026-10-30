@@ -477,8 +477,7 @@ impl<'a> StringRunScanner<'a> {
         let be_enabled = encodings.utf16be || encodings.utf32be;
         for (i, slot) in candidate_start.iter_mut().enumerate() {
             let b = i as u8;
-            *slot =
-                (le_enabled && is_printable(b)) || (be_enabled && (b == 0 || is_printable(b)));
+            *slot = (le_enabled && is_printable(b)) || (be_enabled && (b == 0 || is_printable(b)));
         }
         Self {
             min_len,
@@ -1818,34 +1817,48 @@ mod tests {
         let mut results = Vec::new();
         {
             let mut on_found = |s: ExtractedString| results.push(s);
-            let mut scanner = StringRunScanner::new(4, NoiseConfig::default(), &mut on_found, EncodingFilter::all());
+            let mut scanner = StringRunScanner::new(
+                4,
+                NoiseConfig::default(),
+                &mut on_found,
+                EncodingFilter::all(),
+            );
             scanner.feed(&full[0..6], 0, 5, 6, 0);
             let mut block2 = vec![full[5]];
             block2.extend_from_slice(&full[6..]);
             scanner.feed(&block2, 0, block2.len(), block2.len(), 5);
             scanner.flush_all();
         }
-        assert!(results.iter().any(|s| s.encoding == "ascii" && s.text == "abcdef"));
+        assert!(results
+            .iter()
+            .any(|s| s.encoding == "ascii" && s.text == "abcdef"));
     }
 
     #[test]
     fn chunk_boundary_utf16be() {
         let mut full = Vec::new();
-        for c in b"abcd" { full.extend_from_slice(&[0, *c]); }
+        for c in b"abcd" {
+            full.extend_from_slice(&[0, *c]);
+        }
         let mut results = Vec::new();
         {
             let mut on_found = |s: ExtractedString| results.push(s);
-            let mut scanner = StringRunScanner::new(4, NoiseConfig::default(), &mut on_found, EncodingFilter::all());
+            let mut scanner = StringRunScanner::new(
+                4,
+                NoiseConfig::default(),
+                &mut on_found,
+                EncodingFilter::all(),
+            );
             scanner.feed(&full[0..6], 0, 5, 6, 0);
             let mut block2 = vec![full[5]];
             block2.extend_from_slice(&full[6..]);
             scanner.feed(&block2, 0, block2.len(), block2.len(), 5);
             scanner.flush_all();
         }
-        assert!(results.iter().any(|s| s.encoding == "utf16be" && s.text == "abcd"));
+        assert!(results
+            .iter()
+            .any(|s| s.encoding == "utf16be" && s.text == "abcd"));
     }
-
-
 
     #[test]
     fn utf16_ascii_le_does_not_emit_duplicate_be() {
@@ -1857,8 +1870,12 @@ mod tests {
             data.push(0);
         }
         let out = extract_strings(&data, 4, 1000);
-        assert!(out.iter().any(|s| s.encoding == "utf16le" && s.text == "hello"));
-        assert!(!out.iter().any(|s| s.encoding == "utf16be" && s.text == "hello"));
+        assert!(out
+            .iter()
+            .any(|s| s.encoding == "utf16le" && s.text == "hello"));
+        assert!(!out
+            .iter()
+            .any(|s| s.encoding == "utf16be" && s.text == "hello"));
     }
 
     #[test]
@@ -1869,7 +1886,11 @@ mod tests {
             data.extend_from_slice(&[0, 0, 0]);
         }
         let out = extract_strings(&data, 4, 1000);
-        assert!(out.iter().any(|s| s.encoding == "utf32le" && s.text == "hello"));
-        assert!(!out.iter().any(|s| s.encoding == "utf32be" && s.text == "hello"));
+        assert!(out
+            .iter()
+            .any(|s| s.encoding == "utf32le" && s.text == "hello"));
+        assert!(!out
+            .iter()
+            .any(|s| s.encoding == "utf32be" && s.text == "hello"));
     }
 }

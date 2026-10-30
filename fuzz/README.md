@@ -8,4 +8,3 @@ cargo install cargo-fuzz
 cargo +nightly fuzz run fuzz_minidump
 cargo +nightly fuzz run fuzz_strings
 ```
-PY

@@ -12,9 +12,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Shared `scratch` buffer reuse in `StringRunScanner` to reduce allocations.
 - CVE-like secret patterns with an Aho-Corasick anchor prefilter in the
   classifier.
+- Structured detector output (`--detect-format rich`) with `rule`, `value`,
+  `confidence`, `severity`, `context` and the original `text` preserved.
+- `classifier::DetectedFinding`, `SecretFinding` and `detect_secrets_detailed`
+  for library users that need match spans and provenance.
 
 ### Changed
 - `apply_detectors` allocates output capacity up front and clones lazily.
+- Flat detector output (`--detect-format flat`, default) is unchanged.
 
 ## [1.0.14] - 2026-10-30 (`bxmap-cli`)
 
@@ -27,4 +32,3 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Encoding-scoped extraction APIs for library users.
 - Encoding-filtered CLI scans.
 - Candidate-byte fast-skip table in `StringRunScanner`.
-PY

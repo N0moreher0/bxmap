@@ -21,4 +21,3 @@ path = "fuzz_targets/fuzz_strings.rs"
 test = false
 doc = false
 bench = false
-PY

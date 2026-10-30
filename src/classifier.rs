@@ -6,6 +6,7 @@
 
 use aho_corasick::AhoCorasick;
 use regex::Regex;
+use serde::Serialize;
 use std::sync::OnceLock;
 
 /// A concrete secret value extracted from text.
@@ -13,6 +14,103 @@ use std::sync::OnceLock;
 pub struct SecretMatch {
     pub typ: &'static str,
     pub value: String,
+}
+
+/// A secret match with provenance: byte span, confidence and severity.
+///
+/// This is the structured counterpart of [`SecretMatch`]; `detect_secrets`
+/// keeps its original shape for backward compatibility.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecretFinding {
+    pub rule: &'static str,
+    pub value: String,
+    /// Byte offset of the match inside the scanned string.
+    pub start: usize,
+    /// Byte offset just past the match inside the scanned string.
+    pub end: usize,
+    pub confidence: f64,
+    pub severity: &'static str,
+}
+
+/// A structured detector finding ready for JSON/text output.
+///
+/// Unlike the flat detector output (which replaces the original string with the
+/// matched token), a finding keeps the source `text` plus a `context` snippet so
+/// an analyst can see where the match came from.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DetectedFinding {
+    pub offset: u64,
+    pub encoding: &'static str,
+    pub rule: &'static str,
+    pub value: String,
+    pub text: String,
+    pub context: String,
+    pub confidence: f64,
+    pub severity: &'static str,
+}
+
+/// Severity bucket for a rule name.
+pub fn severity_for(rule: &str) -> &'static str {
+    match rule {
+        "GENERIC_SECRET" | "DOMAIN" | "BASE64_DECODED" => "low",
+        "AWS_SECRET_KEY"
+        | "AZURE_SAS_TOKEN"
+        | "PAYPAL_CLIENT_SECRET"
+        | "TWILIO_AUTH_TOKEN"
+        | "URL"
+        | "IPV4"
+        | "IPV6" => "medium",
+        _ => "high",
+    }
+}
+
+/// Baseline confidence for a rule. Values are intentionally coarse: detectors
+/// are triage hints, not proof.
+pub fn confidence_for(rule: &str) -> f64 {
+    match rule {
+        "GENERIC_SECRET" => 0.40,
+        "DOMAIN" => 0.60,
+        "BASE64_DECODED" => 0.50,
+        "URL" => 0.85,
+        "IPV4" | "IPV6" => 0.90,
+        "AWS_SECRET_KEY" | "AZURE_SAS_TOKEN" | "PAYPAL_CLIENT_SECRET" | "TWILIO_AUTH_TOKEN" => 0.75,
+        _ => 0.95,
+    }
+}
+
+fn char_floor(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn char_ceil(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Return a short snippet around `[start, end)` with `...` markers when the
+/// context was clipped. Offsets are byte offsets and are snapped to UTF-8
+/// boundaries, so this never panics on multibyte text.
+pub fn context_around(text: &str, start: usize, end: usize, radius: usize) -> String {
+    let start = char_floor(text, start);
+    let end = char_ceil(text, end.max(start));
+    let left = char_floor(text, start.saturating_sub(radius));
+    let right = char_ceil(text, end.saturating_add(radius));
+    let mut out = String::with_capacity(right - left + 8);
+    if left > 0 {
+        out.push_str("...");
+    }
+    out.push_str(&text[left..right]);
+    if right < text.len() {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Built-in secret/API-key detection patterns (name, regex).
@@ -244,6 +342,19 @@ fn secret_candidates(text: &str) -> u64 {
 }
 
 pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
+    detect_secrets_detailed(text)
+        .into_iter()
+        .map(|finding| SecretMatch {
+            typ: finding.rule,
+            value: finding.value,
+        })
+        .collect()
+}
+
+/// Structured secret detection: same rules and de-duplication as
+/// [`detect_secrets`], but each match also carries its byte span, confidence and
+/// severity.
+pub fn detect_secrets_detailed(text: &str) -> Vec<SecretFinding> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let candidates = secret_candidates(text);
@@ -254,9 +365,13 @@ pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
         for m in re.find_iter(text) {
             let val = m.as_str().to_string();
             if seen.insert(val.clone()) {
-                out.push(SecretMatch {
-                    typ: name,
+                out.push(SecretFinding {
+                    rule: name,
                     value: val,
+                    start: m.start(),
+                    end: m.end(),
+                    confidence: confidence_for(name),
+                    severity: severity_for(name),
                 });
             }
         }
@@ -671,5 +786,57 @@ mod tests {
     fn entropy_function_works() {
         assert_eq!(entropy_of(""), 0.0);
         assert!((entropy_of("aaaa") - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn detailed_secret_findings_carry_span_and_scores() {
+        let text = "config: AKIAIOSFODNN7EXAMPLE trailing";
+        let findings = detect_secrets_detailed(text);
+        let aws = findings
+            .iter()
+            .find(|f| f.rule == "AWS_ACCESS_KEY")
+            .expect("AWS key should be detected");
+        assert_eq!(aws.value, "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(&text[aws.start..aws.end], aws.value);
+        assert!(aws.confidence >= 0.9);
+        assert_eq!(aws.severity, "high");
+    }
+
+    #[test]
+    fn detect_secrets_matches_detailed_rules() {
+        let text = "password=hunter2hunter2 and AKIAIOSFODNN7EXAMPLE";
+        let flat: Vec<(&str, String)> = detect_secrets(text)
+            .into_iter()
+            .map(|m| (m.typ, m.value))
+            .collect();
+        let rich: Vec<(&str, String)> = detect_secrets_detailed(text)
+            .into_iter()
+            .map(|f| (f.rule, f.value))
+            .collect();
+        assert_eq!(flat, rich);
+    }
+
+    #[test]
+    fn context_around_clips_and_handles_multibyte() {
+        let text = "αβγδε hello world ζηθικλ";
+        let start = text.find("hello").unwrap();
+        let context = context_around(text, start, start + 5, 4);
+        assert!(context.contains("hello"));
+        assert!(context.starts_with("..."));
+        assert!(context.ends_with("..."));
+
+        let all = context_around(text, 0, text.len(), 64);
+        assert_eq!(all, text);
+    }
+
+    #[test]
+    fn generic_secret_is_low_confidence() {
+        let findings = detect_secrets_detailed("password=hunter2hunter2");
+        let generic = findings
+            .iter()
+            .find(|f| f.rule == "GENERIC_SECRET")
+            .expect("generic secret should be detected");
+        assert_eq!(generic.severity, "low");
+        assert!(generic.confidence < 0.5);
     }
 }
