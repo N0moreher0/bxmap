@@ -46,6 +46,9 @@ bxmap --help
   `yara`, `xor`, `entropy`) and a final `{"type":"metadata",...}` line carrying
   `total_records`, `truncated` and `scanned_until`. Prefer it for very large
   dumps: it streams and avoids the array wrapper of `json`.
+- `-o, --output <PATH>` — write results to a file. A path ending in `.gz` is
+  gzip-compressed on the fly, which keeps multi-hundred-MB JSON outputs small
+  and the gzip stream stays valid even when the scan exits early.
 - `--detect <list>` — IOC / credential triage.
 - `--detect-format <flat|rich>` — `rich` keeps the original text and adds
   `rule`, `confidence`, `severity` and `context` to every finding.

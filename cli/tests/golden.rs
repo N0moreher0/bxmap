@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::process::Command;
 
 fn bin_path() -> std::path::PathBuf {
@@ -609,4 +610,39 @@ fn golden_ndjson_metadata_flags_truncation() {
     let last = stdout.lines().last().unwrap_or_default();
     assert!(last.starts_with("{\"type\":\"metadata\""), "{stdout}");
     assert!(last.contains("\"truncated\":true"), "{stdout}");
+}
+
+#[test]
+fn golden_gzip_output_is_written_and_finished_on_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"aaaa\x00bbbb\x00cccc\x00").unwrap();
+    let gz = dir.path().join("out.ndjson.gz");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--format",
+            "ndjson",
+            "--max-strings",
+            "2",
+            "-o",
+            gz.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    // Truncation still exits 3, but the gzip stream must stay readable.
+    assert_eq!(output.status.code(), Some(3));
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(&gz).unwrap())
+        .read_to_string(&mut text)
+        .unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(lines[2].contains("\"truncated\":true"), "{text}");
 }

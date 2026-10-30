@@ -40,6 +40,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Auxiliary stages (`--magic-bytes`, `--yar`, `--brute-xor`, `--entropy`) now
   filter their output to the `--start`/`--end` window instead of reporting hits
   from the whole file.
+- `-o out.json.gz` gzip-compresses output on the fly (any `--format`). The
+  gzip trailer is written even when the scan exits early with truncation.
 - `--progress` / `--no-progress` print a live status line on stderr (percent,
   MiB/s, scanned offset). Progress is on by default when stderr is a terminal
   and results are not going to the terminal. The new

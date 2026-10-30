@@ -103,6 +103,60 @@ enum JsonLayout {
     Lines,
 }
 
+/// Output sink: plain file/stdout, or gzip-compressed when the `-o` path ends
+/// in `.gz`.
+///
+/// `finish` must be called before the process exits so the gzip trailer is
+/// written even on early exits (e.g. `--max-strings` truncation).
+enum Sink {
+    Plain(BufWriter<Box<dyn Write>>),
+    Gzip(BufWriter<flate2::write::GzEncoder<File>>),
+}
+
+impl Sink {
+    fn open(path: Option<&str>) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Sink::Plain(BufWriter::new(Box::new(io::stdout().lock()))));
+        };
+        let file = File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?;
+        if path.to_ascii_lowercase().ends_with(".gz") {
+            Ok(Sink::Gzip(BufWriter::new(flate2::write::GzEncoder::new(
+                file,
+                flate2::Compression::default(),
+            ))))
+        } else {
+            Ok(Sink::Plain(BufWriter::new(Box::new(file))))
+        }
+    }
+
+    /// Flush everything and write the gzip trailer when compressing.
+    fn finish(self) -> io::Result<()> {
+        match self {
+            Sink::Plain(mut writer) => writer.flush(),
+            Sink::Gzip(writer) => {
+                let encoder = writer.into_inner().map_err(|error| error.into_error())?;
+                encoder.finish().map(|_| ())
+            }
+        }
+    }
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Sink::Plain(writer) => writer.write(buf),
+            Sink::Gzip(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Sink::Plain(writer) => writer.flush(),
+            Sink::Gzip(writer) => writer.flush(),
+        }
+    }
+}
+
 /// Detector output shape. `Flat` preserves the historical behaviour (replace
 /// the source string with the matched token); `Rich` emits `DetectedFinding`
 /// records with rule/confidence/severity/context.
@@ -2163,12 +2217,7 @@ fn main() -> Result<(), String> {
             .retain(|region| entropy_region_in_range(region, range_active, range_start, range_end));
     }
     if (threads == 1 || range_active) && args.format != Format::JsonTree && !args.dedupe {
-        let mut writer: Box<dyn Write> = match args.output.as_ref() {
-            Some(path) => Box::new(BufWriter::new(
-                File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
-            )),
-            None => Box::new(BufWriter::new(io::stdout().lock())),
-        };
+        let mut writer = Sink::open(args.output.as_deref())?;
         let json_layout = if args.format == Format::Ndjson {
             JsonLayout::Lines
         } else {
@@ -2366,7 +2415,7 @@ fn main() -> Result<(), String> {
                 }
             }
         }
-        writer.flush().map_err(|e| format!("write failed: {e}"))?;
+        writer.finish().map_err(|e| format!("write failed: {e}"))?;
         if let Some(path) = args.output {
             eprintln!("wrote {result_count} results to '{path}'");
         }
@@ -2460,12 +2509,7 @@ fn main() -> Result<(), String> {
         } else {
             findings.into_iter().map(|finding| (finding, 1)).collect()
         };
-        let mut writer: Box<dyn Write> = match args.output.as_ref() {
-            Some(path) => Box::new(BufWriter::new(
-                File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
-            )),
-            None => Box::new(BufWriter::new(io::stdout().lock())),
-        };
+        let mut writer = Sink::open(args.output.as_deref())?;
         let json_layout = if args.format == Format::Ndjson {
             JsonLayout::Lines
         } else {
@@ -2493,7 +2537,7 @@ fn main() -> Result<(), String> {
         } else if args.format == Format::Json {
             writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
         }
-        writer.flush().map_err(|e| format!("write failed: {e}"))?;
+        writer.finish().map_err(|e| format!("write failed: {e}"))?;
         if let Some(path) = args.output {
             eprintln!("wrote {result_count} findings to '{path}'");
         }
@@ -2541,12 +2585,7 @@ fn main() -> Result<(), String> {
     };
 
     let output_path = args.output.clone();
-    let mut writer: Box<dyn Write> = match output_path.as_ref() {
-        Some(path) => Box::new(BufWriter::new(
-            File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
-        )),
-        None => Box::new(BufWriter::new(io::stdout().lock())),
-    };
+    let mut writer = Sink::open(output_path.as_deref())?;
     if args.format == Format::JsonTree {
         use std::collections::BTreeMap;
         let mut groups: BTreeMap<(String, String), Vec<&ExtractedString>> = BTreeMap::new();
@@ -2614,7 +2653,7 @@ fn main() -> Result<(), String> {
             last_offset
         ));
         write!(writer, "{}", out).map_err(|e| format!("write failed: {e}"))?;
-        writer.flush().map_err(|e| format!("write failed: {e}"))?;
+        writer.finish().map_err(|e| format!("write failed: {e}"))?;
         if let Some(path) = output_path.clone() {
             eprintln!("wrote {} results to '{}'", results.len(), path);
         }
@@ -2751,7 +2790,7 @@ fn main() -> Result<(), String> {
             }
         }
     }
-    writer.flush().map_err(|e| format!("write failed: {e}"))?;
+    writer.finish().map_err(|e| format!("write failed: {e}"))?;
     if let Some(path) = output_path {
         eprintln!("wrote {} results to '{path}'", results.len());
     }

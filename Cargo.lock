@@ -237,6 +237,7 @@ name = "bxmap-cli"
 version = "1.0.14"
 dependencies = [
  "bxmap",
+ "flate2",
  "rayon",
  "regex",
  "tempfile",
