@@ -1337,6 +1337,81 @@ pub fn extract_strings_from_file_streaming_with_encodings<F: FnMut(ExtractedStri
     )
 }
 
+/// Scan only `[start, end)` of a file, streaming results to `on_found`.
+///
+/// The scanner reads up to [`MAX_RUN_CHARS`] bytes before `start` and after
+/// `end` so strings crossing the requested boundaries are still complete, but
+/// only strings whose start offset is inside `[start, end)` are emitted. This
+/// is the building block for splitting a large dump across processes.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_strings_from_file_streaming_range_with_encodings<F: FnMut(ExtractedString)>(
+    dump_path: &str,
+    start: u64,
+    end: u64,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+    mut on_found: F,
+) -> std::io::Result<usize> {
+    let file_len = std::fs::metadata(dump_path)?.len();
+    let start = start.min(file_len);
+    let end = end.min(file_len).max(start);
+    if start >= end {
+        return Ok(0);
+    }
+    let overlap = MAX_RUN_CHARS as u64;
+    let scan_start = start.saturating_sub(overlap);
+    let scan_end = std::cmp::min(end.saturating_add(overlap), file_len);
+    let scan_len = scan_end - scan_start;
+
+    let mut file = File::open(dump_path)?;
+    file.seek(SeekFrom::Start(scan_start))?;
+    let mut reader = BufReader::with_capacity(1 << 16, file.take(scan_len));
+
+    let emitted = std::cell::Cell::new(0usize);
+    let mut scanner_callback = |s: ExtractedString| {
+        if s.offset >= start && s.offset < end && emitted.get() < max_strings {
+            emitted.set(emitted.get() + 1);
+            on_found(s);
+        }
+    };
+    let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut scanner_callback, encodings);
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut global_base = scan_start;
+    let mut carry_len = 0usize;
+
+    while emitted.get() < max_strings {
+        let to_read_into = buffer.len() - carry_len;
+        let mut read_total = 0usize;
+        while read_total < to_read_into {
+            let n = reader.read(&mut buffer[carry_len + read_total..carry_len + to_read_into])?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+
+        let len = carry_len + read_total;
+        if len == 0 {
+            break;
+        }
+        let is_last_chunk = read_total < to_read_into;
+        if is_last_chunk {
+            scanner.feed(&buffer, 0, len, len, global_base);
+            scanner.flush_all();
+            break;
+        }
+
+        scanner.feed(&buffer, 0, len - 1, len, global_base);
+        buffer[0] = buffer[len - 1];
+        carry_len = 1;
+        global_base += (len - 1) as u64;
+    }
+
+    Ok(emitted.get())
+}
+
 /// File-based streaming variant of [`extract_strings_from_reader_streaming`].
 pub fn extract_strings_from_file_streaming<F: FnMut(ExtractedString)>(
     dump_path: &str,
@@ -1892,5 +1967,88 @@ mod tests {
         assert!(!out
             .iter()
             .any(|s| s.encoding == "utf32be" && s.text == "hello"));
+    }
+
+    fn temp_bin(name: &str, data: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bxmap-{name}-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    #[test]
+    fn streaming_range_emits_only_strings_starting_inside_the_window() {
+        // Offsets: AAAA@0, BBBB@5, CCCC@10, DDDD@15, EEEE@20.
+        let path = temp_bin("range-window", b"AAAA\x00BBBB\x00CCCC\x00DDDD\x00EEEE\x00");
+        let mut found = Vec::new();
+        let count = extract_strings_from_file_streaming_range_with_encodings(
+            path.to_str().unwrap(),
+            5,
+            15,
+            4,
+            1000,
+            NoiseConfig::default(),
+            EncodingFilter::ascii(),
+            |s| found.push(s),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let texts: Vec<&str> = found.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(count, 2);
+        assert_eq!(texts, vec!["BBBB", "CCCC"]);
+        assert_eq!(found[0].offset, 5);
+        assert_eq!(found[1].offset, 10);
+    }
+
+    #[test]
+    fn streaming_range_keeps_strings_that_cross_the_end_boundary() {
+        // The run starts inside [5, 10) but extends past it; it must be emitted
+        // whole because the scanner reads MAX_RUN_CHARS past the boundary.
+        let path = temp_bin("range-cross", b"xxxx\x00ABCDEFGHIJ\x00tail");
+        let mut found = Vec::new();
+        extract_strings_from_file_streaming_range_with_encodings(
+            path.to_str().unwrap(),
+            5,
+            10,
+            4,
+            1000,
+            NoiseConfig::default(),
+            EncodingFilter::ascii(),
+            |s| found.push(s),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].text, "ABCDEFGHIJ");
+        assert_eq!(found[0].offset, 5);
+    }
+
+    #[test]
+    fn streaming_range_honours_max_strings() {
+        let path = temp_bin("range-limit", b"AAAA\x00BBBB\x00CCCC\x00");
+        let mut found = Vec::new();
+        let count = extract_strings_from_file_streaming_range_with_encodings(
+            path.to_str().unwrap(),
+            0,
+            15,
+            4,
+            1,
+            NoiseConfig::default(),
+            EncodingFilter::ascii(),
+            |s| found.push(s),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(count, 1);
+        assert_eq!(found.len(), 1);
     }
 }
