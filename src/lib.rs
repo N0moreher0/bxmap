@@ -451,6 +451,14 @@ struct StringRunScanner<'a> {
 
     /// Reused ASCII staging buffer for the repeat-noise check and text creation.
     scratch: Vec<u8>,
+
+    /// Last emitted UTF-16LE run (bytes + start offset) used to suppress the
+    /// redundant UTF-16BE mirror that appears one byte later for ASCII text.
+    last_u16le_bytes: Vec<u8>,
+    last_u16le_offset: i64,
+    /// Same for UTF-32LE / UTF-32BE.
+    last_u32le_bytes: Vec<u8>,
+    last_u32le_offset: i64,
 }
 
 impl<'a> StringRunScanner<'a> {
@@ -496,6 +504,10 @@ impl<'a> StringRunScanner<'a> {
             encodings,
             candidate_start,
             scratch: Vec::with_capacity(64),
+            last_u16le_bytes: Vec::with_capacity(64),
+            last_u16le_offset: -100,
+            last_u32le_bytes: Vec::with_capacity(64),
+            last_u32le_offset: -100,
         }
     }
 
@@ -808,6 +820,9 @@ impl<'a> StringRunScanner<'a> {
                     encoding: "utf16le",
                     text,
                 });
+                self.last_u16le_offset = self.u16_start;
+                self.last_u16le_bytes.clear();
+                self.last_u16le_bytes.extend_from_slice(&self.scratch);
             }
         }
         self.u16_start = -1;
@@ -825,7 +840,11 @@ impl<'a> StringRunScanner<'a> {
         if self.u16be_start >= 0 && self.u16be_buf.len() >= self.min_len {
             self.scratch.clear();
             self.scratch.extend(self.u16be_buf.iter().map(|&c| c as u8));
-            if !is_low_information_repeat(&self.scratch, &self.noise_cfg) {
+            // Suppress the redundant UTF-16BE mirror of an ASCII UTF-16LE run
+            // that starts exactly one byte earlier (common for LE-stored text).
+            let duplicate = self.last_u16le_offset + 1 == self.u16be_start
+                && self.last_u16le_bytes == self.scratch;
+            if !is_low_information_repeat(&self.scratch, &self.noise_cfg) && !duplicate {
                 let text = String::from_utf8_lossy(&self.scratch).into_owned();
                 (self.on_found)(ExtractedString {
                     offset: self.u16be_start as u64,
@@ -856,6 +875,9 @@ impl<'a> StringRunScanner<'a> {
                     encoding: "utf32le",
                     text,
                 });
+                self.last_u32le_offset = self.u32le_start;
+                self.last_u32le_bytes.clear();
+                self.last_u32le_bytes.extend_from_slice(&self.scratch);
             }
         }
         self.u32le_start = -1;
@@ -873,7 +895,9 @@ impl<'a> StringRunScanner<'a> {
         if self.u32be_start >= 0 && self.u32be_buf.len() >= self.min_len {
             self.scratch.clear();
             self.scratch.extend(self.u32be_buf.iter().map(|&c| c as u8));
-            if !is_low_information_repeat(&self.scratch, &self.noise_cfg) {
+            let duplicate = self.last_u32le_offset + 1 == self.u32be_start
+                && self.last_u32le_bytes == self.scratch;
+            if !is_low_information_repeat(&self.scratch, &self.noise_cfg) && !duplicate {
                 let text = String::from_utf8_lossy(&self.scratch).into_owned();
                 (self.on_found)(ExtractedString {
                     offset: self.u32be_start as u64,

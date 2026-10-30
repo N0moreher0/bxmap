@@ -19,10 +19,19 @@ pub struct SecretMatch {
 /// Order matters only for `classify()` preference (first match wins).
 pub static SECRET_PATTERNS: &[(&str, &str)] = &[
     ("AWS_ACCESS_KEY", r"AKIA[0-9A-Z]{16}"),
-    ("AWS_SECRET_KEY", r"(?i)aws.{0,20}secret.{0,20}[A-Za-z0-9/+=]{30,}"),
+    (
+        "AWS_SECRET_KEY",
+        r"(?i)aws.{0,20}secret.{0,20}[A-Za-z0-9/+=]{30,}",
+    ),
     ("GOOGLE_API_KEY", r"AIza[0-9A-Za-z_-]{35}"),
-    ("GOOGLE_OAUTH_CLIENT_ID", r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com"),
-    ("AZURE_STORAGE_KEY", r"(?i)azure.{0,20}(?:storage|account).{0,20}key.{0,20}[A-Za-z0-9+/=]{40,}"),
+    (
+        "GOOGLE_OAUTH_CLIENT_ID",
+        r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com",
+    ),
+    (
+        "AZURE_STORAGE_KEY",
+        r"(?i)azure.{0,20}(?:storage|account).{0,20}key.{0,20}[A-Za-z0-9+/=]{40,}",
+    ),
     ("AZURE_SAS_TOKEN", r"(?i)\?[^ ]*sig=[A-Za-z0-9%+/=]{20,}"),
     ("GITHUB_PAT_CLASSIC", r"ghp_[A-Za-z0-9]{36,}"),
     ("GITHUB_FINE_GRAINED_PAT", r"github_pat_[A-Za-z0-9_]{20,}"),
@@ -35,29 +44,65 @@ pub static SECRET_PATTERNS: &[(&str, &str)] = &[
     ("HUGGINGFACE_TOKEN", r"hf_[A-Za-z0-9]{20,}"),
     ("DEEPSEEK_API_KEY", r"sk-[A-Za-z0-9]{20,}"),
     ("STRIPE_SECRET_KEY", r"sk_(?:live|test)_[A-Za-z0-9]{20,}"),
-    ("STRIPE_PUBLISHABLE_KEY", r"pk_(?:live|test)_[A-Za-z0-9]{20,}"),
-    ("STRIPE_RESTRICTED_KEY", r"rk_(?:live|test)_[A-Za-z0-9]{20,}"),
-    ("PAYPAL_CLIENT_SECRET", r"(?i)paypal.{0,20}secret.{0,20}[A-Za-z0-9]{20,}"),
+    (
+        "STRIPE_PUBLISHABLE_KEY",
+        r"pk_(?:live|test)_[A-Za-z0-9]{20,}",
+    ),
+    (
+        "STRIPE_RESTRICTED_KEY",
+        r"rk_(?:live|test)_[A-Za-z0-9]{20,}",
+    ),
+    (
+        "PAYPAL_CLIENT_SECRET",
+        r"(?i)paypal.{0,20}secret.{0,20}[A-Za-z0-9]{20,}",
+    ),
     ("SLACK_BOT_TOKEN", r"xoxb-[0-9A-Za-z-]{20,}"),
     ("SLACK_USER_TOKEN", r"xoxp-[0-9A-Za-z-]{20,}"),
-    ("SLACK_WEBHOOK", r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+"),
-    ("DISCORD_BOT_TOKEN", r"[MN][A-Za-z0-9]{23}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}"),
+    (
+        "SLACK_WEBHOOK",
+        r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",
+    ),
+    (
+        "DISCORD_BOT_TOKEN",
+        r"[MN][A-Za-z0-9]{23}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}",
+    ),
     ("TWILIO_API_KEY_SID", r"SK[0-9a-fA-F]{32}"),
-    ("TWILIO_AUTH_TOKEN", r"(?i)twilio.{0,20}auth.{0,20}token.{0,20}[0-9a-f]{32}"),
-    ("SENDGRID_API_KEY", r"SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}"),
-    ("JWT_TOKEN", r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
-    ("PRIVATE_KEY_BLOCK", r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
-    ("DATABASE_URI", r#"(?i)(postgres|postgresql|mysql|mongodb|redis|sqlserver|mssql)://[^\s"'<>]+"#),
-    ("GENERIC_SECRET", r"(?i)(password|passwd|secret|token|apikey|api_key)\s*[=:]\s*\S{6,}"),
+    (
+        "TWILIO_AUTH_TOKEN",
+        r"(?i)twilio.{0,20}auth.{0,20}token.{0,20}[0-9a-f]{32}",
+    ),
+    (
+        "SENDGRID_API_KEY",
+        r"SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}",
+    ),
+    (
+        "JWT_TOKEN",
+        r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+    ),
+    (
+        "PRIVATE_KEY_BLOCK",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+    ),
+    (
+        "DATABASE_URI",
+        r#"(?i)(postgres|postgresql|mysql|mongodb|redis|sqlserver|mssql)://[^\s"'<>]+"#,
+    ),
+    (
+        "GENERIC_SECRET",
+        r"(?i)(password|passwd|secret|token|apikey|api_key)\s*[=:]\s*\S{6,}",
+    ),
 ];
 
 static SECRET_COMPILED: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
 fn secret_compiled() -> &'static Vec<(&'static str, Regex)> {
     SECRET_COMPILED.get_or_init(|| {
-        SECRET_PATTERNS.iter().map(|(name, pat)| {
-            let re = Regex::new(pat).unwrap_or_else(|_| Regex::new(r".^").unwrap());
-            (*name, re)
-        }).collect()
+        SECRET_PATTERNS
+            .iter()
+            .map(|(name, pat)| {
+                let re = Regex::new(pat).unwrap_or_else(|_| Regex::new(r".^").unwrap());
+                (*name, re)
+            })
+            .collect()
     })
 }
 
@@ -98,7 +143,14 @@ const SECRET_ANCHORS: &[(&str, &[&str])] = &[
     ("PRIVATE_KEY_BLOCK", &["-----BEGIN "]),
     (
         "DATABASE_URI",
-        &["postgres", "mysql", "mongodb", "redis", "sqlserver", "mssql"],
+        &[
+            "postgres",
+            "mysql",
+            "mongodb",
+            "redis",
+            "sqlserver",
+            "mssql",
+        ],
     ),
     (
         "GENERIC_SECRET",
@@ -109,7 +161,7 @@ const SECRET_ANCHORS: &[(&str, &[&str])] = &[
 /// Minimum byte length of any possible match, per pattern (derived from the regex).
 /// Lets us skip patterns that have no literal anchor (Discord) on short strings.
 const SECRET_MIN_LEN: &[(&str, usize)] = &[
-    ("DISCORD_BOT_TOKEN", 59), // 24 + '.' + 6 + '.' + 27+
+    ("DISCORD_BOT_TOKEN", 59),  // 24 + '.' + 6 + '.' + 27+
     ("TWILIO_API_KEY_SID", 34), // "SK" + 32 hex
 ];
 
@@ -130,7 +182,11 @@ fn secret_prefilter() -> &'static SecretPrefilter {
     PREFILTER.get_or_init(|| {
         let count = SECRET_PATTERNS.len();
         assert!(count <= 64, "secret prefilter uses a u64 bitmask");
-        let all = if count == 64 { u64::MAX } else { (1u64 << count) - 1 };
+        let all = if count == 64 {
+            u64::MAX
+        } else {
+            (1u64 << count) - 1
+        };
         let mut anchors: Vec<&str> = Vec::new();
         let mut anchor_masks: Vec<u64> = Vec::new();
         let mut anchored = 0u64;
@@ -156,7 +212,13 @@ fn secret_prefilter() -> &'static SecretPrefilter {
             .ascii_case_insensitive(true)
             .build(&anchors)
             .expect("secret anchors form a valid automaton");
-        SecretPrefilter { ac, anchor_masks, always: all & !anchored, all, gates }
+        SecretPrefilter {
+            ac,
+            anchor_masks,
+            always: all & !anchored,
+            all,
+            gates,
+        }
     })
 }
 
@@ -192,7 +254,10 @@ pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
         for m in re.find_iter(text) {
             let val = m.as_str().to_string();
             if seen.insert(val.clone()) {
-                out.push(SecretMatch { typ: name, value: val });
+                out.push(SecretMatch {
+                    typ: name,
+                    value: val,
+                });
             }
         }
     }
@@ -203,7 +268,8 @@ pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
 pub fn extract_pems(text: &str) -> Vec<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----").unwrap()
+        Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----")
+            .unwrap()
     });
     re.find_iter(text).map(|m| m.as_str().to_string()).collect()
 }
@@ -229,52 +295,177 @@ struct Rule {
 
 const RULES: &[Rule] = &[
     // ---- SECRET ----
-    Rule { group: "SECRET", typ: "AWS_KEY", pattern: r"AKIA[0-9A-Z]{16}", min_entropy: 0.0, require_digit: false },
-    Rule { group: "SECRET", typ: "AWS_SECRET", pattern: r"(?i)aws.{0,20}secret.{0,20}[a-z0-9/+=]{20,}", min_entropy: 2.0, require_digit: false },
-    Rule { group: "SECRET", typ: "GITHUB_TOKEN", pattern: r"gh[pousr]_[A-Za-z0-9]{36,}", min_entropy: 0.0, require_digit: false },
-    Rule { group: "SECRET", typ: "JWT", pattern: r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", min_entropy: 0.0, require_digit: false },
-    Rule { group: "SECRET", typ: "PRIVATE_KEY", pattern: r"-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----", min_entropy: 0.0, require_digit: false },
-    Rule { group: "SECRET", typ: "AZURE_KEY", pattern: r"(?i)azure.{0,20}(key|token|secret).{0,20}[a-z0-9]{20,}", min_entropy: 2.0, require_digit: false },
-    Rule { group: "SECRET", typ: "GCP_KEY", pattern: r"AIza[0-9A-Za-z_-]{35}", min_entropy: 0.0, require_digit: false },
-    Rule { group: "SECRET", typ: "GENERIC_SECRET", pattern: r"(?i)(password|passwd|secret|token|apikey|api_key)\s*[=:]\s*\S{6,}", min_entropy: 0.0, require_digit: false },
+    Rule {
+        group: "SECRET",
+        typ: "AWS_KEY",
+        pattern: r"AKIA[0-9A-Z]{16}",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "SECRET",
+        typ: "AWS_SECRET",
+        pattern: r"(?i)aws.{0,20}secret.{0,20}[a-z0-9/+=]{20,}",
+        min_entropy: 2.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "SECRET",
+        typ: "GITHUB_TOKEN",
+        pattern: r"gh[pousr]_[A-Za-z0-9]{36,}",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "SECRET",
+        typ: "JWT",
+        pattern: r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "SECRET",
+        typ: "PRIVATE_KEY",
+        pattern: r"-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "SECRET",
+        typ: "AZURE_KEY",
+        pattern: r"(?i)azure.{0,20}(key|token|secret).{0,20}[a-z0-9]{20,}",
+        min_entropy: 2.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "SECRET",
+        typ: "GCP_KEY",
+        pattern: r"AIza[0-9A-Za-z_-]{35}",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "SECRET",
+        typ: "GENERIC_SECRET",
+        pattern: r"(?i)(password|passwd|secret|token|apikey|api_key)\s*[=:]\s*\S{6,}",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
     // ---- NETWORK ----
-    Rule { group: "NETWORK", typ: "URL", pattern: r#"(?i)https?://[^\s"'<>]+"#, min_entropy: 0.0, require_digit: false },
-    Rule { group: "NETWORK", typ: "IPV4", pattern: r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b", min_entropy: 0.0, require_digit: false },
-    Rule { group: "NETWORK", typ: "DOMAIN", pattern: r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b", min_entropy: 0.0, require_digit: false },
-    Rule { group: "NETWORK", typ: "EMAIL", pattern: r"(?i)\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b", min_entropy: 0.0, require_digit: false },
+    Rule {
+        group: "NETWORK",
+        typ: "URL",
+        pattern: r#"(?i)https?://[^\s"'<>]+"#,
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "NETWORK",
+        typ: "IPV4",
+        pattern: r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "NETWORK",
+        typ: "DOMAIN",
+        pattern: r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "NETWORK",
+        typ: "EMAIL",
+        pattern: r"(?i)\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
     // ---- CRYPTO ----
-    Rule { group: "CRYPTO", typ: "BTC_ADDR", pattern: r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b", min_entropy: 0.0, require_digit: false },
-    Rule { group: "CRYPTO", typ: "ETH_ADDR", pattern: r"\b0x[a-fA-F0-9]{40}\b", min_entropy: 0.0, require_digit: false },
-    Rule { group: "CRYPTO", typ: "XMR_ADDR", pattern: r"\b4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}\b", min_entropy: 0.0, require_digit: false },
+    Rule {
+        group: "CRYPTO",
+        typ: "BTC_ADDR",
+        pattern: r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "CRYPTO",
+        typ: "ETH_ADDR",
+        pattern: r"\b0x[a-fA-F0-9]{40}\b",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "CRYPTO",
+        typ: "XMR_ADDR",
+        pattern: r"\b4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}\b",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
     // ---- MALWARE ----
-    Rule { group: "MALWARE", typ: "SUSPICIOUS_PATH", pattern: r"(?i)\\(temp|appdata|startup|public)\\", min_entropy: 0.0, require_digit: false },
-    Rule { group: "MALWARE", typ: "MUTEX", pattern: r"(?i)Global\\[A-Za-z0-9_-]{4,}", min_entropy: 0.0, require_digit: false },
-    Rule { group: "MALWARE", typ: "C2", pattern: r"(?i)(c2|gate\.php|/panel/|/admin/)", min_entropy: 0.0, require_digit: false },
+    Rule {
+        group: "MALWARE",
+        typ: "SUSPICIOUS_PATH",
+        pattern: r"(?i)\\(temp|appdata|startup|public)\\",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "MALWARE",
+        typ: "MUTEX",
+        pattern: r"(?i)Global\\[A-Za-z0-9_-]{4,}",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    Rule {
+        group: "MALWARE",
+        typ: "C2",
+        pattern: r"(?i)(c2|gate\.php|/panel/|/admin/)",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
     // ---- ENCODING ----
-    Rule { group: "ENCODING", typ: "BASE64", pattern: r"(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?", min_entropy: 2.5, require_digit: true },
+    Rule {
+        group: "ENCODING",
+        typ: "BASE64",
+        pattern: r"(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?",
+        min_entropy: 2.5,
+        require_digit: true,
+    },
 ];
 
 static COMPILED: OnceLock<Vec<(Rule, Regex)>> = OnceLock::new();
 
 fn compiled_rules() -> &'static Vec<(Rule, Regex)> {
     COMPILED.get_or_init(|| {
-        RULES.iter().map(|r| {
-            let re = Regex::new(r.pattern).unwrap_or_else(|_| Regex::new(r".^").unwrap());
-            (*r, re)
-        }).collect()
+        RULES
+            .iter()
+            .map(|r| {
+                let re = Regex::new(r.pattern).unwrap_or_else(|_| Regex::new(r".^").unwrap());
+                (*r, re)
+            })
+            .collect()
     })
 }
 
 /// Shannon entropy (bits/byte) for a string's bytes.
 pub fn entropy_of(text: &str) -> f64 {
-    if text.is_empty() { return 0.0; }
+    if text.is_empty() {
+        return 0.0;
+    }
     let mut counts = [0usize; 256];
-    for b in text.bytes() { counts[b as usize] += 1; }
+    for b in text.bytes() {
+        counts[b as usize] += 1;
+    }
     let len = text.len() as f64;
-    counts.iter().filter(|&&c| c != 0).map(|&c| {
-        let p = c as f64 / len;
-        -p * p.log2()
-    }).sum()
+    counts
+        .iter()
+        .filter(|&&c| c != 0)
+        .map(|&c| {
+            let p = c as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 /// Classify a single extracted string. Returns None if no rule matches.
@@ -290,15 +481,25 @@ pub fn classify(text: &str) -> Option<Classification> {
             if *name == "GENERIC_SECRET" {
                 // only classify if entropy reasonable? keep as-is
             }
-            return Some(Classification { group: "SECRET", typ: name });
+            return Some(Classification {
+                group: "SECRET",
+                typ: name,
+            });
         }
     }
     // existing rules...
     for (rule, re) in compiled_rules() {
         if re.is_match(text) {
-            if rule.min_entropy > 0.0 && e < rule.min_entropy { continue; }
-            if rule.require_digit && !text.bytes().any(|b| b.is_ascii_digit()) { continue; }
-            return Some(Classification { group: rule.group, typ: rule.typ });
+            if rule.min_entropy > 0.0 && e < rule.min_entropy {
+                continue;
+            }
+            if rule.require_digit && !text.bytes().any(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            return Some(Classification {
+                group: rule.group,
+                typ: rule.typ,
+            });
         }
     }
     None
@@ -334,7 +535,10 @@ mod tests {
     }
 
     fn detect_pairs(text: &str) -> Vec<(String, String)> {
-        detect_secrets(text).into_iter().map(|m| (m.typ.to_string(), m.value)).collect()
+        detect_secrets(text)
+            .into_iter()
+            .map(|m| (m.typ.to_string(), m.value))
+            .collect()
     }
 
     #[test]
@@ -371,24 +575,57 @@ mod tests {
             "pa\u{17F}\u{17F}word=abcdefgh1234",
         ];
         for text in samples {
-            assert_eq!(detect_pairs(text), detect_secrets_reference(text), "text: {text:?}");
+            assert_eq!(
+                detect_pairs(text),
+                detect_secrets_reference(text),
+                "text: {text:?}"
+            );
         }
         // pseudo-random mixes of anchors and noise
         let atoms = [
-            "AKIA", "ghp_", "sk-", "SK", "eyJ", ".", "=", ":", "token", "SECRET", "passwd",
-            "redis", "://", "SG.", "aws", "xoxb-", "Azure", "key", "ABCDEFGHIJKLMNOPQRST",
-            "0123456789abcdef0123456789abcdef", "-----BEGIN ", "PRIVATE KEY-----", " ", "x",
+            "AKIA",
+            "ghp_",
+            "sk-",
+            "SK",
+            "eyJ",
+            ".",
+            "=",
+            ":",
+            "token",
+            "SECRET",
+            "passwd",
+            "redis",
+            "://",
+            "SG.",
+            "aws",
+            "xoxb-",
+            "Azure",
+            "key",
+            "ABCDEFGHIJKLMNOPQRST",
+            "0123456789abcdef0123456789abcdef",
+            "-----BEGIN ",
+            "PRIVATE KEY-----",
+            " ",
+            "x",
         ];
         let mut state = 0x2545F4914F6CDD1Du64;
         for _ in 0..4000 {
             let mut text = String::new();
-            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
             let parts = 1 + (state % 7) as usize;
             for _ in 0..parts {
-                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
                 text.push_str(atoms[(state % atoms.len() as u64) as usize]);
             }
-            assert_eq!(detect_pairs(&text), detect_secrets_reference(&text), "text: {text:?}");
+            assert_eq!(
+                detect_pairs(&text),
+                detect_secrets_reference(&text),
+                "text: {text:?}"
+            );
         }
     }
 
@@ -399,10 +636,16 @@ mod tests {
         for (name, _) in SECRET_PATTERNS {
             let anchored = SECRET_ANCHORS.iter().any(|(n, _)| n == name);
             let gated = SECRET_MIN_LEN.iter().any(|(n, _)| n == name);
-            assert!(anchored || gated, "{name} has neither anchors nor a length gate");
+            assert!(
+                anchored || gated,
+                "{name} has neither anchors nor a length gate"
+            );
         }
         for (name, _) in SECRET_ANCHORS {
-            assert!(SECRET_PATTERNS.iter().any(|(n, _)| n == name), "stale anchor entry {name}");
+            assert!(
+                SECRET_PATTERNS.iter().any(|(n, _)| n == name),
+                "stale anchor entry {name}"
+            );
         }
     }
 

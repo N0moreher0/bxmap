@@ -25,10 +25,10 @@ Chi phí thấp, hiệu quả cao nhất. Làm trước khi thêm tính năng.
 
 ### 1.3 Release và chuỗi cung ứng
 - [x] Chuyển từ "mỗi push `main` ra release" sang **release theo tag semver**; push `main` chỉ build artifact CI (nightly).
-- [x] Sinh `SHA256SUMS` cho mọi binary (cosign/minisign còn để làm sau).
+- [x] Sinh `SHA256SUMS` cho mọi binary; ký bằng cosign/minisign còn làm thêm.
 - [ ] Xuất SBOM (`cargo-cyclonedx`) kèm release.
 - [ ] Chuyển `sample_demo.dmp` ra khỏi git history sang release asset hoặc Git LFS.
-- [x] Job CI kiểm tra **MSRV** cho bản `lite` (1.70); bản `full` kiểm tra qua stable.
+- [x] Job CI kiểm tra **MSRV** cho bản `lite` (1.70); bản `full` dùng stable.
 
 ---
 
@@ -39,16 +39,30 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 ### 2.1 Fuzzing và hardening
 - [ ] `cargo-fuzz` cho: parser minidump, parser `.vmss`, reader chunk/overlap, các detector regex.
 - [ ] Giới hạn cấp phát: header khai báo số stream/region/size quá lớn không được gây OOM.
-- [x] Kiểm tra bounds, tránh `unwrap`/panic trên đường parse (minidump + VMware hardening + mini-fuzz no-panic); dump cắt cụt/hỏng trả lỗi rõ ràng, không crash.
+- [~] Kiểm tra bounds, tránh `unwrap`/panic trên đường parse (minidump + VMware hardened + mini-fuzz no-panic); vẫn tiếp tục các parser khác.
 - [ ] Chạy `clippy -D warnings`, `cargo audit`, `cargo deny` trong CI.
 
 ### 2.2 Bộ test
-- [~] Unit test cho từng encoding (ASCII, UTF-16LE/BE; Unicode UTF-32 boundary handling còn xử lý tiếp), gồm chuỗi nằm **vắt ngang ranh giới chunk**.
+- [ ] Unit test cho từng encoding (ASCII, UTF-16LE/BE, UTF-32LE/BE), gồm chuỗi nằm **vắt ngang ranh giới chunk** và ngang ranh giới region song song.
 - [ ] Test đảm bảo kết quả song song == kết quả tuần tự (cùng tập, cùng thứ tự theo offset).
 - [ ] Golden test cho output `text`, `json`, `json-tree`.
 - [ ] Bộ dump mẫu nhỏ, tổng hợp (không chứa dữ liệu thật) cho test hồi quy.
 
 **Xong khi:** CI chạy fuzz smoke test mỗi PR và không còn panic đã biết.
+
+---
+
+## Phase 2.5 — Bug đã xác nhận từ test thực tế (MemLabs Lab 6) · P0
+
+Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối chiếu byte thật trong dump.
+
+- [x] **Trùng UTF-16LE/BE.** Đã suppress bản BE mirror khi cùng nội dung và offset lệch 1 byte.
+- [x] **Chuỗi chứa xuống dòng bị in nguyên**: output text escape control chars (\n, \r, \t, ...) thành một dòng.
+- [x] **Chuỗi quá dài**: thêm `--max-str-len` để cắt output.
+- [ ] Test hồi quy: dump mẫu có text ASCII-in-UTF-16 để chắc chắn bug LE/BE không quay lại.
+- [ ] **Auto-stop ESLint-like?** Khi scan binary lớn, tự chia output nếu string quá dài theo `--max-str-len` và báo thống kê số chuỗi đã cắt (để phân tích hiệu năng).
+
+**Xong khi:** quét lại Lab 6 không còn cặp LE/BE trùng và mỗi chuỗi tối đa một dòng output.
 
 ---
 
@@ -84,6 +98,12 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 - [ ] Dùng `RegexSet` / aho-corasick làm prefilter để 30+ pattern không làm chậm quét.
 - [ ] Cho phép chọn nhiều loại: `--detect ip,url,secret`.
 - [ ] Nạp pattern tùy chỉnh từ file (`--detect-rules`).
+- [ ] **Giảm false positive của generic secret** (thấy rõ trên Lab 6): `Token: GetTokenInformation`, `Token: Malloc`, `Token:DigiCert`, `Password: false,`, `ApiKey=function(a){...}`. Yêu cầu giá trị trông giống secret (entropy, độ dài, không phải identifier/từ tiếng Anh/`true`/`false`/mã JS).
+- [ ] Loại hoặc hạ điểm các mẫu biết trước là không phải secret: `publicKeyToken="..."` trong manifest assembly (`6595b64144ccf1df`, `31bf3856ad364e35`, `1122334455667788`).
+- [ ] **Phân loại key công khai phía client**: `AIza...` trong request trình duyệt (vd. tới `*.clients6.google.com`) gắn nhãn `public-client-key`, confidence thấp; khác với secret phía server/người dùng.
+- [ ] **Output có cấu trúc cho mọi finding:** thêm `rule` (vd. `google_api_key`, `generic_password`), `confidence`/`severity`, và `context` (vài chục byte quanh match). Hiện `--detect secret` chỉ có `offset`, `encoding`, `text`.
+- [ ] **Nhận diện khối biến môi trường** (`NAME=value\0NAME=value\0` trong UTF-16): `password=`/`key=` trong env block xếp ưu tiên cao (case thật: `RAR password=easypeasyvirus` trong dump Lab 6).
+- [ ] `--dedupe` mặc định cho detector: cùng một key lặp nhiều lần chỉ hiện một dòng kèm `count` và danh sách offset.
 
 ---
 
@@ -110,8 +130,23 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 - [ ] ELF core dump, LiME, `hiberfil.sys`.
 - [ ] Mở rộng `.vmss`/`.vmem`: ánh xạ địa chỉ vật lý, thêm các định dạng VM snapshot khác.
 - [ ] Ánh xạ VA → module/section/export cho thêm kiến trúc; hiển thị cây tiến trình đầy đủ hơn.
+- [ ] **`--magic-bytes` mở rộng:** RAR4/RAR5 (`Rar!\x1a\x07\x00` / `...\x01\x00`), 7z, GZIP, JPEG, SQLite, ngoài PE/ELF/ZIP/PDF/PNG hiện có.
+- [ ] **Carving cơ bản (`--carve <type> --out-dir`)**: cắt file theo chữ ký ra đĩa (RAR, ZIP, PNG, JPEG...) để phân tích tiếp (Lab 6 có 6 chữ ký RAR trong dump).
 - [ ] Xuất báo cáo HTML/Markdown tự đóng gói cho case management.
 - [ ] Binding Python (PyO3) để dùng trong notebook và pipeline.
+
+---
+
+## Phase 7 — Chứng minh giá trị (demo & benchmark) · P1
+
+Mục tiêu: có vài case thật cho thấy bxmap tìm ra thứ có ý nghĩa nhanh hơn `strings | grep`.
+
+- [ ] Bộ demo MemLabs (Lab 1, 2, 6): mỗi lab một mục "đáp án nói cần tìm X → `strings` ra N dòng → bxmap ra X trong M dòng", kèm thời gian và RAM.
+- [ ] Case Lab 6: bxmap `--detect` bắt `RAR password=...` trong env block (UTF-16) → dẫn tới file RAR; ghi rõ bước còn lại (carve RAR, mở bằng mật khẩu).
+- [ ] Trình bày trung thực: so sánh công bằng với `strings -el | grep`, nêu rõ điểm thắng là một lần quét đủ encoding + phân loại + tốc độ, không phải "chỉ bxmap tìm được".
+- [ ] Một bài viết ngắn kể case + GIF/asciinema ở đầu README; đăng r/computerforensics, r/netsec, Show HN, This Week in Rust.
+- [ ] Thêm một dump `.DMP` tự tạo trong VM để demo `--map-va`, `--rwx-only`, `--heap-only` (MemLabs là `.raw`, không dùng được các cờ này).
+- [ ] Redact mọi credential thật trước khi đăng ảnh/bài.
 
 ---
 
@@ -119,7 +154,7 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 
 | Mốc | Nội dung | Điều kiện |
 |-----|----------|-----------|
-| **0.10** | Phase 1 + 2 | README khớp code, CI có fuzz + MSRV, release theo tag có checksum |
+| **0.10** | Phase 1 + 2 + 2.5 | README khớp code, CI có fuzz + MSRV, release theo tag có checksum |
 | **0.11** | Phase 3 | Có benchmark công khai, XOR chạy song song |
 | **0.12** | Phase 4 | Detector có validate, dedupe, entropy gọn |
 | **0.13** | Phase 5 | Encoding enum, NDJSON/CSV, completions |
@@ -132,11 +167,12 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 
 1. Sửa README + quyết định giấy phép
 2. Release theo tag + checksum
-3. Fuzz parser + test chunk boundary
+3. Sửa bug LE/BE trùng + chuỗi nhiều dòng, fuzz parser, test chunk boundary
 4. Benchmark + tối ưu XOR
-5. Validate detector + dedupe
+5. Giảm false positive secret + dedupe + trường `rule`/`confidence`/`context`
 6. Enum encoding + NDJSON/CSV
-7. Định dạng mới
+7. Demo MemLabs + bài viết
+8. Định dạng mới, carving
 
 ## Ngoài phạm vi (cố ý không làm)
 
