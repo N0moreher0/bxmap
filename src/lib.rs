@@ -717,8 +717,6 @@ impl<'a> StringRunScanner<'a> {
                             }
                         }
                     }
-                } else if self.u32le_start >= 0 {
-                    self.flush_u32le();
                 }
             } else if self.u32le_start >= 0 {
                 self.u32le_start = -1;
@@ -749,8 +747,6 @@ impl<'a> StringRunScanner<'a> {
                             }
                         }
                     }
-                } else if self.u32be_start >= 0 {
-                    self.flush_u32be();
                 }
             } else if self.u32be_start >= 0 {
                 self.u32be_start = -1;
