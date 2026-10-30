@@ -51,7 +51,9 @@
 //! negatives (missing real strings), staying true to the "only filter
 //! what's certainly noise" spirit.
 pub mod artifacts;
+pub mod chunk;
 pub mod classifier;
+pub mod magic;
 pub mod minidump;
 pub mod vmware;
 

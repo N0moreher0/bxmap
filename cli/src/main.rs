@@ -891,48 +891,18 @@ struct MagicMatch {
     kind: &'static str,
 }
 
+/// Cap on reported magic-byte hits; dumps can contain millions of `MZ` bytes.
+const MAX_MAGIC_MATCHES: usize = 256;
+
 fn scan_magic_bytes(path: &str) -> io::Result<Vec<MagicMatch>> {
-    let mut reader = BufReader::with_capacity(1 << 16, File::open(path)?);
-    let signatures: &[(&[u8], &str)] = &[
-        (b"MZ", "PE/DOS executable"),
-        (b"\x7fELF", "ELF executable"),
-        (b"PK\x03\x04", "ZIP/Office archive"),
-        (b"%PDF-", "PDF document"),
-        (b"\x89PNG\r\n\x1a\n", "PNG image"),
-    ];
-    let mut matches = Vec::new();
-    let mut buffer = Vec::with_capacity((1 << 16) + 16);
-    let mut chunk = vec![0u8; 1 << 16];
-    let mut offset = 0u64;
-    loop {
-        let previous = buffer.len().min(16);
-        if buffer.len() > previous {
-            buffer.drain(..buffer.len() - previous);
-        }
-        let start = offset.saturating_sub(previous as u64);
-        let read = reader.read(&mut chunk)?;
-        buffer.extend_from_slice(&chunk[..read]);
-        for (signature, kind) in signatures {
-            for (index, window) in buffer.windows(signature.len()).enumerate() {
-                if index + signature.len() > previous && window == *signature {
-                    matches.push(MagicMatch {
-                        offset: start + index as u64,
-                        kind,
-                    });
-                    if matches.len() >= 256 {
-                        matches.sort_by_key(|item| item.offset);
-                        return Ok(matches);
-                    }
-                }
-            }
-        }
-        offset += read as u64;
-        if read == 0 {
-            break;
-        }
-    }
-    matches.sort_by_key(|item| item.offset);
-    Ok(matches)
+    let matches = bxmap::magic::scan_file(path, MAX_MAGIC_MATCHES)?;
+    Ok(matches
+        .into_iter()
+        .map(|found| MagicMatch {
+            offset: found.offset,
+            kind: found.kind(),
+        })
+        .collect())
 }
 
 /// Separator written before a JSON record, plus the record's indent and the

@@ -189,6 +189,9 @@ fn main() -> std::io::Result<()> {
 | `extract_strings_from_file_parallel` | Opt-in parallel file scan |
 | `scan_yara_from_reader_streaming` | Stream bytes through compiled YARA rules |
 | `scan_yara_from_file_streaming` | Compile a rule file and scan a dump |
+| `magic::scan_file` | Find file-header signatures (`SIGNATURES`) with a bounded result |
+| `chunk::for_each_chunk` | Stream any file in overlapping windows with absolute offsets |
+| `artifacts::ArtifactCollector` | Turn extracted strings into deduped path/env/URL/e-mail/registry/tool artifacts |
 | `NoiseConfig` | Configure or disable repeat-pattern filtering |
 
 Every result is an `ExtractedString`:

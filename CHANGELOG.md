@@ -89,8 +89,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   encoding, the scanned byte range (percentage of the requested window and of
   the file), whether `--max-strings` stopped the scan, and the top artifacts
   collected by `--extract`. `--report none` restores the compact summary.
+- New `bxmap::magic` module: `SIGNATURES` (PE/ELF/ZIP/PDF/PNG headers),
+  `MagicMatch` and `scan_file(path, max_matches)`. The table is the single
+  source of truth for header detection and will be reused by `--carve`.
+- New `bxmap::chunk` module: `for_each_chunk(path, chunk_size, overlap, ..)`
+  hands out windows with absolute offsets plus the overlap prefix length, so
+  signature scanners skip re-reported hits instead of duplicating the carry
+  bookkeeping.
 
 ### Changed
+- `--magic-bytes` now runs through `bxmap::magic` (Aho-Corasick over the shared
+  signature table) instead of a hand-rolled `windows()` scan in the CLI. Same
+  output, no per-signature pass over each chunk.
 - `apply_detectors` allocates output capacity up front and clones lazily.
 - Flat detector output (`--detect-format flat`, default) is unchanged.
 - `--start`/`--end` force the sequential streaming scanner even when
