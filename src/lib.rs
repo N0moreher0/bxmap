@@ -1352,12 +1352,45 @@ pub fn extract_strings_from_file_streaming_range_with_encodings<F: FnMut(Extract
     max_strings: usize,
     noise_cfg: NoiseConfig,
     encodings: EncodingFilter,
+    on_found: F,
+) -> std::io::Result<usize> {
+    extract_strings_from_file_streaming_range_with_encodings_progress(
+        dump_path,
+        start,
+        end,
+        min_len,
+        max_strings,
+        noise_cfg,
+        encodings,
+        on_found,
+        |_| {},
+    )
+}
+
+/// Same as [`extract_strings_from_file_streaming_range_with_encodings`], but
+/// also calls `on_progress(absolute_offset)` after every chunk so callers can
+/// render a progress bar. The callback runs on the scanning thread; keep it
+/// cheap or throttle it.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_strings_from_file_streaming_range_with_encodings_progress<
+    F: FnMut(ExtractedString),
+    P: FnMut(u64),
+>(
+    dump_path: &str,
+    start: u64,
+    end: u64,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
     mut on_found: F,
+    mut on_progress: P,
 ) -> std::io::Result<usize> {
     let file_len = std::fs::metadata(dump_path)?.len();
     let start = start.min(file_len);
     let end = end.min(file_len).max(start);
     if start >= end {
+        on_progress(end);
         return Ok(0);
     }
     let overlap = MAX_RUN_CHARS as u64;
@@ -1400,6 +1433,7 @@ pub fn extract_strings_from_file_streaming_range_with_encodings<F: FnMut(Extract
         if is_last_chunk {
             scanner.feed(&buffer, 0, len, len, global_base);
             scanner.flush_all();
+            on_progress(global_base + len as u64);
             break;
         }
 
@@ -1407,6 +1441,7 @@ pub fn extract_strings_from_file_streaming_range_with_encodings<F: FnMut(Extract
         buffer[0] = buffer[len - 1];
         carry_len = 1;
         global_base += (len - 1) as u64;
+        on_progress(global_base);
     }
 
     Ok(emitted.get())
