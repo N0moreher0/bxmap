@@ -39,7 +39,7 @@ Chi phí thấp, hiệu quả cao nhất. Làm trước khi thêm tính năng.
 Dump đến từ máy nhiễm mã độc, parser phải chịu được input thù địch.
 
 ### 2.1 Fuzzing và hardening
-- [ ] `cargo-fuzz` cho: parser minidump, parser `.vmss`, reader chunk/overlap, các detector regex, **validator carve (Phase 8)**.
+- [x] `cargo-fuzz` cho: parser minidump, parser `.vmss` (VmwareState), reader chunk/overlap, magic-byte scanner, entropy scanner, artifact collector, **validator carve** (tất cả 10 validators).
 - [ ] Giới hạn cấp phát: header khai báo số stream/region/size quá lớn không được gây OOM.
 - [~] Kiểm tra bounds, tránh `unwrap`/panic trên đường parse (minidump + VMware hardened + mini-fuzz no-panic); vẫn tiếp tục các parser khác.
 - [ ] Chạy `clippy -D warnings`, `cargo audit`, `cargo deny` trong CI.
