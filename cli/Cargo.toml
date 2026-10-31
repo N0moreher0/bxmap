@@ -22,6 +22,7 @@ yara = ["bxmap/yara"]
 [dependencies]
 bxmap = { version = "1.0.4", path = "..", default-features = false }
 flate2 = "1"
+memchr = "2"
 rayon = "1"
 regex = "1"
 

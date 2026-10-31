@@ -72,20 +72,21 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 
 ## Phase 3 — Hiệu năng · P1
 
-- [ ] Thêm benchmark `criterion` + script benchmark end-to-end (GB/s, RAM đỉnh) trên dump mẫu.
-- [ ] So sánh công khai với `strings`, FLOSS, bstrings; đưa bảng số liệu vào README (kèm máy và dữ liệu đo).
-- [ ] Tối ưu đường quét: `memchr`/SIMD cho ASCII, thử mmap cho file lớn, tránh cấp phát từng chuỗi nhỏ.
-- [ ] **`--brute-xor`:**
-  - [ ] Song song hóa bằng rayon (hiện chưa).
-  - [ ] Known-plaintext crib (`MZ`, `This program cannot be run`, `http`, `.dll`) để loại key sớm, không chấm điểm đầy đủ.
-  - [ ] Phát hiện key 1 byte bằng phân bố tần suất thay vì thử toàn bộ.
-  - [ ] Cảnh báo/ước lượng thời gian khi dùng key 3 byte (16.777.216 key mỗi candidate).
-- [ ] `--auto-tune` mở rộng sang các stage khác (XOR, detector), không chỉ worker trích chuỗi.
-- [ ] **Không "đứng" khi `--max-strings` lớn** (user báo cáo): stream kết quả ra output ngay cả ở chế độ song song thay vì gom hết vào RAM rồi sắp xếp (kiểm chứng bằng đo RAM đỉnh).
-- [~] `--max-strings 0` = không giới hạn (đi kèm stream), và `--max-memory` để đặt trần RAM. (`--max-strings 0` đã xong; `--max-memory` chưa.)
+- [x] Thêm benchmark `criterion` + script benchmark end-to-end (GB/s, RAM đỉnh) trên dump mẫu. `benches/extract.rs` (quét trong RAM, MiB/s) và `bench/bench.py` (wall time + peak RSS trên corpus 256 MiB, so sánh được với `strings`).
+- [~] So sánh công khai với `strings`, FLOSS, bstrings; đưa bảng số liệu vào README (kèm máy và dữ liệu đo). Đã có bảng bxmap vs `strings -a -el -n 4` (cùng corpus, best-of-3) trong README, kèm ghi chú trung thực về chênh lệch output; FLOSS/bstrings chưa cài trên máy đo nên chưa có số.
+- [~] Tối ưu đường quét: `memchr`/SIMD cho ASCII, thử mmap cho file lớn, tránh cấp phát từng chuỗi nhỏ. Đã dùng `memchr` cho việc tách candidate `--brute-xor` (bỏ đọc từng byte), thêm prefilter byte cho `--extract all` (nhanh ~2,4x), giảm `PARALLEL_CHUNK_SIZE` 64→16 MiB (peak RSS 358→142 MB). Scanner ASCII đã có fast-skip 8 byte sẵn; mmap/SIMD thật vẫn chưa.
+- [x] **`--brute-xor`:**
+  - [x] Song song hóa bằng rayon — mỗi key là một task, gộp top-N theo thread, tái dùng buffer plaintext (không cấp phát mỗi key).
+  - [x] Known-plaintext crib (`MZ`, `This program cannot be run`, `http`, `.dll`, `PK`, `<?xml`, `SELECT`) cộng điểm + prefilter 96 byte để loại key sớm.
+  - [x] Phát hiện key 1 byte bằng phân bố tần suất thay vì thử toàn bộ. Key 1–2 byte vẫn duyệt đủ (256/65.536 key, rẻ); key ≥ 3 byte dùng tần suất: top-3 byte mỗi cột × 6 byte plaintext phổ biến → 5.832 key thay vì 16,7 triệu.
+  - [x] Cảnh báo/ước lượng thời gian khi dùng key 3 byte — in số key sẽ thử; `--xor-exhaustive` in ước lượng byte-ops trước khi chạy hết không gian.
+- [ ] `--auto-tune` mở rộng sang các stage khác (XOR, detector), không chỉ worker trích chuỗi. (XOR giờ tự chạy song song trên pool rayon hiện có, nên `--threads`/`--auto-tune` cũng ảnh hưởng, nhưng chưa có tuning riêng.)
+- [x] **Không "đứng" khi `--max-strings` lớn**: thêm `extract_strings_from_file_parallel_streaming_with_encodings(_progress)` — quét song song theo cửa sổ `threads` region, phát kết quả tăng dần theo offset rồi bỏ, RAM không tăng theo số match. CLI dùng đường này cho mọi `--threads > 1` khi không cần `json-tree`/`--dedupe`.
+- [~] `--max-strings 0` = không giới hạn (đi kèm stream), và `--max-memory` để đặt trần RAM. (`--max-strings 0` đã xong; `--max-memory` chưa — peak RAM giờ đã bị chặn bởi `threads * 16 MiB` + kết quả một cửa sổ.)
 - [x] **Thanh tiến độ trên stderr:** offset hiện tại, % dump, tốc độ MB/s, số kết quả — để người dùng biết tool đang chạy hay treo (in terminal có ảnh nền/nhiều dòng rất chậm, dễ nhầm là treo). Đã có `--progress` / `--no-progress`; tự bật khi stderr là terminal và kết quả không in ra terminal. Cập nhật tối đa 5 lần/giây qua API `extract_strings_from_file_streaming_range_with_encodings_progress`.
 - [x] `--start <offset>` / `--end <offset>` để quét một khoảng và chia việc cho nhiều tiến trình; tài liệu hóa cách chia khối có gối nhau (overlap) để không cắt đôi chuỗi. Đã có API `extract_strings_from_file_streaming_range_with_encodings` (đọc thêm `MAX_RUN_CHARS` mỗi phía, chỉ phát chuỗi bắt đầu trong `[start, end)`) và cờ CLI nhận số thập phân hoặc `0x` hex.
-- [ ] Cảnh báo/gợi ý khi stdout là terminal với lượng kết quả rất lớn ("hãy dùng `-o file`").
+- [x] Cảnh báo/gợi ý khi stdout là terminal với lượng kết quả rất lớn ("hãy dùng `-o file`"): in gợi ý khi > 10.000 kết quả và không có `-o`.
+- [x] Sửa số liệu sai: `throughput` trong `--report summary` giờ tính trên số byte thực sự đã quét (trước đây chia cả file size cho thời gian ngắn khi bị `--max-strings` cắt → báo 400 MiB/s sau khi quét 0,1%).
 
 ---
 

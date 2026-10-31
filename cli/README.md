@@ -56,6 +56,14 @@ bxmap --help
 - `--detect-format <flat|rich>` — `rich` keeps the original text and adds
   `rule`, `confidence`, `severity` and `context` to every finding.
 - `--auto-tune` — choose a worker count for this machine.
+- `--threads <N>` — fixed worker count. With `N > 1` the scan runs in parallel
+  *and still streams*: each window of regions is scanned in parallel, emitted
+  in ascending offset order, then dropped, so peak RAM stays bounded by
+  `threads * 16 MiB` plus the results of the window instead of growing with
+  the number of matches.
+- `--xor-exhaustive` — with `--brute-xor 3b`, enumerate all 16,777,216 keys
+  instead of the default frequency-guided search. Prints a byte-op estimate
+  first; expect minutes on a large dump.
 - `--compact` — minify `json`/`json-tree` output: one line, no indentation.
   Handy for large exports and for piping into other tools.
 - `--extract <list>` — also emit deduped artifacts collected from the
@@ -97,6 +105,16 @@ bxmap --help
   `data_truncated: true` in JSON and `data_truncated=1` in text.
 - `--entropy-no-data` — with `--entropy`, omit the `data_hex` payload and keep
   only `offset`, `length` and `entropy`.
+
+## Reporting notes
+
+The `throughput` line in `--report summary` is computed over the bytes that
+were actually scanned. A run stopped by `--max-strings` therefore reports the
+real rate for the small prefix it read, instead of dividing the whole file size
+by a short elapsed time and printing an inflated number.
+
+When more than 10,000 results are about to be printed to a terminal (no `-o`),
+the CLI adds a hint to write them to a file instead.
 
 ## Exit codes
 

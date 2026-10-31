@@ -1,5 +1,6 @@
 use bxmap::{
     artifacts::{Artifact, ArtifactCollector, ArtifactKinds},
+    extract_strings_from_file_parallel_streaming_with_encodings_progress,
     extract_strings_from_file_parallel_with_encodings,
     extract_strings_from_file_streaming_range_with_encodings,
     extract_strings_from_file_streaming_range_with_encodings_progress,
@@ -359,6 +360,7 @@ struct Args {
     entropy_max_data: Option<usize>,
     yar: Option<String>,
     brute_xor: Option<Vec<usize>>,
+    xor_exhaustive: bool,
     parse_pid: bool,
     stats: bool,
     filter_regex: Option<String>,
@@ -466,6 +468,9 @@ OPTIONS:
     --yar <PATH>         Compile and match a YARA/YARA-X rule file while streaming
     --brute-xor <1b;2b;3b>
                           Brute-force XOR candidates using selected key sizes
+                          (parallel; 3-byte keys use a frequency-guided search)
+    --xor-exhaustive      With --brute-xor 3b: enumerate all 16,777,216 keys
+                          instead of the frequency-guided search (slow)
     --parse-pid          Map PID markers in extracted strings
     --detect <list>       Detect IOCs: ip, url, domain, b64, secret, all (comma-separated)
     --detect-format <flat|rich>
@@ -536,6 +541,7 @@ fn parse_args() -> Result<Args, String> {
         entropy_max_data: None,
         yar: None,
         brute_xor: None,
+        xor_exhaustive: false,
         parse_pid: false,
         stats: false,
         filter_regex: None,
@@ -684,6 +690,7 @@ fn parse_args() -> Result<Args, String> {
                 args.brute_xor = Some(sizes);
             }
             "--parse-pid" => args.parse_pid = true,
+            "--xor-exhaustive" => args.xor_exhaustive = true,
             "--stats" => args.stats = true,
             "--filter-regex" => args.filter_regex = Some(next(&mut i)?),
             "--magic-bytes" => args.magic_bytes = true,
@@ -1433,73 +1440,310 @@ fn xor_printable_score(data: &[u8]) -> f64 {
     score
 }
 
-fn xor_top_results(candidate: &[u8], offset: u64, key_size: usize) -> Vec<XorResult> {
-    let key_count = 1usize << (key_size * 8);
-    let mut top = Vec::with_capacity(MAX_XOR_RESULTS_PER_CANDIDATE);
-    for value in 0..key_count {
-        let mut key = vec![0u8; key_size];
-        for (index, byte) in key.iter_mut().enumerate() {
-            *byte = ((value >> (index * 8)) & 0xff) as u8;
-        }
-        let plaintext: Vec<u8> = candidate
-            .iter()
-            .enumerate()
-            .map(|(index, &byte)| byte ^ key[index % key_size])
-            .collect();
-        let result = XorResult {
-            offset,
-            key,
-            score: xor_printable_score(&plaintext),
-            plaintext,
-        };
-        if result.score == 0.0 {
-            continue;
-        }
-        let position = top
-            .iter()
-            .position(|item: &XorResult| result.score > item.score)
-            .unwrap_or(top.len());
-        top.insert(position, result);
-        if top.len() > MAX_XOR_RESULTS_PER_CANDIDATE {
-            top.pop();
-        }
-    }
-    top
+/// Known-plaintext cribs. A decrypted candidate containing one of these is
+/// far more likely to be real code/text than random printable junk, so a hit
+/// boosts the score and lets a wrong key be dropped early.
+const XOR_CRIBS: [&[u8]; 8] = [
+    b"MZ",
+    b"This program cannot be run",
+    b"http://",
+    b"https://",
+    b".dll",
+    b"PK\x03\x04",
+    b"<?xml",
+    b"SELECT ",
+];
+
+/// How many of the most frequent ciphertext bytes per key position are tried
+/// when the key space is too large to enumerate (key size >= 3), each XORed
+/// with the plaintext bytes that usually dominate a column of real text.
+const XOR_TOP_CIPHER_BYTES: usize = 3;
+/// Plaintext bytes that tend to be the most common in a column of real text:
+/// space, NUL (binary/UTF-16 padding), and the usual English letters.
+const XOR_COMMON_PLAINTEXT: [u8; 6] = [b' ', 0x00, b'e', b't', b'a', b'o'];
+/// How many keys a frequency-guided search may try per candidate.
+const XOR_MAX_KEYS: usize = 65_536;
+/// How many leading decrypted bytes the cheap rejection pass looks at.
+const XOR_PREFILTER_BYTES: usize = 96;
+
+fn xor_crib_score(data: &[u8]) -> f64 {
+    XOR_CRIBS
+        .iter()
+        .filter(|crib| data.windows(crib.len()).any(|window| window == **crib))
+        .count() as f64
+        * 0.3
 }
 
+/// Cheap first pass: if the first `XOR_PREFILTER_BYTES` decrypted bytes are
+/// mostly non-printable, the key is wrong -- skip decrypting the rest.
+fn xor_prefilter_ok(candidate: &[u8], key: &[u8]) -> bool {
+    let len = candidate.len().min(XOR_PREFILTER_BYTES);
+    if len == 0 {
+        return false;
+    }
+    let mut printable = 0usize;
+    for (index, &byte) in candidate[..len].iter().enumerate() {
+        let plain = byte ^ key[index % key.len()];
+        if (32..=126).contains(&plain) || plain == b'\t' || plain == b'\n' || plain == b'\r' {
+            printable += 1;
+        }
+    }
+    printable * 100 >= len * 60
+}
+
+/// Score one key against a candidate, reusing `plain` as scratch space so the
+/// hot loop allocates nothing.
+fn xor_score_key(candidate: &[u8], key: &[u8], plain: &mut Vec<u8>) -> f64 {
+    if !xor_prefilter_ok(candidate, key) {
+        return 0.0;
+    }
+    plain.clear();
+    plain.reserve(candidate.len());
+    for (index, &byte) in candidate.iter().enumerate() {
+        plain.push(byte ^ key[index % key.len()]);
+    }
+    let mut score = xor_printable_score(plain);
+    if score > 0.0 {
+        score += xor_crib_score(plain);
+    }
+    score
+}
+
+/// Per-thread accumulator: keeps the best `MAX_XOR_RESULTS_PER_CANDIDATE`
+/// results plus a reusable plaintext buffer.
+struct XorTop {
+    top: Vec<XorResult>,
+    plain: Vec<u8>,
+}
+
+impl XorTop {
+    fn new(len: usize) -> Self {
+        Self {
+            top: Vec::with_capacity(MAX_XOR_RESULTS_PER_CANDIDATE + 1),
+            plain: Vec::with_capacity(len),
+        }
+    }
+
+    fn offer(&mut self, candidate: &[u8], offset: u64, key: &[u8]) {
+        let score = xor_score_key(candidate, key, &mut self.plain);
+        if score == 0.0 {
+            return;
+        }
+        let position = self
+            .top
+            .iter()
+            .position(|item| score > item.score)
+            .unwrap_or(self.top.len());
+        if position >= MAX_XOR_RESULTS_PER_CANDIDATE {
+            return;
+        }
+        self.top.insert(
+            position,
+            XorResult {
+                offset,
+                key: key.to_vec(),
+                plaintext: self.plain.clone(),
+                score,
+            },
+        );
+        self.top.truncate(MAX_XOR_RESULTS_PER_CANDIDATE);
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        for item in other.top {
+            let position = self
+                .top
+                .iter()
+                .position(|existing| item.score > existing.score)
+                .unwrap_or(self.top.len());
+            if position >= MAX_XOR_RESULTS_PER_CANDIDATE {
+                continue;
+            }
+            self.top.insert(position, item);
+            self.top.truncate(MAX_XOR_RESULTS_PER_CANDIDATE);
+        }
+        self
+    }
+}
+
+/// Frequency-guided key search for key spaces too large to enumerate.
+///
+/// A repeating XOR only shifts the plaintext byte distribution per key
+/// position, so the most frequent ciphertext byte in a column is
+/// `key_byte ^ (most frequent plaintext byte)`. For each position we take the
+/// few most common ciphertext bytes, XOR them with the plaintext bytes that
+/// usually dominate real text, and try every combination. A 3-byte key drops
+/// from 16,777,216 keys to a few thousand, which stays interactive.
+fn frequency_guided_keys(
+    candidate: &[u8],
+    key_size: usize,
+    top_cipher_bytes: usize,
+) -> Vec<Vec<u8>> {
+    let mut columns: Vec<Vec<u8>> = Vec::with_capacity(key_size);
+    for position in 0..key_size {
+        let mut counts = [0usize; 256];
+        for &byte in candidate.iter().skip(position).step_by(key_size) {
+            counts[byte as usize] += 1;
+        }
+        let mut ranked: Vec<(u8, usize)> = counts
+            .iter()
+            .enumerate()
+            .filter(|(_, &count)| count != 0)
+            .map(|(byte, &count)| (byte as u8, count))
+            .collect();
+        ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        ranked.truncate(top_cipher_bytes);
+        if ranked.is_empty() {
+            ranked.push((0, 0));
+        }
+        let mut guesses: Vec<u8> = Vec::new();
+        for &(cipher, _) in &ranked {
+            for &plain in &XOR_COMMON_PLAINTEXT {
+                let guess = cipher ^ plain;
+                if !guesses.contains(&guess) {
+                    guesses.push(guess);
+                }
+            }
+        }
+        columns.push(guesses);
+    }
+
+    let mut keys: Vec<Vec<u8>> = vec![Vec::with_capacity(key_size)];
+    for column in &columns {
+        let mut next = Vec::new();
+        for prefix in &keys {
+            for &byte in column {
+                let mut key = prefix.clone();
+                key.push(byte);
+                next.push(key);
+                if next.len() >= XOR_MAX_KEYS {
+                    break;
+                }
+            }
+            if next.len() >= XOR_MAX_KEYS {
+                break;
+            }
+        }
+        keys = next;
+    }
+    keys
+}
+
+/// Best `MAX_XOR_RESULTS_PER_CANDIDATE` keys for one candidate.
+///
+/// Keys are scored in parallel across the rayon pool. 1- and 2-byte keys are
+/// enumerated exhaustively (256 / 65,536 keys); larger key spaces default to
+/// the frequency-guided search unless `exhaustive` is set.
+fn xor_top_results(
+    candidate: &[u8],
+    offset: u64,
+    key_size: usize,
+    exhaustive: bool,
+) -> Vec<XorResult> {
+    use rayon::prelude::*;
+
+    let empty = || XorTop::new(candidate.len());
+    if exhaustive || key_size <= 2 {
+        let key_count = 1usize << (key_size * 8);
+        (0..key_count)
+            .into_par_iter()
+            .fold(empty, |mut acc, value| {
+                let mut key = [0u8; 3];
+                for (index, byte) in key.iter_mut().enumerate().take(key_size) {
+                    *byte = ((value >> (index * 8)) & 0xff) as u8;
+                }
+                acc.offer(candidate, offset, &key[..key_size]);
+                acc
+            })
+            .reduce(empty, XorTop::merge)
+            .top
+    } else {
+        frequency_guided_keys(candidate, key_size, XOR_TOP_CIPHER_BYTES)
+            .par_iter()
+            .fold(empty, |mut acc, key| {
+                acc.offer(candidate, offset, key);
+                acc
+            })
+            .reduce(empty, XorTop::merge)
+            .top
+    }
+}
+
+/// Split the file on NUL bytes and keep runs long enough to brute-force.
+///
+/// Reads in 1 MiB blocks and uses `memchr` to find separators; the previous
+/// implementation called `read()` for a single byte at a time, which made
+/// `--brute-xor` the slowest stage on a real dump.
 fn collect_xor_candidates(path: &str) -> io::Result<Vec<(u64, Vec<u8>)>> {
-    let mut reader = BufReader::with_capacity(1 << 16, File::open(path)?);
-    let mut byte = [0u8; 1];
-    let mut run = Vec::new();
+    const BLOCK: usize = 1 << 20;
+    let mut reader = BufReader::with_capacity(BLOCK, File::open(path)?);
+    let mut buf = vec![0u8; BLOCK];
+    let mut run: Vec<u8> = Vec::with_capacity(MAX_XOR_CANDIDATE_LEN);
     let mut run_offset = 0u64;
-    let mut offset = 0u64;
+    let mut base = 0u64;
     let mut candidates = Vec::new();
+
     loop {
-        let read = reader.read(&mut byte)?;
+        let read = reader.read(&mut buf)?;
         if read == 0 {
             break;
         }
-        if byte[0] == 0 {
-            append_xor_candidates(&mut candidates, run_offset, &run);
-            run.clear();
-        } else {
-            if run.is_empty() {
-                run_offset = offset;
+        let mut pos = 0usize;
+        while pos < read {
+            match memchr::memchr(0, &buf[pos..read]) {
+                Some(found) => {
+                    let zero = pos + found;
+                    if run.is_empty() {
+                        run_offset = base + pos as u64;
+                    }
+                    push_xor_run(&mut candidates, &mut run_offset, &mut run, &buf[pos..zero]);
+                    pos = zero + 1;
+                }
+                None => {
+                    if run.is_empty() {
+                        run_offset = base + pos as u64;
+                    }
+                    push_xor_run(&mut candidates, &mut run_offset, &mut run, &buf[pos..read]);
+                    break;
+                }
             }
-            run.push(byte[0]);
+            if candidates.len() >= MAX_XOR_CANDIDATES {
+                return Ok(candidates);
+            }
         }
-        offset += 1;
-        if candidates.len() >= MAX_XOR_CANDIDATES {
-            break;
-        }
+        base += read as u64;
     }
-    if candidates.len() < MAX_XOR_CANDIDATES {
+    if !run.is_empty() {
         append_xor_candidates(&mut candidates, run_offset, &run);
     }
     candidates.truncate(MAX_XOR_CANDIDATES);
     Ok(candidates)
 }
 
+/// Append `data` to the current run, flushing it every
+/// `MAX_XOR_CANDIDATE_LEN` bytes so a NUL-free file cannot grow `run` forever.
+fn push_xor_run(
+    candidates: &mut Vec<(u64, Vec<u8>)>,
+    run_offset: &mut u64,
+    run: &mut Vec<u8>,
+    data: &[u8],
+) {
+    let mut rest = data;
+    while !rest.is_empty() {
+        let room = MAX_XOR_CANDIDATE_LEN - run.len();
+        let take = room.min(rest.len());
+        run.extend_from_slice(&rest[..take]);
+        rest = &rest[take..];
+        if run.len() >= MAX_XOR_CANDIDATE_LEN {
+            append_xor_candidates(candidates, *run_offset, run);
+            *run_offset += MAX_XOR_CANDIDATE_LEN as u64;
+            run.clear();
+        }
+    }
+}
+
+/// Keep a run only if it is long enough and not trivially repetitive (all
+/// one byte, or a two-byte cycle) -- those decrypt to junk for every key.
 fn append_xor_candidates(candidates: &mut Vec<(u64, Vec<u8>)>, offset: u64, data: &[u8]) {
     if data.len() < MIN_XOR_CANDIDATE_LEN {
         return;
@@ -1942,6 +2186,46 @@ mod tests {
         assert!(xor_printable_score(b"password=secret") > 0.0);
     }
 
+    fn xor_encrypt(plain: &[u8], key: &[u8]) -> Vec<u8> {
+        plain
+            .iter()
+            .enumerate()
+            .map(|(index, &byte)| byte ^ key[index % key.len()])
+            .collect()
+    }
+
+    #[test]
+    fn recovers_single_byte_xor_key() {
+        let plain = b"password=hunter2 and http://evil.example/payload.exe";
+        let cipher = xor_encrypt(plain, b"K");
+        let top = super::xor_top_results(&cipher, 0x100, 1, false);
+        let best = top.first().expect("at least one candidate key");
+        assert_eq!(best.key, b"K");
+        assert_eq!(best.plaintext, plain);
+    }
+
+    #[test]
+    fn recovers_three_byte_xor_key_with_frequency_search() {
+        // Long enough for the per-column frequency ranking to see the real
+        // key bytes: a 3-byte key used to require 16.7M full scans.
+        let plain = b"MZ\x90\x00This program cannot be run in DOS mode. \
+                      http://update.example.com/payload.dll";
+        let cipher = xor_encrypt(plain, b"KEY");
+        let top = super::xor_top_results(&cipher, 0x2000, 3, false);
+        let best = top.first().expect("at least one candidate key");
+        assert_eq!(best.key, b"KEY");
+        assert_eq!(best.plaintext, plain);
+        assert!(best.score > 1.0, "crib hits should boost the score");
+    }
+
+    #[test]
+    fn xor_exhaustive_and_frequency_agree_on_two_byte_keys() {
+        let plain = b"Authorization: Bearer abcdef0123456789 .dll";
+        let cipher = xor_encrypt(plain, b"Qz");
+        let top = super::xor_top_results(&cipher, 0, 2, true);
+        assert_eq!(top.first().expect("candidate").key, b"Qz");
+    }
+
     #[test]
     fn refangs_common_ioc_obfuscation() {
         assert_eq!(
@@ -2187,6 +2471,18 @@ fn hit_result_limit(result_count: usize, max_strings: usize) -> bool {
     max_strings != usize::MAX && result_count > max_strings
 }
 
+/// Printing tens of thousands of lines to a terminal is slow (and the scroll
+/// back is unusable), so point the user at `-o` once the result set is large.
+fn hint_large_terminal_output(result_count: usize, output_is_file: bool) {
+    if !output_is_file && io::stdout().is_terminal() && result_count > 10_000 {
+        eprintln!(
+            "  [i] {result_count} results were printed to the terminal; next time add \
+             `-o results.txt` (or `--format ndjson -o results.ndjson.gz`) to write them \
+             much faster and keep them."
+        );
+    }
+}
+
 /// Collapse identical strings, keeping the first occurrence (lowest offset)
 /// and the number of times each text appeared.
 fn dedupe_strings(
@@ -2252,6 +2548,8 @@ struct ReportData<'a> {
     scanned_until: u64,
     /// `--report summary`: add encoding, coverage and artifact details.
     detailed: bool,
+    /// Whether results went to `-o <file>` (suppresses the terminal hint).
+    output_is_file: bool,
 }
 
 fn print_report(data: &ReportData<'_>) {
@@ -2294,11 +2592,17 @@ fn print_report(data: &ReportData<'_>) {
     eprintln!("  threads    : {}", data.threads);
     eprintln!("  file size  : {} bytes", data.file_size);
     eprintln!("  elapsed    : {:.3} ms", data.elapsed * 1000.0);
+    // Throughput must describe what was actually scanned: a `--max-strings`
+    // cap stops early, and dividing the whole file size by that short elapsed
+    // time reported absurd numbers (e.g. 400 MiB/s after 0.1% of the dump).
+    let scanned = data.covered_end().saturating_sub(data.range_start);
     eprintln!(
-        "  throughput : {:.2} MiB/s",
-        data.file_size as f64 / data.elapsed.max(f64::MIN_POSITIVE) / 1_048_576.0
+        "  throughput : {:.2} MiB/s (over {} scanned bytes)",
+        scanned as f64 / data.elapsed.max(f64::MIN_POSITIVE) / 1_048_576.0,
+        scanned
     );
     eprintln!("+------------------------------------------------------------+");
+    hint_large_terminal_output(data.result_count, data.output_is_file);
     if data.detailed && !data.artifacts.is_empty() {
         eprintln!("  [!] top artifacts (rarest first, up to 10)");
         for artifact in data.artifacts.iter().take(10) {
@@ -2712,6 +3016,9 @@ fn run() -> Result<(), String> {
                 .to_string(),
         );
     }
+    if args.xor_exhaustive && args.brute_xor.is_none() {
+        return Err("--xor-exhaustive requires --brute-xor".to_string());
+    }
     if args.entropy_window == Some(0) {
         return Err("--entropy-window must be greater than 0".to_string());
     }
@@ -2747,6 +3054,7 @@ fn run() -> Result<(), String> {
     }
     let range_end = range_end.min(file_size);
     let scan_span = range_end.saturating_sub(range_start);
+    let output_is_file = args.output.is_some();
     let show_progress = args.progress.unwrap_or_else(|| {
         io::stderr().is_terminal() && (args.output.is_some() || !io::stdout().is_terminal())
     });
@@ -2826,10 +3134,35 @@ fn run() -> Result<(), String> {
     if let Some(key_sizes) = args.brute_xor.as_ref() {
         let candidates = collect_xor_candidates(&args.path)
             .map_err(|e| format!("XOR candidate scan failed: {e}"))?;
+        let big_keys = key_sizes.iter().copied().filter(|&size| size >= 3).max();
+        if let Some(size) = big_keys {
+            if args.xor_exhaustive {
+                let keys = 1u64 << (size * 8);
+                let ops = keys
+                    .saturating_mul(candidates.len() as u64)
+                    .saturating_mul(MAX_XOR_CANDIDATE_LEN as u64);
+                eprintln!(
+                    "  [i] --xor-exhaustive: {} candidate(s) x {keys} {size}-byte keys (~{:.1} G byte-ops); expect minutes on a large dump",
+                    candidates.len(),
+                    ops as f64 / 1e9
+                );
+            } else {
+                eprintln!(
+                    "  [i] --brute-xor: {size}-byte keys use a frequency-guided search ({} keys instead of {}); pass --xor-exhaustive to enumerate the full space",
+                    (XOR_TOP_CIPHER_BYTES * XOR_COMMON_PLAINTEXT.len()).pow(size as u32),
+                    1u64 << (size * 8)
+                );
+            }
+        }
         for (offset, candidate) in candidates {
             let mut candidate_results = Vec::new();
             for &key_size in key_sizes {
-                candidate_results.extend(xor_top_results(&candidate, offset, key_size));
+                candidate_results.extend(xor_top_results(
+                    &candidate,
+                    offset,
+                    key_size,
+                    args.xor_exhaustive,
+                ));
             }
             candidate_results.sort_by(|left, right| {
                 right
@@ -2856,7 +3189,11 @@ fn run() -> Result<(), String> {
         entropy_regions
             .retain(|region| entropy_region_in_range(region, range_active, range_start, range_end));
     }
-    if (threads == 1 || range_active) && args.format != Format::JsonTree && !args.dedupe {
+    // Everything that can be written while scanning goes through the streaming
+    // path -- including the multi-threaded one. Previously `--threads > 1`
+    // buffered every match in RAM and sorted at the end, which is exactly what
+    // made big `--max-strings` runs look like a hang (and could OOM).
+    if args.format != Format::JsonTree && !args.dedupe {
         let mut writer = Sink::open(args.output.as_deref())?;
         let json_layout = json_layout_for(args.format, args.compact);
         if args.format == Format::Json {
@@ -2984,17 +3321,30 @@ fn run() -> Result<(), String> {
                 progress_results.get()
             );
         };
-        let scan_result = extract_strings_from_file_streaming_range_with_encodings_progress(
-            &args.path,
-            range_start,
-            range_end,
-            args.min_len,
-            internal_limit,
-            noise,
-            enc_filter,
-            &mut handle,
-            &mut progress,
-        );
+        let scan_result = if threads > 1 && !range_active {
+            extract_strings_from_file_parallel_streaming_with_encodings_progress(
+                &args.path,
+                args.min_len,
+                internal_limit,
+                noise,
+                enc_filter,
+                threads,
+                &mut handle,
+                &mut progress,
+            )
+        } else {
+            extract_strings_from_file_streaming_range_with_encodings_progress(
+                &args.path,
+                range_start,
+                range_end,
+                args.min_len,
+                internal_limit,
+                noise,
+                enc_filter,
+                &mut handle,
+                &mut progress,
+            )
+        };
         scan_result.map_err(|e| format!("scan failed: {e}"))?;
         if show_progress {
             eprintln!();
@@ -3136,6 +3486,7 @@ fn run() -> Result<(), String> {
             scanned_until: last_offset,
             detailed: args.report_mode == ReportMode::Summary
                 || args.report_mode == ReportMode::All,
+            output_is_file,
         });
         if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
             let stats = build_user_stats(&artifacts, args.filter_appdata);
@@ -3298,6 +3649,7 @@ fn run() -> Result<(), String> {
             scanned_until: raw_results.iter().map(|r| r.offset).max().unwrap_or(0),
             detailed: args.report_mode == ReportMode::Summary
                 || args.report_mode == ReportMode::All,
+            output_is_file,
         });
         if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
             let stats = build_user_stats(&artifacts, args.filter_appdata);
@@ -3432,6 +3784,7 @@ fn run() -> Result<(), String> {
             scanned_until: last_offset,
             detailed: args.report_mode == ReportMode::Summary
                 || args.report_mode == ReportMode::All,
+            output_is_file,
         });
         if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
             let stats = build_user_stats(&artifacts, args.filter_appdata);
@@ -3631,6 +3984,7 @@ fn run() -> Result<(), String> {
         max_strings: args.max_strings,
         scanned_until: results.iter().map(|r| r.offset).max().unwrap_or(0),
         detailed: args.report_mode == ReportMode::Summary || args.report_mode == ReportMode::All,
+        output_is_file,
     });
     if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
         let stats = build_user_stats(&artifacts, args.filter_appdata);

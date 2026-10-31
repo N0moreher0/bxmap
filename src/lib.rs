@@ -1738,7 +1738,50 @@ pub fn extract_strings_from_file_with_encodings(
 // lost at the boundary. Results are concatenated and re-sorted by offset
 // (each region's own results are already offset-sorted, but merge order
 // across regions/threads isn't guaranteed).
-const PARALLEL_CHUNK_SIZE: u64 = 64 * 1024 * 1024; // 64MB per region
+const PARALLEL_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16MB per region
+
+/// Scan one `PARALLEL_CHUNK_SIZE` region of `dump_path` and return the
+/// strings that *start* inside it, in ascending offset order.
+///
+/// The region reads `MAX_RUN_CHARS` bytes past its own boundary so a string
+/// crossing the boundary is still complete, but it only keeps strings whose
+/// start offset belongs to this region -- the next region owns the rest, so
+/// nothing is duplicated or lost at the boundary.
+fn scan_parallel_chunk(
+    dump_path: &str,
+    idx: usize,
+    file_len: u64,
+    min_len: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+) -> std::io::Result<Vec<ExtractedString>> {
+    let start = idx as u64 * PARALLEL_CHUNK_SIZE;
+    let logical_end = std::cmp::min(start + PARALLEL_CHUNK_SIZE, file_len);
+    let read_end = std::cmp::min(logical_end + MAX_RUN_CHARS as u64, file_len);
+    let read_len = (read_end - start) as usize;
+
+    let mut file = File::open(dump_path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; read_len];
+    file.read_exact(&mut buf)?;
+
+    let mut local: Vec<ExtractedString> = Vec::new();
+    {
+        let mut on_found = |s: ExtractedString| {
+            if s.offset < logical_end {
+                local.push(s);
+            }
+        };
+        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found, encodings);
+        scanner.feed(&buf, 0, buf.len(), buf.len(), start);
+        scanner.flush_all();
+    }
+    Ok(local)
+}
+
+fn parallel_chunk_count(file_len: u64) -> usize {
+    ((file_len + PARALLEL_CHUNK_SIZE - 1) / PARALLEL_CHUNK_SIZE) as usize
+}
 
 /// Same as `extract_strings_from_file`, but scans the file in parallel
 /// across multiple OS threads via `rayon`'s work-stealing thread pool
@@ -1746,7 +1789,9 @@ const PARALLEL_CHUNK_SIZE: u64 = 64 * 1024 * 1024; // 64MB per region
 /// fast storage / a warm page cache, where the CPU-bound scan (not disk
 /// I/O) is the bottleneck. Peak memory is bounded by
 /// `num_active_threads * (PARALLEL_CHUNK_SIZE + MAX_RUN_CHARS)`, not by the
-/// file size. Use `rayon::ThreadPoolBuilder::num_threads` (or the
+/// file size -- but the *results* are collected into one `Vec`, so prefer
+/// [`extract_strings_from_file_parallel_streaming_with_encodings`] for very
+/// large result sets. Use `rayon::ThreadPoolBuilder::num_threads` (or the
 /// `RAYON_NUM_THREADS` env var) to control the degree of parallelism; by
 /// default rayon uses one thread per logical CPU.
 pub fn extract_strings_from_file_parallel(
@@ -1755,60 +1800,13 @@ pub fn extract_strings_from_file_parallel(
     max_strings: usize,
     noise_cfg: NoiseConfig,
 ) -> std::io::Result<Vec<ExtractedString>> {
-    use rayon::prelude::*;
-
-    let file_len = std::fs::metadata(dump_path)?.len();
-    if file_len == 0 {
-        return Ok(Vec::new());
-    }
-
-    let overlap = MAX_RUN_CHARS as u64;
-    let n_chunks = ((file_len + PARALLEL_CHUNK_SIZE - 1) / PARALLEL_CHUNK_SIZE) as usize;
-
-    let chunk_results: Vec<std::io::Result<Vec<ExtractedString>>> = (0..n_chunks)
-        .into_par_iter()
-        .map(|idx| -> std::io::Result<Vec<ExtractedString>> {
-            let start = idx as u64 * PARALLEL_CHUNK_SIZE;
-            // The boundary this region "owns" -- strings starting at or
-            // past this point belong to the NEXT region, not this one.
-            let logical_end = std::cmp::min(start + PARALLEL_CHUNK_SIZE, file_len);
-            // How far past the boundary this region actually reads, purely
-            // to give a run starting right before `logical_end` room to
-            // finish (or hit its own MAX_RUN_CHARS force-flush, same as
-            // the sequential scanner would).
-            let read_end = std::cmp::min(logical_end + overlap, file_len);
-            let read_len = (read_end - start) as usize;
-
-            let mut file = File::open(dump_path)?;
-            file.seek(SeekFrom::Start(start))?;
-            let mut buf = vec![0u8; read_len];
-            file.read_exact(&mut buf)?;
-
-            let mut local: Vec<ExtractedString> = Vec::new();
-            {
-                let mut on_found = |s: ExtractedString| {
-                    if s.offset < logical_end {
-                        local.push(s);
-                    }
-                };
-                let mut scanner =
-                    StringRunScanner::new(min_len, noise_cfg, &mut on_found, EncodingFilter::all());
-                scanner.feed(&buf, 0, buf.len(), buf.len(), start);
-                scanner.flush_all();
-            }
-            Ok(local)
-        })
-        .collect();
-
-    let mut results = Vec::new();
-    for r in chunk_results {
-        results.extend(r?);
-    }
-    results.sort_by_key(|s| s.offset);
-    if results.len() > max_strings {
-        results.truncate(max_strings);
-    }
-    Ok(results)
+    extract_strings_from_file_parallel_with_encodings(
+        dump_path,
+        min_len,
+        max_strings,
+        noise_cfg,
+        EncodingFilter::all(),
+    )
 }
 
 /// Same as [`extract_strings_from_file_parallel`], but only scans the encodings
@@ -1826,37 +1824,11 @@ pub fn extract_strings_from_file_parallel_with_encodings(
     if file_len == 0 {
         return Ok(Vec::new());
     }
-
-    let overlap = MAX_RUN_CHARS as u64;
-    let n_chunks = ((file_len + PARALLEL_CHUNK_SIZE - 1) / PARALLEL_CHUNK_SIZE) as usize;
+    let n_chunks = parallel_chunk_count(file_len);
 
     let chunk_results: Vec<std::io::Result<Vec<ExtractedString>>> = (0..n_chunks)
         .into_par_iter()
-        .map(|idx| -> std::io::Result<Vec<ExtractedString>> {
-            let start = idx as u64 * PARALLEL_CHUNK_SIZE;
-            let logical_end = std::cmp::min(start + PARALLEL_CHUNK_SIZE, file_len);
-            let read_end = std::cmp::min(logical_end + overlap, file_len);
-            let read_len = (read_end - start) as usize;
-
-            let mut file = File::open(dump_path)?;
-            file.seek(SeekFrom::Start(start))?;
-            let mut buf = vec![0u8; read_len];
-            file.read_exact(&mut buf)?;
-
-            let mut local: Vec<ExtractedString> = Vec::new();
-            {
-                let mut on_found = |s: ExtractedString| {
-                    if s.offset < logical_end {
-                        local.push(s);
-                    }
-                };
-                let mut scanner =
-                    StringRunScanner::new(min_len, noise_cfg, &mut on_found, encodings);
-                scanner.feed(&buf, 0, buf.len(), buf.len(), start);
-                scanner.flush_all();
-            }
-            Ok(local)
-        })
+        .map(|idx| scan_parallel_chunk(dump_path, idx, file_len, min_len, noise_cfg, encodings))
         .collect();
 
     let mut results = Vec::new();
@@ -1868,6 +1840,111 @@ pub fn extract_strings_from_file_parallel_with_encodings(
         results.truncate(max_strings);
     }
     Ok(results)
+}
+
+/// Streaming variant of [`extract_strings_from_file_parallel_with_encodings`]:
+/// scans a bounded window of regions in parallel, emits their results in
+/// ascending offset order, then drops them and moves on.
+///
+/// Peak memory is bounded by `threads * (PARALLEL_CHUNK_SIZE + MAX_RUN_CHARS)`
+/// for the scan buffers plus the results of at most `threads` regions -- it
+/// does **not** grow with the number of matches in the file, unlike the
+/// buffered parallel API. `threads` is the worker count (`0`/`1` means "no
+/// private pool"; `1` still scans region-by-region on the current thread).
+/// Scanning stops as soon as `max_strings` results have been emitted, so a
+/// small cap keeps a huge dump cheap. Returns the number of emitted strings.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_strings_from_file_parallel_streaming_with_encodings<F: FnMut(ExtractedString)>(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+    threads: usize,
+    on_found: F,
+) -> std::io::Result<usize> {
+    extract_strings_from_file_parallel_streaming_with_encodings_progress(
+        dump_path,
+        min_len,
+        max_strings,
+        noise_cfg,
+        encodings,
+        threads,
+        on_found,
+        |_| {},
+    )
+}
+
+/// Same as [`extract_strings_from_file_parallel_streaming_with_encodings`],
+/// but also reports the absolute offset reached after every completed window
+/// so callers can render a progress bar.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_strings_from_file_parallel_streaming_with_encodings_progress<
+    F: FnMut(ExtractedString),
+    P: FnMut(u64),
+>(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    encodings: EncodingFilter,
+    threads: usize,
+    mut on_found: F,
+    mut on_progress: P,
+) -> std::io::Result<usize> {
+    use rayon::prelude::*;
+
+    let file_len = std::fs::metadata(dump_path)?.len();
+    if file_len == 0 {
+        on_progress(0);
+        return Ok(0);
+    }
+    let n_chunks = parallel_chunk_count(file_len);
+
+    let pool = if threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        )
+    } else {
+        None
+    };
+    // One region per worker: enough to keep every core busy without letting
+    // the scan buffers (and their result vectors) pile up.
+    let window = threads.max(1);
+
+    let mut emitted = 0usize;
+    let mut idx = 0usize;
+    while idx < n_chunks && emitted < max_strings {
+        let end_idx = std::cmp::min(idx + window, n_chunks);
+        let scan = || -> Vec<std::io::Result<Vec<ExtractedString>>> {
+            (idx..end_idx)
+                .into_par_iter()
+                .map(|i| scan_parallel_chunk(dump_path, i, file_len, min_len, noise_cfg, encodings))
+                .collect()
+        };
+        let batch = match pool.as_ref() {
+            Some(pool) => pool.install(scan),
+            None => scan(),
+        };
+        for chunk in batch {
+            for s in chunk? {
+                if emitted >= max_strings {
+                    return Ok(emitted);
+                }
+                emitted += 1;
+                on_found(s);
+            }
+        }
+        idx = end_idx;
+        on_progress(std::cmp::min(
+            end_idx as u64 * PARALLEL_CHUNK_SIZE,
+            file_len,
+        ));
+    }
+    Ok(emitted)
 }
 
 pub const VERSION: &str = "1.0.4";
@@ -2276,6 +2353,71 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn parallel_streaming_matches_sequential_and_stays_sorted() {
+        let mut data = Vec::new();
+        for index in 0..500 {
+            data.extend_from_slice(b"\x00\x01\x02binary-junk\xff\xfe");
+            data.extend_from_slice(format!("C:\\Users\\victim\\file{index}.txt").as_bytes());
+            data.extend_from_slice(&[0, 0, 0]);
+            let utf16: Vec<u8> = format!("RAR password=secret{index}")
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            data.extend_from_slice(&utf16);
+            data.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        let path = temp_bin("parallel-stream", &data);
+        let path_str = path.to_string_lossy().to_string();
+
+        let sequential = extract_strings_from_file_with_encodings(
+            &path_str,
+            4,
+            usize::MAX,
+            EncodingFilter::all(),
+        )
+        .unwrap();
+        let mut streamed = Vec::new();
+        let emitted = extract_strings_from_file_parallel_streaming_with_encodings(
+            &path_str,
+            4,
+            usize::MAX,
+            NoiseConfig::default(),
+            EncodingFilter::all(),
+            4,
+            |item| streamed.push(item),
+        )
+        .unwrap();
+
+        assert_eq!(emitted, streamed.len());
+        assert_eq!(streamed.len(), sequential.len());
+        assert!(streamed
+            .windows(2)
+            .all(|pair| pair[0].offset <= pair[1].offset));
+        for (left, right) in streamed.iter().zip(sequential.iter()) {
+            assert_eq!(
+                (left.offset, &left.encoding, &left.text),
+                (right.offset, &right.encoding, &right.text)
+            );
+        }
+
+        // The cap must stop the scan early and report exactly that many.
+        let mut capped = 0usize;
+        let emitted = extract_strings_from_file_parallel_streaming_with_encodings(
+            &path_str,
+            4,
+            10,
+            NoiseConfig::default(),
+            EncodingFilter::all(),
+            4,
+            |_| capped += 1,
+        )
+        .unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(emitted, 10);
+        assert_eq!(capped, 10);
     }
 
     fn temp_bin(name: &str, data: &[u8]) -> std::path::PathBuf {

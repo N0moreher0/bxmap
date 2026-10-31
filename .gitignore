@@ -2,3 +2,4 @@
 /fuzz/target
 sample_demo.dmp
 demo/dumps/*.dmp
+bench/.corpus.bin

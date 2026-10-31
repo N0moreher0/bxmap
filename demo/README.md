@@ -35,7 +35,7 @@ bxmap demo/dumps/lab1.dmp --auto-tune --extract all --report all
 - Artifacts: paths (with `user=victim;category=...`), emails, registry, env vars
 - User report: `victim` with 2 files (1 AppData = 50%)
 
-**Performance:** ~12 MiB/s, 4.1s, 6 threads
+**Performance:** measure it yourself — see [Benchmark Numbers](#benchmark-numbers).
 
 ---
 
@@ -54,7 +54,7 @@ bxmap demo/dumps/lab6.dmp --auto-tune --extract env --report user
 - Bitcoin wallet in env: `BITCOIN_WALLET=bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh`
 - AES-256 encryption key: `ENCRYPTION_KEY=AES256KeyForFileEncryption123456789012`
 
-**Performance:** ~43 MiB/s, 2.8s, 6 threads
+**Performance:** measure it yourself — see [Benchmark Numbers](#benchmark-numbers).
 
 **Next steps (manual):**
 1. Use `--carve rar` (Phase 8) to extract the 6 RAR files
@@ -82,7 +82,7 @@ bxmap demo/dumps/lab4.dmp --auto-tune --extract all --report all --max-strings 5
 eminem                    11 files  AppData:    2 ( 18.2%)
 ```
 
-**Performance:** ~47 MiB/s, 2.1s (scanned 3.6% before 50k limit)
+**Performance:** measure it yourself — see [Benchmark Numbers](#benchmark-numbers).
 
 ---
 
@@ -118,28 +118,32 @@ bxmap demo/dumps/minidump.dmp --map-va --rwx-only --auto-tune
 
 ## Benchmark Numbers
 
-| Dump | Size | Time | Throughput | Peak RAM | Output (50k limit) |
-|------|------|------|------------|----------|---------------------|
-| Lab 1 | 50 MB | 4.1s | 12.2 MiB/s | ~150 MB | 200k strings, 305 artifacts |
-| Lab 2 | 80 MB | ~3s | ~25 MiB/s | ~180 MB | — |
-| Lab 4 | 100 MB | 2.1s* | 47 MiB/s | ~200 MB | 50k strings, 110 artifacts |
-| Lab 6 | 120 MB | 2.8s | 43 MiB/s | ~220 MB | 200k strings, 240 artifacts |
-| Minidump | 30 MB | 0.8s | 37 MiB/s | ~100 MB | — |
-
-*Lab 4 stopped at `--max-strings 50000` (3.6% of file). Full scan would be ~60s.
-
----
-
-## Running Full Benchmarks
+No numbers are baked into this file. Fabricated timings age badly and depend
+entirely on your CPU, storage and result density, so the repository ships a
+reproducible benchmark instead:
 
 ```bash
-# Full scan (no limit) - adjust based on RAM
-bxmap demo/dumps/lab4.dmp --auto-tune --max-strings 0 -o lab4_full.json
-bxmap demo/dumps/lab6.dmp --auto-tune --max-strings 0 -o lab6_full.json
+# CPU-only scanner throughput (criterion, no disk I/O)
+cargo bench --no-default-features
 
-# With gzip compression
-bxmap demo/dumps/lab6.dmp --auto-tune --max-strings 0 -o lab6_full.json.gz
+# End-to-end wall time + peak RSS on a generated 256 MiB corpus
+python bench/bench.py --with-strings --repeat 3 --json bench/last-run.json
 ```
+
+`bench/bench.py` writes the corpus once, runs each scenario `--repeat` times,
+reports the best run, and can compare against `strings` (`--with-strings`).
+See the "Performance characteristics" section of the top-level `README.md` for
+one measured example (machine + corpus described there).
+
+To benchmark a demo dump specifically:
+
+```bash
+./target/release/bxmap-cli demo/dumps/lab6.dmp --auto-tune --max-strings 0 \
+    --format ndjson -o lab6.ndjson.gz
+```
+
+The summary line printed on stderr reports elapsed time, throughput over the
+bytes actually scanned, peak result count and truncation status.
 
 ---
 

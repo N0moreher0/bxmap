@@ -23,6 +23,13 @@ rayon = "1"
 regex = "1"
 yara-x = { version = "1.20", optional = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "extract"
+harness = false
+
 [features]
 # "yara" pulls in yara-x (wasmtime/cranelift): 64-bit only and large.
 # Build with --no-default-features for tiny static builds (routers, 32-bit ARM/MIPS).

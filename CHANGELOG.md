@@ -89,6 +89,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   encoding, the scanned byte range (percentage of the requested window and of
   the file), whether `--max-strings` stopped the scan, and the top artifacts
   collected by `--extract`. `--report none` restores the compact summary.
+- `--report user|all` prints a consolidated per-user file list (one line per user)
+  when `--extract paths` is active. Shows file count, AppData count, and AppData
+  percentage. Filter with `--min-files-in-user <N>`.
+- `--filter-appdata` adjusts the AppData percentage denominator to visible files
+  (total minus AppData) for `--report user|all`. Does not remove AppData paths
+  from collection.
 - New `bxmap::magic` module: `SIGNATURES` (PE/ELF/ZIP/PDF/PNG headers),
   `MagicMatch` and `scan_file(path, max_matches)`. The table is the single
   source of truth for header detection and will be reused by `--carve`.
@@ -109,17 +115,43 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is active, and NDJSON `total_records` now counts auxiliary records (YARA,
   XOR, magic, entropy, artifacts) instead of only strings.
 
-### Added
-- `--report user|all` prints a consolidated per-user file list (one line per user)
-  when `--extract paths` is active. Shows file count, AppData count, and AppData
-  percentage. Filter with `--min-files-in-user <N>`.
-- `--filter-appdata` adjusts the AppData percentage denominator to visible files
-  (total minus AppData) for `--report user|all`. Does not remove AppData paths
-  from collection.
-- New `bxmap::chunk` module with `for_each_chunk` and `Chunk` for overlap-aware
-  window iteration (used by `--carve` and magic-byte scanning).
-- New `bxmap::magic` module with `SIGNATURES`, `MagicMatch`, `Signature`, and
-  Aho-Corasick `scan_file`; single source of truth for header signatures.
+### Performance
+- New `extract_strings_from_file_parallel_streaming_with_encodings` and
+  `..._progress` APIs: scan a window of `PARALLEL_CHUNK_SIZE` regions in
+  parallel, emit their results in ascending offset order, then drop them. Peak
+  memory no longer grows with the number of matches, unlike the buffered
+  parallel API.
+- `PARALLEL_CHUNK_SIZE` reduced from 64 MiB to 16 MiB: peak RSS on a 256 MiB
+  corpus dropped from ~358 MB to ~142 MB with throughput unchanged.
+- `--brute-xor` rewritten: keys are scored in parallel on the rayon pool with a
+  per-thread top-N accumulator and a reused plaintext buffer, so the hot loop
+  allocates nothing. A 96-byte prefilter and known-plaintext cribs (`MZ`,
+  `This program cannot be run`, `http://`, `.dll`, `PK`, `<?xml`, `SELECT`)
+  reject wrong keys early. 1–2 byte keys stay exhaustive (256 / 65,536); key
+  sizes ≥ 3 use a frequency-guided search (top-3 ciphertext bytes per column ×
+  6 common plaintext bytes = 5,832 keys instead of 16,777,216) and print the
+  key count up front.
+- `--xor-exhaustive` forces the full key space for 3-byte keys and prints a
+  byte-op estimate before starting.
+- XOR candidate collection now reads 1 MiB blocks and uses `memchr` to split on
+  NUL bytes instead of calling `read()` one byte at a time.
+- `--extract` prefilters each string with cheap byte checks (`:`, `\`, `/`,
+  `=`, `://`, `@`, `HK`) before running the regexes; `--extract all` on a
+  256 MiB corpus went from ~42 s to ~16 s.
+- New criterion benchmarks (`benches/extract.rs`) for in-memory ASCII, UTF-16
+  and all-encoding scans plus the parallel file path, and `bench/bench.py` for
+  end-to-end wall time, throughput and peak RSS (optionally against `strings`).
+
+### Fixed
+- The `--report summary` throughput line is now computed over the bytes that
+  were actually scanned. A run stopped early by `--max-strings` used to divide
+  the whole file size by a short elapsed time (e.g. "400 MiB/s" after scanning
+  0.1% of the dump).
+- `--threads > 1` no longer buffers every match in RAM and sorts at the end; it
+  streams through the parallel path like the single-threaded one, which is what
+  made large `--max-strings` runs look like a hang.
+- Printing more than 10,000 results to a terminal now prints a hint suggesting
+  `-o <file>`.
 
 ## [1.0.14] - 2026-10-30 (`bxmap-cli`)
 

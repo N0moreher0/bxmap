@@ -176,14 +176,21 @@ impl ArtifactCollector {
         if self.kinds.is_empty() || text.is_empty() {
             return;
         }
+        // Cheap byte prefilters. On a real dump `--extract all` runs five
+        // regexes over every string; most strings can match none of them, and
+        // `str::contains(char)` is a memchr scan instead of a regex walk.
+        let has_colon = text.contains(':');
+        let has_sep = text.contains('\\') || text.contains('/');
         // Paths double as evidence for tool traces, so scan them once when
         // either family is active.
-        let paths =
-            if self.kinds.contains(ArtifactKind::Path) || self.kinds.contains(ArtifactKind::Tool) {
-                extract_paths(text)
-            } else {
-                Vec::new()
-            };
+        let paths = if (self.kinds.contains(ArtifactKind::Path)
+            || self.kinds.contains(ArtifactKind::Tool))
+            && (has_colon || has_sep)
+        {
+            extract_paths(text)
+        } else {
+            Vec::new()
+        };
         if self.kinds.contains(ArtifactKind::Path) {
             for (start, path) in &paths {
                 let path = *path;
@@ -203,7 +210,7 @@ impl ArtifactCollector {
                 );
             }
         }
-        if self.kinds.contains(ArtifactKind::Env) {
+        if self.kinds.contains(ArtifactKind::Env) && text.contains('=') {
             for pair in extract_env(text) {
                 if let Some((name, _value)) = pair.split_once('=') {
                     let detail = if is_sensitive_name(name) {
@@ -221,7 +228,7 @@ impl ArtifactCollector {
                 }
             }
         }
-        if self.kinds.contains(ArtifactKind::Url) {
+        if self.kinds.contains(ArtifactKind::Url) && has_colon && text.contains("://") {
             for (start, url) in extract_matches(text, url_regex()) {
                 self.record(
                     ArtifactKind::Url,
@@ -232,7 +239,7 @@ impl ArtifactCollector {
                 );
             }
         }
-        if self.kinds.contains(ArtifactKind::Email) {
+        if self.kinds.contains(ArtifactKind::Email) && text.contains('@') {
             for (start, email) in extract_matches(text, email_regex()) {
                 self.record(
                     ArtifactKind::Email,
@@ -243,7 +250,9 @@ impl ArtifactCollector {
                 );
             }
         }
-        if self.kinds.contains(ArtifactKind::Registry) {
+        if self.kinds.contains(ArtifactKind::Registry)
+            && (text.contains("HK") || text.contains("hk"))
+        {
             for (start, key) in extract_matches(text, registry_regex()) {
                 self.record(
                     ArtifactKind::Registry,

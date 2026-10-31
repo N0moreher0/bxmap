@@ -392,9 +392,48 @@ This makes the core suitable for both the included CLI and a custom
   `bxmap::minidump` parses Windows minidumps (MDMP) for VA mapping,
   process/module/thread timeline, and region filters.
 
-Benchmark your target storage, CPU, and result density with your own dump
-corpus. Output volume and downstream processing often dominate end-to-end
-runtime after extraction.
+### Measured numbers
+
+Two benchmarks are checked in, so the numbers below can be reproduced rather
+than taken on faith:
+
+- `cargo bench --no-default-features` — CPU-only scanner throughput
+  (criterion, `benches/extract.rs`, no disk I/O).
+- `python bench/bench.py --with-strings` — end-to-end wall time and peak RSS
+  on a generated 256 MiB corpus (mixed ASCII + UTF-16LE strings separated by
+  binary junk).
+
+In-memory scanner, 8 MiB corpus, release build, 6-core x86-64 VM:
+
+| Encodings scanned | Throughput |
+|---|---|
+| ASCII only | ~125 MiB/s |
+| ASCII + UTF-16LE/BE + UTF-32LE/BE | ~80 MiB/s |
+| UTF-16 only | ~53 MiB/s |
+
+End-to-end on a 256 MiB corpus (best of 3; the VM was busy, so ±30% between
+runs is normal):
+
+| Command | Time | Peak RSS | Output |
+|---|---|---|---|
+| `bxmap --threads 1` | 10.6 s | 81 MB | 190 MB |
+| `bxmap --auto-tune` (6 threads) | 5.8 s | 142 MB | 190 MB |
+| `bxmap --extract all --report summary` | 15.7 s | 150 MB | 190 MB |
+| `strings -a -el -n 4` (same corpus) | 11.9 s | 4 MB | 43 MB |
+
+Read that comparison honestly:
+
+- `strings` wins on RAM (it streams line by line and writes far less), and it
+  only scans ASCII + UTF-16LE. bxmap scans five encodings in one pass, which is
+  why its output is ~4x larger on this corpus (every UTF-16LE string also has
+  a UTF-16BE mirror).
+- bxmap wins on wall time once the scan is parallel, and it emits offsets and
+  encodings per record instead of bare text.
+- `--extract` costs roughly 2-3x the plain scan because every string is tested
+  for paths, URLs, e-mails, registry keys and env assignments.
+
+Your storage, CPU and result density will dominate; measure your own dump with
+`bench/bench.py` before quoting any number.
 
 ## Minimum supported Rust version
 
@@ -402,8 +441,16 @@ Rust 1.70.
 
 ## License
 
-Licensed under the GNU Affero General Public License v3.0 only. See
-[LICENSE](LICENSE) for the full license text.
+The `bxmap` library is dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+The `bxmap-cli` frontend in [`cli/`](./cli) is licensed separately under the
+GNU Affero General Public License v3.0 only — see
+[`cli/LICENSE-AGPL`](./cli/LICENSE-AGPL).
 
 ## Minidump process tree
 

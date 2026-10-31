@@ -1,0 +1,47 @@
+{
+  "machine": {
+    "cpu": "Intel64 Family 6 Model 126 Stepping 5, GenuineIntel",
+    "os": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.7",
+    "size_mb": 256,
+    "repeat": 3
+  },
+  "results": [
+    {
+      "label": "bxmap --threads 1",
+      "seconds": 10.702983599999698,
+      "seconds_best": 10.63008119999995,
+      "mib_per_s": 23.918564165603993,
+      "peak_mb": 81.37890625,
+      "output_mb": 190.3657112121582,
+      "exit": 0
+    },
+    {
+      "label": "bxmap --auto-tune",
+      "seconds": 6.490454799999952,
+      "seconds_best": 5.764532499999859,
+      "mib_per_s": 39.442536445982476,
+      "peak_mb": 141.81640625,
+      "output_mb": 190.36610317230225,
+      "exit": 0
+    },
+    {
+      "label": "bxmap --extract all --report summary",
+      "seconds": 16.74289719999979,
+      "seconds_best": 15.64662559999988,
+      "mib_per_s": 15.290065807726707,
+      "peak_mb": 150.08203125,
+      "output_mb": 190.36670780181885,
+      "exit": 0
+    },
+    {
+      "label": "strings -a -el -n 4",
+      "seconds": 12.66478429999961,
+      "seconds_best": 11.914994799999931,
+      "mib_per_s": 20.213530205959202,
+      "peak_mb": 4.140625,
+      "output_mb": 43.16516876220703,
+      "exit": 0
+    }
+  ]
+}
