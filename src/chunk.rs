@@ -7,7 +7,7 @@
 //! bookkeeping and get the offsets subtly wrong.
 
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 
 /// Default window size for streaming scanners (64 KiB).
 pub const CHUNK_SIZE: usize = 1 << 16;
@@ -94,6 +94,64 @@ where
         carry.clear();
         carry.extend_from_slice(&window[window.len() - keep..]);
         window_start += (window.len() - keep) as u64;
+    }
+}
+
+/// Read from a `Read + Seek` source in `chunk_size` windows, retaining up to
+/// `overlap` trailing bytes between windows.
+///
+/// `on_chunk` returns `false` to stop early. `overlap` is clamped to
+/// `chunk_size`, and `chunk_size` to at least one byte.
+pub fn for_each_chunk_reader<R, F>(
+    reader: &mut R,
+    chunk_size: usize,
+    overlap: usize,
+    mut on_chunk: F,
+) -> io::Result<()>
+where
+    R: Read + Seek,
+    F: FnMut(Chunk<'_>) -> bool,
+{
+    let chunk_size = chunk_size.max(1);
+    let overlap = overlap.min(chunk_size);
+    let mut buffer = vec![0u8; chunk_size];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut window_start = 0u64;
+
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+
+    loop {
+        let mut filled = 0usize;
+        while filled < chunk_size {
+            let read = reader.read(&mut buffer[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            return Ok(());
+        }
+        let mut window = Vec::with_capacity(carry.len() + filled);
+        window.extend_from_slice(&carry);
+        window.extend_from_slice(&buffer[..filled]);
+        let carried = carry.len();
+        let keep = window.len().min(overlap);
+        let chunk = Chunk {
+            offset: window_start,
+            data: &window,
+            overlap: carried,
+        };
+        if !on_chunk(chunk) {
+            return Ok(());
+        }
+        carry.clear();
+        carry.extend_from_slice(&window[window.len() - keep..]);
+        window_start += (window.len() - keep) as u64;
+        if window_start >= file_len {
+            return Ok(());
+        }
     }
 }
 

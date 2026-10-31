@@ -4,9 +4,13 @@ version = "0.0.0"
 publish = false
 edition = "2021"
 
+[package.metadata]
+cargo-fuzz = true
+
 [dependencies]
 libfuzzer-sys = "0.4"
 bxmap = { path = ".." }
+tempfile = "3"
 
 [[bin]]
 name = "fuzz_minidump"
@@ -18,6 +22,48 @@ bench = false
 [[bin]]
 name = "fuzz_strings"
 path = "fuzz_targets/fuzz_strings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_carve"
+path = "fuzz_targets/fuzz_carve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_vmware"
+path = "fuzz_targets/fuzz_vmware.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_chunk"
+path = "fuzz_targets/fuzz_chunk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_magic"
+path = "fuzz_targets/fuzz_magic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_entropy"
+path = "fuzz_targets/fuzz_entropy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_artifacts"
+path = "fuzz_targets/fuzz_artifacts.rs"
 test = false
 doc = false
 bench = false

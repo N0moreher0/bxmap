@@ -1,6 +1,6 @@
 #![no_main]
-use libfuzzer_sys::fuzz_target;
 use bxmap::minidump::Minidump;
+use libfuzzer_sys::fuzz_target;
 use std::io::Cursor;
 
 fuzz_target!(|data: &[u8]| {

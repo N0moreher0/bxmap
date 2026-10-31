@@ -1,6 +1,6 @@
 #![no_main]
-use libfuzzer_sys::fuzz_target;
 use bxmap::{extract_strings, NoiseConfig};
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let _ = extract_strings(data, 4, 1000);

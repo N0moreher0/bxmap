@@ -298,6 +298,31 @@ impl Carver {
         self.run(dump_path, Some(out_dir))
     }
 
+    /// Find and validate files from any `Read` source without writing them.
+    /// Writes the input to a temporary file first (suitable for fuzzing/small inputs).
+    pub fn scan_from_reader<R>(&self, mut reader: R) -> io::Result<CarveReport>
+    where
+        R: Read,
+    {
+        use std::io::Write;
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join(format!(
+            "bxmap-fuzz-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut temp_file = File::create(&temp_path)?;
+        std::io::copy(&mut reader, &mut temp_file)?;
+        temp_file.flush()?;
+        drop(temp_file);
+        let result = self.scan(temp_path.to_str().unwrap());
+        let _ = std::fs::remove_file(&temp_path);
+        result
+    }
+
     fn run(&self, dump_path: &str, out_dir: Option<&Path>) -> io::Result<CarveReport> {
         let file_len = std::fs::metadata(dump_path)?.len();
         let mut source = File::open(dump_path)?;

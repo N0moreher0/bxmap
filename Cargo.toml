@@ -14,7 +14,7 @@ rust-version = "1.70"
 [workspace]
 # Single workspace root so cross/docker mounts one directory and
 # target/ + Cargo.lock live at the repo root.
-members = ["cli"]
+members = ["cli", "fuzz"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
