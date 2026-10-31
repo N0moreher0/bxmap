@@ -15,32 +15,70 @@ pub struct Signature {
     pub bytes: &'static [u8],
     /// Human-readable label used in output.
     pub kind: &'static str,
+    /// Carve id (`jpeg`, `png`, `zip`, ...) when [`crate::carve`] can recover
+    /// this format; `None` means "report only". Keeping the id here means
+    /// `--magic-bytes` and `--carve` share one table instead of drifting apart.
+    pub carve: Option<&'static str>,
 }
 
-/// Signatures reported by `--magic-bytes`.
+/// Signatures reported by `--magic-bytes` and reused by `--carve`.
 ///
-/// Adding an entry here is enough for both the CLI report and the future
-/// carver to pick it up.
+/// Adding an entry here is enough for both the CLI report and the carver.
 pub const SIGNATURES: &[Signature] = &[
     Signature {
         bytes: b"MZ",
         kind: "PE/DOS executable",
+        carve: None,
     },
     Signature {
         bytes: b"\x7fELF",
         kind: "ELF executable",
+        carve: None,
     },
     Signature {
         bytes: b"PK\x03\x04",
         kind: "ZIP/Office archive",
+        carve: Some("zip"),
     },
     Signature {
         bytes: b"%PDF-",
         kind: "PDF document",
+        carve: Some("pdf"),
     },
     Signature {
         bytes: b"\x89PNG\r\n\x1a\n",
         kind: "PNG image",
+        carve: Some("png"),
+    },
+    Signature {
+        bytes: b"\xff\xd8\xff",
+        kind: "JPEG image",
+        carve: Some("jpeg"),
+    },
+    Signature {
+        bytes: b"Rar!\x1a\x07\x00",
+        kind: "RAR4 archive",
+        carve: Some("rar4"),
+    },
+    Signature {
+        bytes: b"Rar!\x1a\x07\x01\x00",
+        kind: "RAR5 archive",
+        carve: Some("rar5"),
+    },
+    Signature {
+        bytes: b"7z\xbc\xaf\x27\x1c",
+        kind: "7-Zip archive",
+        carve: Some("7z"),
+    },
+    Signature {
+        bytes: b"\x1f\x8b\x08",
+        kind: "GZIP stream",
+        carve: Some("gzip"),
+    },
+    Signature {
+        bytes: b"SQLite format 3\x00",
+        kind: "SQLite database",
+        carve: Some("sqlite"),
     },
 ];
 

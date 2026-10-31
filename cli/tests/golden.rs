@@ -1511,3 +1511,214 @@ fn golden_report_rejects_unknown_mode() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid --report mode 'bogus'"), "{stderr}");
 }
+
+// --- --carve ---------------------------------------------------------------
+
+/// CRC-32 (IEEE) used by PNG chunk trailers.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xedb8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc ^ 0xffff_ffff
+}
+
+/// A PNG whose IDAT payload is arbitrary bytes (the carver checks structure and
+/// CRCs, not whether the deflate stream decodes).
+fn png_fixture(payload: &[u8]) -> Vec<u8> {
+    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_input = kind.to_vec();
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        out
+    }
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&4u32.to_be_bytes()); // width
+    ihdr.extend_from_slice(&1u32.to_be_bytes()); // height
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, no interlace
+
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    out.extend(chunk(b"IHDR", &ihdr));
+    out.extend(chunk(b"IDAT", payload));
+    out.extend(chunk(b"IEND", &[]));
+    out
+}
+
+/// A structurally valid JPEG: APP0, DQT, SOF0, DHT, SOS, entropy data, EOI.
+fn jpeg_fixture(payload: &[u8]) -> Vec<u8> {
+    fn segment(marker: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xFF, marker];
+        out.extend_from_slice(&((body.len() as u16) + 2).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    let mut out = vec![0xFF, 0xD8];
+    out.extend(segment(
+        0xE0,
+        b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00",
+    ));
+    let mut dqt = vec![0u8];
+    dqt.extend((1u8..=64).collect::<Vec<_>>());
+    out.extend(segment(0xDB, &dqt));
+    let mut sof = vec![8u8];
+    sof.extend_from_slice(&8u16.to_be_bytes());
+    sof.extend_from_slice(&8u16.to_be_bytes());
+    sof.extend_from_slice(&[1, 1, 0x11, 0]);
+    out.extend(segment(0xC0, &sof));
+    let mut dht = vec![0u8, 1];
+    dht.extend_from_slice(&[0u8; 15]);
+    dht.push(0);
+    out.extend(segment(0xC4, &dht));
+    out.extend(segment(0xDA, &[1, 1, 0, 0, 0x3f, 0]));
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+#[test]
+fn golden_carve_writes_validated_files_and_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let png = png_fixture(b"png payload bytes");
+    let jpeg = jpeg_fixture(&vec![0x5au8; 300]);
+
+    let mut dump = vec![0u8; 256];
+    let png_offset = dump.len();
+    dump.extend_from_slice(&png);
+    dump.extend_from_slice(&vec![0u8; 512]);
+    let jpeg_offset = dump.len();
+    dump.extend_from_slice(&jpeg);
+    dump.extend_from_slice(&vec![0u8; 128]);
+
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let out_dir = dir.path().join("carved");
+    let index = dir.path().join("index.ndjson");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "png,jpeg",
+            "--carve-out",
+            out_dir.to_str().unwrap(),
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("carve: 2 file(s) (2 complete)"), "{stderr}");
+
+    let files = std::fs::read_dir(&out_dir).unwrap().count();
+    assert_eq!(files, 2);
+
+    let written = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().contains("-png-"))
+        .map(|entry| std::fs::read(entry.path()).unwrap())
+        .unwrap();
+    assert_eq!(written, png, "carved PNG must be byte-identical");
+
+    let records = std::fs::read_to_string(&index).unwrap();
+    let lines = records.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2, "{records}");
+    assert!(
+        lines[0].contains(&format!("\"offset\":{png_offset}")),
+        "{records}"
+    );
+    assert!(lines[0].contains("\"type\":\"png\""), "{records}");
+    assert!(lines[0].contains("\"complete\":true"), "{records}");
+    assert!(
+        lines[0].contains(&format!("\"size\":{}", png.len())),
+        "{records}"
+    );
+    assert!(
+        lines[1].contains(&format!("\"offset\":{jpeg_offset}")),
+        "{records}"
+    );
+    assert!(lines[1].contains("\"type\":\"jpeg\""), "{records}");
+    assert!(
+        lines[1].contains(&format!("\"size\":{}", jpeg.len())),
+        "{records}"
+    );
+}
+
+#[test]
+fn golden_carve_max_files_truncation_exits_3() {
+    let dir = tempfile::tempdir().unwrap();
+    let png = png_fixture(b"payload");
+    let mut dump = vec![0u8; 64];
+    for _ in 0..2 {
+        dump.extend_from_slice(&png);
+        dump.extend_from_slice(&vec![0u8; 64]);
+    }
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "png",
+            "--carve-out",
+            dir.path().join("out").to_str().unwrap(),
+            "--carve-max-files",
+            "1",
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("CARVE TRUNCATED"), "{stderr}");
+}
+
+#[test]
+fn golden_carve_requires_out_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, b"hello world\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([path.to_str().unwrap(), "--carve", "png"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--carve requires --carve-out"), "{stderr}");
+}

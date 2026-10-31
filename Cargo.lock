@@ -233,9 +233,11 @@ version = "1.0.4"
 dependencies = [
  "aho-corasick",
  "criterion",
+ "flate2",
  "rayon",
  "regex",
  "serde",
+ "sha2",
  "yara-x",
 ]
 

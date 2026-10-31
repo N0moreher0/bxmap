@@ -339,6 +339,43 @@ The Core exposes `scan_yara_from_reader_streaming` and
 file and scans bounded chunks with overlap, so rules crossing an I/O boundary
 remain visible without loading the complete dump into memory.
 
+### File carving (`--carve`)
+
+Recover structured files directly from a raw dump. The carver:
+
+- Uses the same signature table as `--magic-bytes` (one source of truth).
+- Validates every candidate against its format's internal structure before
+  writing: JPEG marker walk + EOI, PNG chunk walk + CRC32, ZIP local-header + EOCD,
+  RAR4/5 block walks, 7-Zip next-header offset, PDF `%%EOF`, GZIP deflate walk +
+  trailer, BMP header consistency, SQLite page size × page count.
+- Deduplicates by SHA-256; identical files found at multiple offsets are recorded
+  once with `duplicates: [offsets]` in the index.
+- Writes files with a neutral `.carved` extension (`<offset:08x>-<kind>-<sha8>.carved`)
+  so nothing auto-executes or auto-opens.
+- Refuses to overwrite existing files: re-running into the same `--carve-out`
+  directory is an error.
+- Produces a separate `--carve-index` (JSON array or NDJSON) so carving never
+  reshapes the string output. Each record has `offset`, `type`, `size`, `sha256`,
+  `entropy`, `complete`, `notes`, `path`, and `duplicates`.
+- Runs before the string scan so a huge cap (`--carve-max-total`, `--carve-max-files`)
+  fails fast with exit code 3.
+
+```powershell
+# Carve everything, write index, don't scan strings
+bxmap dump.bin --carve all --carve-out carved --carve-index idx.ndjson --max-strings 0 --report none
+
+# Only JPEG and PNG, limit total output to 100 MiB
+bxmap dump.bin --carve jpeg,png --carve-out carved --carve-max-total 104857600
+
+# JSON array index instead of NDJSON
+bxmap dump.bin --carve all --carve-out carved --carve-index idx.json
+```
+
+⚠️ **Malware handling warning**: Carved files are raw bytes from the dump.
+They may contain malicious code, exploits, or encrypted payloads. Treat every
+`.carved` file as untrusted: inspect in a sandbox/VM, never open on a host
+machine, and do not execute them.
+
 ## Streaming and parallel scanning
 
 The normal file and reader APIs use bounded streaming memory. They are a good

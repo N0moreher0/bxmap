@@ -106,6 +106,45 @@ bxmap --help
 - `--entropy-no-data` — with `--entropy`, omit the `data_hex` payload and keep
   only `offset`, `length` and `entropy`.
 
+### File carving (`--carve`)
+
+- `--carve <types>` — recover structured files and write them to `--carve-out`.
+  Types: `jpeg`, `png`, `zip`, `rar4`, `rar5`, `7z`, `pdf`, `gzip`, `bmp`,
+  `sqlite`, `all` (comma-separated). Aliases: `rar` (both RAR versions),
+  `jpg` (jpeg), `7zip` (7z). Every candidate is structurally validated before
+  writing; nothing is decrypted, decompressed, or executed.
+- `--carve-out <dir>` — destination directory (required with `--carve`).
+  Existing files are never overwritten; re-running into the same directory
+  exits with an error.
+- `--carve-index <file>` — write the carve index. `.ndjson` = one record per
+  line; anything else = JSON array. The index is a separate channel from
+  `--format` so carving never reshapes the string output.
+  Each record has `offset`, `offset_hex`, `type`, `size`, `sha256`, `entropy`,
+  `complete`, `notes`, `path`, and `duplicates`.
+- `--carve-min-size <N>` — skip files smaller than N bytes (default 64).
+- `--carve-max-size <N>` — per-file ceiling; header-declared sizes are clamped
+  to it (default 64 MiB).
+- `--carve-max-total <N>` — stop after writing N bytes (default 512 MiB,
+  `0` = no limit). Hitting it exits with code 3.
+- `--carve-max-files <N>` — stop after N files (default 1000). Hitting it exits
+  with code 3.
+
+```powershell
+# Carve everything, write NDJSON index, no string scan
+bxmap dump.bin --carve all --carve-out carved --carve-index idx.ndjson --max-strings 0 --report none
+
+# Only JPEG and PNG, limit to 100 MiB total
+bxmap dump.bin --carve jpeg,png --carve-out carved --carve-max-total 104857600
+
+# JSON array index
+bxmap dump.bin --carve all --carve-out carved --carve-index idx.json
+```
+
+⚠️ **Malware handling warning**: Carved files are raw bytes from the dump.
+They may contain malicious code, exploits, or encrypted payloads. Treat every
+`.carved` file as untrusted: inspect in a sandbox/VM, never open on a host
+machine, and do not execute them.
+
 ## Reporting notes
 
 The `throughput` line in `--report summary` is computed over the bytes that
@@ -122,10 +161,10 @@ the CLI adds a hint to write them to a file instead.
 |------|---------|
 | `0` | Scan finished and every extracted record was written. |
 | `1` | Usage or I/O error (bad flag, unreadable input, failed write). The message goes to stderr. |
-| `3` | `--max-strings` stopped the scan early. Results are incomplete; the warning names the offset where scanning stopped. Re-run with a larger limit or `--max-strings 0`. |
+| `3` | `--max-strings`, `--carve-max-total`, or `--carve-max-files` stopped the scan/carve early. Results are incomplete; the warning names the offset where it stopped. Re-run with a larger limit or `--max-strings 0` / remove the carve cap. |
 
 `--report summary` repeats the limit status in the closing summary, and
-`json-tree`/`ndjson` carry `truncated` metadata so scripts can detect code `3`
-without parsing stderr.
+`json-tree`/`ndjson`/`carve-index` carry `truncated` metadata so scripts can
+detect code `3` without parsing stderr.
 
 For library usage see the crate README at <https://docs.rs/bxmap>.

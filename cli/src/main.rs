@@ -1,5 +1,6 @@
 use bxmap::{
     artifacts::{Artifact, ArtifactCollector, ArtifactKinds},
+    carve::{CarveKind, CarveOptions, CarveReport, Carver},
     extract_strings_from_file_parallel_streaming_with_encodings_progress,
     extract_strings_from_file_parallel_with_encodings,
     extract_strings_from_file_streaming_range_with_encodings,
@@ -11,6 +12,7 @@ use bxmap::{
 use regex::Regex;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -368,6 +370,13 @@ struct Args {
     filter_appdata: bool,
     detectors: Vec<Detector>,
     magic_bytes: bool,
+    carve: Option<String>,
+    carve_out: Option<String>,
+    carve_index: Option<String>,
+    carve_min_size: u64,
+    carve_max_size: u64,
+    carve_max_total: u64,
+    carve_max_files: usize,
     tree: bool,
     map_va: bool,
     in_module: Option<String>,
@@ -477,6 +486,21 @@ OPTIONS:
                            Detector output shape (default flat). rich keeps the
                            original text and adds rule/confidence/severity/context.
     --magic-bytes         Report executable/document magic-byte signatures
+    --carve <types>       Recover structured files from the dump and write them
+                          to --carve-out. Types: jpeg,png,zip,rar,7z,pdf,gzip,
+                          bmp,sqlite,all (comma-separated). Every candidate is
+                          structurally validated before it is written; nothing
+                          is decrypted or executed.
+    --carve-out <dir>     Destination directory for carved files (required with
+                          --carve). Existing files are never overwritten.
+    --carve-index <file>  Write the carve index (.ndjson = one record per line,
+                          anything else = JSON array)
+    --carve-min-size <N>  Skip files smaller than N bytes (default 64)
+    --carve-max-size <N>  Per-file ceiling; header sizes are clamped to it
+                          (default 64 MiB)
+    --carve-max-total <N> Stop after writing N bytes (default 512 MiB, 0 = no
+                          limit). Hitting it exits with code 3.
+    --carve-max-files <N> Stop after N files (default 1000)
     --tree                Parse a Windows minidump and print its process tree
                           (modules, threads, memory regions), then exit
     --map-va              For a minidump, add virtual address and module/region
@@ -547,6 +571,13 @@ fn parse_args() -> Result<Args, String> {
         filter_regex: None,
         detectors: Vec::new(),
         magic_bytes: false,
+        carve: None,
+        carve_out: None,
+        carve_index: None,
+        carve_min_size: bxmap::carve::DEFAULT_MIN_SIZE,
+        carve_max_size: bxmap::carve::DEFAULT_MAX_SIZE,
+        carve_max_total: bxmap::carve::DEFAULT_MAX_TOTAL,
+        carve_max_files: bxmap::carve::DEFAULT_MAX_FILES,
         tree: false,
         map_va: false,
         in_module: None,
@@ -694,6 +725,21 @@ fn parse_args() -> Result<Args, String> {
             "--stats" => args.stats = true,
             "--filter-regex" => args.filter_regex = Some(next(&mut i)?),
             "--magic-bytes" => args.magic_bytes = true,
+            "--carve" => args.carve = Some(next(&mut i)?),
+            "--carve-out" => args.carve_out = Some(next(&mut i)?),
+            "--carve-index" => args.carve_index = Some(next(&mut i)?),
+            "--carve-min-size" => {
+                args.carve_min_size = parse_offset(&next(&mut i)?, "--carve-min-size")?;
+            }
+            "--carve-max-size" => {
+                args.carve_max_size = parse_offset(&next(&mut i)?, "--carve-max-size")?;
+            }
+            "--carve-max-total" => {
+                args.carve_max_total = parse_offset(&next(&mut i)?, "--carve-max-total")?;
+            }
+            "--carve-max-files" => {
+                args.carve_max_files = parse_offset(&next(&mut i)?, "--carve-max-files")? as usize;
+            }
             "--tree" => args.tree = true,
             "--map-va" => args.map_va = true,
             "--in-module" => args.in_module = Some(next(&mut i)?),
@@ -2550,6 +2596,104 @@ struct ReportData<'a> {
     detailed: bool,
     /// Whether results went to `-o <file>` (suppresses the terminal hint).
     output_is_file: bool,
+    /// `--carve` summary, when the carve stage ran.
+    carve: Option<&'a CarveReport>,
+}
+
+/// Exit with code `3` when the carve stage stopped at a cap, after saying why.
+fn exit_if_carve_truncated(report: &Option<CarveReport>) {
+    let Some(report) = report else {
+        return;
+    };
+    if !report.truncated {
+        return;
+    }
+    eprintln!(
+        "  [!] CARVE TRUNCATED: stopped after {} file(s) / {} bytes (--carve-max-total or --carve-max-files).",
+        report.files.len(),
+        report.bytes_written
+    );
+    eprintln!("      The carved files are valid, but the dump was not scanned to the end.");
+    std::process::exit(3);
+}
+
+fn print_carve_summary(report: &CarveReport) {
+    let color = io::stderr().is_terminal();
+    if color {
+        eprintln!("\x1b[1;36m  [i] carve: {}\x1b[0m", report.summary_line());
+    } else {
+        eprintln!("  [i] carve: {}", report.summary_line());
+    }
+    for file in report.files.iter().filter(|file| !file.complete).take(5) {
+        eprintln!(
+            "      - incomplete {:#010x} {:<6} {} bytes: {}",
+            file.offset,
+            file.kind.as_str(),
+            file.size,
+            file.notes
+        );
+    }
+    for detail in report.rejected_details.iter().take(3) {
+        eprintln!("      - rejected {detail}");
+    }
+    if let Some(dir) = report
+        .files
+        .iter()
+        .filter_map(|file| file.path.as_ref())
+        .next()
+        .and_then(|path| path.parent())
+    {
+        eprintln!("      wrote files under '{}'", dir.display());
+    }
+}
+
+/// Write the carve index. `.ndjson` writes one record per line, anything else
+/// writes a JSON array. The index is a separate channel from `--format` so
+/// carving never reshapes the string output.
+fn write_carve_index(report: &CarveReport, path: &str) -> io::Result<()> {
+    let ndjson = path.to_ascii_lowercase().ends_with(".ndjson");
+    let mut out = BufWriter::new(File::create(path)?);
+    if !ndjson {
+        writeln!(out, "[")?;
+    }
+    for (index, file) in report.files.iter().enumerate() {
+        let duplicates = file
+            .duplicates
+            .iter()
+            .map(|offset| offset.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let record = format!(
+            "{{\"offset\":{},\"offset_hex\":\"{:#x}\",\"type\":\"{}\",\"size\":{},\"sha256\":\"{}\",\"entropy\":{:.4},\"complete\":{},\"notes\":{},\"path\":{},\"duplicates\":[{}]}}",
+            file.offset,
+            file.offset,
+            file.kind.as_str(),
+            file.size,
+            file.sha256,
+            file.entropy,
+            file.complete,
+            json_escape(&file.notes),
+            match file.path.as_ref() {
+                Some(path) => json_escape(&path.to_string_lossy()),
+                None => "null".to_string(),
+            },
+            duplicates
+        );
+        if ndjson {
+            writeln!(out, "{record}")?;
+        } else {
+            let comma = if index + 1 == report.files.len() {
+                ""
+            } else {
+                ","
+            };
+            writeln!(out, "  {record}{comma}")?;
+        }
+    }
+    if !ndjson {
+        writeln!(out, "]")?;
+    }
+    out.flush()
 }
 
 fn print_report(data: &ReportData<'_>) {
@@ -2633,6 +2777,9 @@ fn print_report(data: &ReportData<'_>) {
                 region.offset, region.length, region.entropy
             );
         }
+    }
+    if let Some(carve) = data.carve {
+        eprintln!("  carve      : {}", carve.summary_line());
     }
 }
 
@@ -3019,6 +3166,26 @@ fn run() -> Result<(), String> {
     if args.xor_exhaustive && args.brute_xor.is_none() {
         return Err("--xor-exhaustive requires --brute-xor".to_string());
     }
+    if args.carve.is_none() {
+        for (flag, set) in [
+            ("--carve-out", args.carve_out.is_some()),
+            ("--carve-index", args.carve_index.is_some()),
+        ] {
+            if set {
+                return Err(format!("{flag} requires --carve"));
+            }
+        }
+    } else {
+        if args.carve_out.is_none() {
+            return Err("--carve requires --carve-out <dir>".to_string());
+        }
+        if args.carve_max_size == 0 {
+            return Err("--carve-max-size must be greater than 0".to_string());
+        }
+        if args.carve_min_size > args.carve_max_size {
+            return Err("--carve-min-size must not exceed --carve-max-size".to_string());
+        }
+    }
     if args.entropy_window == Some(0) {
         return Err("--entropy-window must be greater than 0".to_string());
     }
@@ -3123,6 +3290,35 @@ fn run() -> Result<(), String> {
         )
         .map_err(|e| format!("entropy scan failed: {e}"))?;
     }
+    // --- --carve stage -----------------------------------------------------
+    // Carving is an independent pass: it needs byte ranges, not strings, so it
+    // does not reuse the string scan's callback. It runs before the scan so a
+    // huge carve cap fails fast.
+    let mut carve_report: Option<CarveReport> = None;
+    if let Some(types) = args.carve.as_deref() {
+        let kinds = CarveKind::from_list(types).map_err(|error| format!("--carve: {error}"))?;
+        let out_dir = args
+            .carve_out
+            .as_deref()
+            .ok_or_else(|| "--carve requires --carve-out <dir>".to_string())?;
+        let options = CarveOptions {
+            kinds,
+            min_size: args.carve_min_size,
+            max_size: args.carve_max_size,
+            max_total: args.carve_max_total,
+            max_files: args.carve_max_files,
+        };
+        let report = Carver::new(options)
+            .carve_to_dir(&args.path, Path::new(out_dir))
+            .map_err(|error| format!("carve failed: {error}"))?;
+        if let Some(index_path) = args.carve_index.as_deref() {
+            write_carve_index(&report, index_path)
+                .map_err(|error| format!("cannot write carve index: {error}"))?;
+        }
+        print_carve_summary(&report);
+        carve_report = Some(report);
+    }
+
     let mut yara_matches = Vec::new();
     if let Some(rules_path) = args.yar.as_ref() {
         scan_yara_from_file_streaming(&args.path, rules_path, |matched| {
@@ -3487,6 +3683,7 @@ fn run() -> Result<(), String> {
             detailed: args.report_mode == ReportMode::Summary
                 || args.report_mode == ReportMode::All,
             output_is_file,
+            carve: carve_report.as_ref(),
         });
         if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
             let stats = build_user_stats(&artifacts, args.filter_appdata);
@@ -3496,6 +3693,7 @@ fn run() -> Result<(), String> {
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
         }
+        exit_if_carve_truncated(&carve_report);
         return Ok(());
     }
 
@@ -3650,6 +3848,7 @@ fn run() -> Result<(), String> {
             detailed: args.report_mode == ReportMode::Summary
                 || args.report_mode == ReportMode::All,
             output_is_file,
+            carve: carve_report.as_ref(),
         });
         if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
             let stats = build_user_stats(&artifacts, args.filter_appdata);
@@ -3660,6 +3859,7 @@ fn run() -> Result<(), String> {
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
         }
+        exit_if_carve_truncated(&carve_report);
         return Ok(());
     }
 
@@ -3785,6 +3985,7 @@ fn run() -> Result<(), String> {
             detailed: args.report_mode == ReportMode::Summary
                 || args.report_mode == ReportMode::All,
             output_is_file,
+            carve: carve_report.as_ref(),
         });
         if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
             let stats = build_user_stats(&artifacts, args.filter_appdata);
@@ -3794,6 +3995,7 @@ fn run() -> Result<(), String> {
             print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
             std::process::exit(3);
         }
+        exit_if_carve_truncated(&carve_report);
         return Ok(());
     }
     if args.format == Format::Json || args.format == Format::Ndjson {
@@ -3985,6 +4187,7 @@ fn run() -> Result<(), String> {
         scanned_until: results.iter().map(|r| r.offset).max().unwrap_or(0),
         detailed: args.report_mode == ReportMode::Summary || args.report_mode == ReportMode::All,
         output_is_file,
+        carve: carve_report.as_ref(),
     });
     if args.report_mode == ReportMode::User || args.report_mode == ReportMode::All {
         let stats = build_user_stats(&artifacts, args.filter_appdata);
@@ -3995,5 +4198,6 @@ fn run() -> Result<(), String> {
         print_truncation_notice(args.max_strings, last_offset, range_start, scan_span);
         std::process::exit(3);
     }
+    exit_if_carve_truncated(&carve_report);
     Ok(())
 }

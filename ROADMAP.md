@@ -194,28 +194,28 @@ Thiết kế module (giữ đồng bộ với `bxmap::artifacts`):
 - [x] Chốt quy ước exit code: dùng chung code `3` cho mọi trường hợp "kết quả không đầy đủ" (`--max-strings`, sau này là `--carve-max-total`); cảnh báo trên stderr phải nêu rõ nguồn gây cắt. Đã ghi trong `cli/README.md`.
 
 ### 8.1 Lõi carver
-- [ ] Cờ CLI: `--carve <types>` (vd. `jpeg,png,zip,rar`), `--carve-out <dir>`, `--carve-index <file>`, `--carve-min-size`, `--carve-max-size`, `--carve-max-total`.
-- [ ] Quét streaming tái dùng reader chunk có gối (overlap ≥ độ dài header dài nhất); hỗ trợ `--start/--end` (Phase 3); chạy song song, kết quả ổn định theo offset.
-- [ ] Tìm chữ ký nhanh bằng `memchr`/aho-corasick (dùng lại prefilter đã có ở classifier); không đọc lại toàn dump cho từng loại.
-- [ ] Trần an toàn: dừng khi chạm `--carve-max-total`, in cảnh báo rõ (không im lặng như `--max-strings`), exit code riêng.
+- [x] Cờ CLI: `--carve <types>` (vd. `jpeg,png,zip,rar`), `--carve-out <dir>`, `--carve-index <file>`, `--carve-min-size`, `--carve-max-size`, `--carve-max-total`.
+- [x] Quét streaming tái dùng reader chunk có gối (overlap ≥ độ dài header dài nhất); hỗ trợ `--start/--end` (Phase 3); chạy song song, kết quả ổn định theo offset.
+- [x] Tìm chữ ký nhanh bằng `memchr`/aho-corasick (dùng lại prefilter đã có ở classifier); không đọc lại toàn dump cho từng loại.
+- [x] Trần an toàn: dừng khi chạm `--carve-max-total`, in cảnh báo rõ (không im lặng như `--max-strings`), exit code riêng.
 
 ### 8.2 Bộ validator theo định dạng
-- [ ] **JPEG:** `FF D8 FF` … `FF D9`, đi theo marker (SOI/APPn/DQT/SOF/DHT/SOS), loại false positive; xử lý thumbnail nhúng (EXIF) để không tạo bản trùng lồng nhau.
-- [ ] **PNG:** đi theo chunk, kiểm CRC, kết thúc ở `IEND`.
-- [ ] **ZIP:** `PK\x03\x04` … end-of-central-directory; nhận biết ZIP mã hoá (cờ bit 0) và OOXML/JAR (docx, xlsx, apk...).
-- [ ] **RAR4/RAR5, 7z:** theo chiều dài header; nhận biết archive mã hoá header.
-- [ ] **PDF, GZIP:** theo footer/độ dài; BMP và SQLite ở bước sau (BMP: `BM` + kích thước header; SQLite: page size × số trang).
-- [ ] Luôn chặn kích thước khai trong header bằng `--carve-max-size` và kích thước dump còn lại; không tin header.
-- [ ] Mỗi validator trả về `complete: true|false`, `truncated`, `reason` (vì sao dừng).
+- [x] **JPEG:** `FF D8 FF` … `FF D9`, đi theo marker (SOI/APPn/DQT/SOF/DHT/SOS), loại false positive; xử lý thumbnail nhúng (EXIF) để không tạo bản trùng lồng nhau.
+- [x] **PNG:** đi theo chunk, kiểm CRC, kết thúc ở `IEND`.
+- [x] **ZIP:** `PK\x03\x04` … end-of-central-directory; nhận biết ZIP mã hoá (cờ bit 0) và OOXML/JAR (docx, xlsx, apk...).
+- [x] **RAR4/RAR5, 7z:** theo chiều dài header; nhận biết archive mã hoá header.
+- [x] **PDF, GZIP:** theo footer/độ dài; BMP và SQLite ở bước sau (BMP: `BM` + kích thước header; SQLite: page size × số trang).
+- [x] Luôn chặn kích thước khai trong header bằng `--carve-max-size` và kích thước dump còn lại; không tin header.
+- [x] Mỗi validator trả về `complete: true|false`, `truncated`, `reason` (vì sao dừng).
 
 ### 8.3 Đầu ra và an toàn
-- [ ] Index JSON/NDJSON: `offset`, `type`, `size`, `sha256`, `entropy`, `complete`, `notes`, đường dẫn file đã ghi.
-- [ ] Dedupe theo SHA256; gom các bản trùng thành một dòng kèm danh sách offset.
-- [ ] File ghi ra có đuôi trung tính (`.carved`), tên theo `offset-type-hash`; không mở, không chạy, không giải nén.
-- [ ] Cảnh báo trong README: file carve có thể là mã độc, chỉ xem trong môi trường cô lập.
-- [ ] `--carve-out` là **bắt buộc**: không có thư mục đích thì dừng với lỗi rõ ràng thay vì ghi vào cwd.
-- [ ] Ghi đè an toàn: không ghi ra ngoài `--carve-out`, chống path traversal ở tên file, từ chối ghi đè file đã tồn tại.
-- [ ] Index là kênh riêng (`--carve-index`), không trộn vào `--format` chính; thêm dòng tóm tắt vào `--report summary` (số file, số `complete`, tổng byte).
+- [x] Index JSON/NDJSON: `offset`, `type`, `size`, `sha256`, `entropy`, `complete`, `notes`, đường dẫn file đã ghi.
+- [x] Dedupe theo SHA256; gom các bản trùng thành một dòng kèm danh sách offset.
+- [x] File ghi ra có đuôi trung tính (`.carved`), tên theo `offset-type-hash`; không mở, không chạy, không giải nén.
+- [x] Cảnh báo trong README: file carve có thể là mã độc, chỉ xem trong môi trường cô lập.
+- [x] `--carve-out` là **bắt buộc**: không có thư mục đích thì dừng với lỗi rõ ràng thay vì ghi vào cwd.
+- [x] Ghi đè an toàn: không ghi ra ngoài `--carve-out`, chống path traversal ở tên file, từ chối ghi đè file đã tồn tại.
+- [x] Index là kênh riêng (`--carve-index`), không trộn vào `--format` chính; thêm dòng tóm tắt vào `--report summary` (số file, số `complete`, tổng byte).
 
 ### 8.4 Nhận diện vỏ mã hoá (chỉ khoanh vùng)
 - [ ] Chữ ký container: BitLocker (`-FVE-FS-`), LUKS, OpenSSL (`Salted__`), PGP, VeraCrypt/TrueCrypt (nếu nhận diện được), ZIP/7z/RAR có mã hoá.
@@ -228,8 +228,8 @@ Thiết kế module (giữ đồng bộ với `bxmap::artifacts`):
 - [ ] Thêm định dạng: BMP, SQLite, OLE/Office cũ, MP4, executable (PE/ELF carve).
 
 ### 8.6 Test và đối chiếu
-- [ ] Dump tổng hợp đặt file ở offset biết trước: nằm trọn, vắt qua ranh giới chunk, bị cắt cụt, bị lồng nhau.
-- [ ] Golden test CLI trong `cli/tests/golden.rs` (cùng kiểu các phase trước): carve 1 JPEG + 1 PNG, kiểm index và `complete`.
+- [x] Dump tổng hợp đặt file ở offset biết trước: nằm trọn, vắt qua ranh giới chunk, bị cắt cụt, bị lồng nhau.
+- [x] Golden test CLI trong `cli/tests/golden.rs` (cùng kiểu các phase trước): carve 1 JPEG + 1 PNG, kiểm index và `complete`.
 - [ ] Fuzz validator (`cargo-fuzz`): header khai kích thước khổng lồ, marker lặp vô hạn, chunk PNG sai CRC.
 - [ ] So sánh với foremost, PhotoRec, bulk_extractor trên cùng dump: số file, số false positive, thời gian, RAM.
 - [ ] Case thật: Lab 6 (6 chữ ký RAR → mở bằng mật khẩu tìm thấy), Lab 4 (JPEG/BMP/ZIP trên Desktop); ghi rõ file nào lấy lại được hoàn chỉnh, file nào không.

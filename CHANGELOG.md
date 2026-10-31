@@ -102,6 +102,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   hands out windows with absolute offsets plus the overlap prefix length, so
   signature scanners skip re-reported hits instead of duplicating the carry
   bookkeeping.
+- New `bxmap::carve` module: `CarveKind`, `CarveOptions`, `CarvedFile`,
+  `CarveReport`, `Carver::{scan,carve_to_dir}` and validators for JPEG,
+  PNG, ZIP, RAR4, RAR5, 7z, PDF, GZIP, BMP, SQLite. Carving is an
+  independent pass that runs before the string scan, uses the shared
+  `bxmap::magic::SIGNATURES` table, deduplicates by SHA-256, writes files
+  with a neutral `.carved` extension, and produces a separate `--carve-index`
+  (JSON array or NDJSON).
+- CLI flags: `--carve <types>`, `--carve-out <dir>`, `--carve-index <file>`,
+  `--carve-min-size`, `--carve-max-size`, `--carve-max-total`, `--carve-max-files`.
+  Exit code `3` when a carve cap stops the scan early. `--carve-out` is
+  required with `--carve`; existing files are never overwritten.
+- `bxmap::magic::Signature` gained a `carve` field; `SIGNATURES` extended to
+  11 formats (JPEG, RAR4, RAR5, 7z, GZIP, SQLite).
 
 ### Changed
 - `--magic-bytes` now runs through `bxmap::magic` (Aho-Corasick over the shared
