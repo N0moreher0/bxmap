@@ -35,6 +35,23 @@ pub const DEFAULT_MAX_TOTAL: u64 = 512 * 1024 * 1024;
 /// Files written before the carver stops.
 pub const DEFAULT_MAX_FILES: usize = 1000;
 
+/// Maximum JPEG segment length (64 MiB) - prevents OOM from bogus length fields.
+const MAX_JPEG_SEGMENT: u64 = 64 * 1024 * 1024;
+/// Maximum PNG chunk length (2 GiB, per spec) - already checked against 0x7fff_ffff.
+const MAX_PNG_CHUNK: u64 = 0x7fff_ffff;
+/// Maximum ZIP entry packed size (64 MiB).
+const MAX_ZIP_PACKED: u64 = 64 * 1024 * 1024;
+/// Maximum RAR4 block data size (64 MiB).
+const MAX_RAR4_DATA: u64 = 64 * 1024 * 1024;
+/// Maximum RAR5 block data size (64 MiB).
+const MAX_RAR5_DATA: u64 = 64 * 1024 * 1024;
+/// Maximum GZIP extra field size (1 MiB).
+const MAX_GZIP_EXTRA: u64 = 1024 * 1024;
+/// Maximum GZIP name/comment search length (1 MiB).
+const MAX_GZIP_NAME_COMMENT: u64 = 1024 * 1024;
+/// Maximum PDF search window for %%EOF (64 MiB).
+const MAX_PDF_SEARCH: u64 = 64 * 1024 * 1024;
+
 const READ_BUF: usize = 1 << 16;
 
 /// A format the carver understands.
@@ -756,6 +773,14 @@ fn carve_jpeg(source: &mut Source<'_>) -> io::Result<Verdict> {
             source.skip(2)?;
             continue;
         }
+        // Anti-OOM: segment length must not exceed max size or reasonable limit.
+        let remaining = source.end - source.abs();
+        if length > MAX_JPEG_SEGMENT || 2 + length > remaining {
+            // Corrupt length: resynchronise on the next marker instead of
+            // trusting it.
+            source.skip(2)?;
+            continue;
+        }
         if marker == 0xDA {
             // Start of scan: the entropy-coded data follows and is not
             // length-prefixed, so scan for the next real marker.
@@ -764,11 +789,18 @@ fn carve_jpeg(source: &mut Source<'_>) -> io::Result<Verdict> {
                     "dump ended inside the JPEG SOS header".to_string(),
                 ));
             }
+            // Anti-OOM: limit scan data search to prevent infinite loops.
+            let scan_start = source.abs();
             // Scan data is not length-prefixed, so look for the next 0xFF and
             // decide whether it starts a real marker: FF00 is byte stuffing,
             // FFD0..FFD7 are restart markers and FFFF is padding, none of
             // which ends the scan.
             loop {
+                if source.abs() - scan_start > MAX_JPEG_SEGMENT {
+                    return Ok(Verdict::Invalid(
+                        "JPEG scan data exceeds maximum allowed size".to_string(),
+                    ));
+                }
                 if find_bytes(source, &[0xFF])?.is_none() {
                     return Ok(Verdict::Truncated(
                         "dump ended inside JPEG scan data".to_string(),
@@ -823,10 +855,17 @@ fn carve_png(source: &mut Source<'_>) -> io::Result<Verdict> {
             header[0], header[1], header[2], header[3],
         ]));
         let kind = [header[4], header[5], header[6], header[7]];
-        if length > 0x7fff_ffff {
+        if length > MAX_PNG_CHUNK {
             return Ok(Verdict::Invalid(format!(
                 "implausible PNG chunk length {length}"
             )));
+        }
+        // Anti-OOM: chunk must fit in remaining data.
+        let remaining = source.end - source.abs();
+        if 8 + length + 4 > remaining {
+            return Ok(Verdict::Truncated(
+                "PNG chunk extends past available data".to_string()
+            ));
         }
         source.skip(8)?;
         let mut crc = crc32(0xffff_ffff, &kind);
@@ -907,6 +946,13 @@ fn carve_zip(source: &mut Source<'_>) -> io::Result<Verdict> {
                 ]));
                 let name = u64::from(u16::from_le_bytes([header[26], header[27]]));
                 let extra = u64::from(u16::from_le_bytes([header[28], header[29]]));
+                // Anti-OOM: packed size must not exceed max size or reasonable limit.
+                let remaining = source.end - source.abs();
+                if packed > MAX_ZIP_PACKED || 30 + name + extra + packed > remaining {
+                    return Ok(Verdict::Invalid(format!(
+                        "ZIP entry packed size {packed} exceeds limit or available data"
+                    )));
+                }
                 source.skip(30)?;
                 if source.skip(name + extra)? != name + extra {
                     return Ok(Verdict::Truncated(
@@ -1014,6 +1060,13 @@ fn carve_rar4(source: &mut Source<'_>) -> io::Result<Verdict> {
                 extended[10],
             ]));
         }
+        // Anti-OOM: data size must not exceed max size or reasonable limit.
+        let remaining = source.end - source.abs();
+        if data > MAX_RAR4_DATA || head_size + data > remaining {
+            return Ok(Verdict::Invalid(format!(
+                "RAR4 block data size {data} exceeds limit or available data"
+            )));
+        }
         if source.skip(head_size)? != head_size {
             return Ok(Verdict::Truncated(
                 "dump ended inside a RAR4 block header".to_string(),
@@ -1087,6 +1140,13 @@ fn carve_rar5(source: &mut Source<'_>) -> io::Result<Verdict> {
                 }
             }
         }
+        // Anti-OOM: data size must not exceed max size or reasonable limit.
+        let remaining = source.end - source.abs();
+        if data_size > MAX_RAR5_DATA || data_size > remaining {
+            return Ok(Verdict::Invalid(format!(
+                "RAR5 block data size {data_size} exceeds limit or available data"
+            )));
+        }
         // Block type 5 is the end of the archive.
         if kind == 5 {
             return Ok(Verdict::Valid);
@@ -1137,8 +1197,13 @@ fn carve_pdf(source: &mut Source<'_>) -> io::Result<Verdict> {
         return Ok(Verdict::Invalid("missing %PDF- header".to_string()));
     }
     source.skip(5)?;
+    // Anti-OOM: limit search for %%EOF to prevent scanning entire dump.
+    let search_end = (source.abs() + MAX_PDF_SEARCH).min(source.end);
+    let original_end = source.end;
+    source.end = search_end;
     match find_bytes(source, b"%%EOF")? {
         Some(offset) => {
+            source.end = original_end;
             source.skip(offset - source.abs())?;
             if source.skip(5)? != 5 {
                 return Ok(Verdict::Truncated(
@@ -1179,6 +1244,13 @@ fn carve_gzip(source: &mut Source<'_>) -> io::Result<Verdict> {
             ));
         };
         let extra = u64::from(u16::from_le_bytes(length));
+        // Anti-OOM: extra field size must not exceed limit or available data.
+        let remaining = source.end - source.abs();
+        if extra > MAX_GZIP_EXTRA || 2 + extra > remaining {
+            return Ok(Verdict::Invalid(format!(
+                "GZIP extra field size {extra} exceeds limit or available data"
+            )));
+        }
         source.skip(2)?;
         if source.skip(extra)? != extra {
             return Ok(Verdict::Truncated(
@@ -1186,13 +1258,25 @@ fn carve_gzip(source: &mut Source<'_>) -> io::Result<Verdict> {
             ));
         }
     }
-    if flags & 0x08 != 0 && find_byte(source, 0)?.is_none() {
-        return Ok(Verdict::Truncated(
-            "unterminated GZIP file name".to_string(),
-        ));
+    if flags & 0x08 != 0 {
+        // Anti-OOM: limit name search.
+        let name_start = source.abs();
+        let found = find_byte(source, 0)?;
+        if found.is_none() || source.abs() - name_start > MAX_GZIP_NAME_COMMENT {
+            return Ok(Verdict::Truncated(
+                "unterminated GZIP file name or exceeds limit".to_string(),
+            ));
+        }
     }
-    if flags & 0x10 != 0 && find_byte(source, 0)?.is_none() {
-        return Ok(Verdict::Truncated("unterminated GZIP comment".to_string()));
+    if flags & 0x10 != 0 {
+        // Anti-OOM: limit comment search.
+        let comment_start = source.abs();
+        let found = find_byte(source, 0)?;
+        if found.is_none() || source.abs() - comment_start > MAX_GZIP_NAME_COMMENT {
+            return Ok(Verdict::Truncated(
+                "unterminated GZIP comment or exceeds limit".to_string(),
+            ));
+        }
     }
     if flags & 0x02 != 0 {
         source.skip(2)?;

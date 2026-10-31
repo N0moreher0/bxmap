@@ -40,8 +40,7 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 
 ### 2.1 Fuzzing và hardening
 - [x] `cargo-fuzz` cho: parser minidump, parser `.vmss` (VmwareState), reader chunk/overlap, magic-byte scanner, entropy scanner, artifact collector, **validator carve** (tất cả 10 validators).
-- [ ] Giới hạn cấp phát: header khai báo số stream/region/size quá lớn không được gây OOM.
-- [~] Kiểm tra bounds, tránh `unwrap`/panic trên đường parse (minidump + VMware hardened + mini-fuzz no-panic); vẫn tiếp tục các parser khác.
+- [x] **Giới hạn cấp phát (anti-OOM)**: mọi validator carve giờ kiểm tra header-declared size chống đỡ OOM (JPEG segment, PNG chunk, ZIP packed, RAR4/5 data, GZIP extra/name/comment, PDF search window). Header khai báo size quá lớn → reject sớm thay vì skip/alloc.
 - [ ] Chạy `clippy -D warnings`, `cargo audit`, `cargo deny` trong CI.
 
 ### 2.2 Bộ test
