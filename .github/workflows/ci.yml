@@ -1,0 +1,101 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: cargo fmt --check --manifest-path cli/Cargo.toml
+
+  msrv:
+    name: msrv (lite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.70
+      - name: Check core (lite, MSRV)
+        run: cargo check --locked --no-default-features
+      - name: Check CLI (lite, MSRV)
+        run: cargo check --locked --manifest-path cli/Cargo.toml --no-default-features
+
+  msrv-full:
+    name: msrv (default, full build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80
+      - name: Check core (default, MSRV 1.80)
+        run: cargo check --locked
+      - name: Check CLI (default, MSRV 1.80)
+        run: cargo check --locked --manifest-path cli/Cargo.toml
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --manifest-path cli/Cargo.toml --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --manifest-path cli/Cargo.toml
+      - run: cargo test --locked --no-default-features --all-targets
+      - run: cargo test --locked --manifest-path cli/Cargo.toml --no-default-features
+
+  semver:
+    name: semver-checks (optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-semver-checks --locked
+      - run: cargo semver-checks --crate bxmap
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked -p bxmap
+      - run: cargo package --locked -p bxmap-cli
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

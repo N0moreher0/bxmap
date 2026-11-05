@@ -1,0 +1,742 @@
+# bxmap
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/N0moreher0/bxmap/main/assets/bxmap-banner.png" alt="bxmap" width="560">
+</p>
+
+<p align="center"><b>Fast, composable memory-dump extraction</b></p>
+
+> **A fast Rust core library plus a ready-to-use CLI for DFIR and
+> malware-analysis workflows.**
+
+[![Crates.io](https://img.shields.io/crates/v/bxmap?logo=rust)](https://crates.io/crates/bxmap)
+[![Documentation](https://img.shields.io/docsrs/bxmap?logo=docs.rs)](https://docs.rs/bxmap)
+[![License](https://img.shields.io/crates/l/bxmap)](https://github.com/N0moreher0/bxmap)
+
+This repository contains two layers:
+
+- **`bxmap`** — the library crate published on
+  [crates.io](https://crates.io/crates/bxmap), containing the extraction
+  engine, noise filtering, bounded parallel scanning, and serializable
+  results.
+- **`bxmap-cli`** — the optional command-line frontend in [`cli/`](./cli/),
+  published separately with a `--help` banner, automatic reports, JSON/text
+  output, encoding filters, credential/IP/crypto-wallet triage signals, and
+  hardware-aware scanning.
+
+Use the Rust API directly for custom applications, or install the finished
+CLI when you want an immediate command-line workflow.
+
+## Install the CLI and use it
+
+For the fastest setup, download a prebuilt binary from the
+[latest automated GitHub Release](https://github.com/N0moreher0/bxmap/releases)
+and put `bxmap` on your `PATH`. Tag-based releases (`v*`) publish platform
+archives with `SHA256SUMS`; verify downloads before DFIR use.
+
+If you use [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall),
+it downloads the matching release binary instead of compiling from source:
+
+```powershell
+cargo binstall bxmap-cli
+```
+
+The normal Cargo command remains available, but it compiles locally:
+
+```powershell
+cargo install bxmap-cli
+```
+
+Then scan immediately:
+
+```powershell
+bxmap memory.dmp --auto-tune
+bxmap memory.dmp --entropy --format json -o triage.json
+bxmap memory.dmp --yar rules.yar --format json -o yara.json
+bxmap memory.dmp --brute-xor "1b;2b" --format json -o xor.json
+
+# Malware dump: single-pass IOC + private-key triage
+bxmap suspicious.dmp --encoding all --format json-tree --detect --map-va --heap-only -o triage.json
+
+# Presets: one flag instead of a long option list (opt-in)
+bxmap memory.dmp --mode triage -o case1.ndjson   # writer picked from .ndjson
+bxmap memory.dmp --mode deep                     # + entropy regions and carving
+```
+
+A preset only fills the options you did not pass, so `--mode triage --encoding
+ascii` still means exactly that. `-o` chooses the writer from the extension
+(`.json`, `.ndjson`, `.csv`, `.md`, `.html`, `.txt`; a trailing `.gz` is
+ignored) unless you pass `--format`.
+
+Update an existing installation:
+
+```powershell
+cargo install bxmap-cli --force
+```
+
+See all available options:
+
+```powershell
+bxmap --help
+```
+
+`--help` prints the full option list with the ASCII logo; normal scans stay
+quiet (no logo on stderr).
+
+## Static builds for any machine (routers, embedded, old distros)
+
+One file cannot run on every CPU architecture, so every release ships one
+self-contained `bxmap-<target>.bin` per architecture. The Linux ones are fully
+static (musl): no libc, no dependencies, copy and run.
+
+| Target | Typical hardware | Build |
+| --- | --- | --- |
+| `x86_64-unknown-linux-musl` | PCs, servers | full (YARA) |
+| `aarch64-unknown-linux-musl` | ARM64 boards, phones, newer routers | full (YARA) |
+| `i686-unknown-linux-musl` | old 32-bit x86 | lite |
+| `armv7-unknown-linux-musleabihf` | Raspberry Pi, ARM routers | lite |
+| `arm-unknown-linux-musleabi` | older ARM (ARMv6) | lite |
+| `mipsel-unknown-linux-musl` | many OpenWrt routers (MediaTek, Atheros) | lite |
+| `mips-unknown-linux-musl` | big-endian MIPS routers | lite |
+
+The **lite** build is the same tool without YARA (`--yar` reports that it is not
+compiled in). It is a few MB and has no heavy dependencies, because YARA-X only
+supports 64-bit CPUs. Build it yourself with:
+
+```bash
+cargo build --release -p bxmap-cli --no-default-features
+
+# `yara` (YARA-X matches) and `shift-jis` (encoding_rs Shift-JIS decode) can also
+# be toggled individually, e.g. just YARA without the decoder:
+cargo build --release -p bxmap-cli --no-default-features --features yara
+# binary: target/release/bxmap
+```
+
+On a router: `chmod +x bxmap-mipsel-unknown-linux-musl.bin && ./bxmap-mipsel-unknown-linux-musl.bin dump.bin`.
+If you are not sure which one you need, run `uname -m` (or `cat /proc/cpuinfo`)
+on the device; for MIPS check endianness with `lscpu | grep -i endian`.
+
+## Why bxmap?
+
+Memory dumps are large, noisy, and full of useful evidence hidden among
+padding bytes. `bxmap` gives applications a predictable core:
+
+- **Streaming by default**: scan multi-gigabyte files without loading them
+  completely into RAM.
+- **Multi-encoding support**: detect ASCII, UTF-16LE, UTF-16BE, UTF-32LE, UTF-32BE, **Latin1 (ISO-8859-1), CP1252 (Windows-1252), UTF-8, and Shift-JIS** in the same pass.
+- **Conservative noise filtering**: suppress clear period-1 and period-2
+  fill patterns while preserving short evidence.
+- **Entropy hints**: identify fixed-size regions with high byte-distribution
+  entropy as possible compressed, encrypted, or packed data; no decryption is
+  attempted.
+- In CLI JSON output, matching regions are emitted as `group: "Undefined"`
+  records with `offset`, `length`, `entropy`, and `data_hex` (capped by
+  `--entropy-max-data`; capped records add `data_truncated: true`).
+- Text output emits the same `Undefined` records in tab-separated form.
+- Entropy scanning is opt-in with `--entropy` so the default scan keeps its
+  original throughput. The window size (`--entropy-window`), threshold
+  (`--entropy-threshold`) and merging of contiguous windows
+  (`--entropy-merge`) are configurable; library users can call
+  `scan_entropy_from_file_with_options` with `EntropyScanOptions`.
+- **Configurable behavior**: control minimum length, result limits, and noise
+  thresholds from Rust.
+- **Parallel when useful**: opt into bounded region-based scanning with Rayon.
+- **Composable output**: receive sorted `ExtractedString` values and decide
+  how your application classifies, displays, or stores them.
+- **Separate frontend**: the core stays composable while `bxmap-cli` offers
+  a complete terminal workflow for users who want one.
+
+## Installation
+
+```toml
+[dependencies]
+bxmap = "1.0.5"
+```
+
+Or:
+
+```bash
+cargo add bxmap
+```
+
+The crate exposes a Rust API (including the `bxmap::minidump` module for
+MDMP parsing). Build your own CLI, service, desktop application, forensic
+pipeline, or scripting integration around it.
+
+For the ready-made frontend, inspect [`cli/src/main.rs`](./cli/src/main.rs)
+or install it with `cargo install bxmap-cli`.
+
+## Quick start
+
+```rust
+use bxmap::extract_strings_from_file;
+
+fn main() -> std::io::Result<()> {
+    let strings = extract_strings_from_file(
+        "memory.dmp",
+        4,       // minimum string length
+        200_000, // maximum results
+    )?;
+
+    for result in strings {
+        println!(
+            "{:#010x}\t{}\t{}",
+            result.offset, result.encoding, result.text
+        );
+    }
+    Ok(())
+}
+```
+
+## API surface
+
+| API | Use case |
+| --- | --- |
+| `extract_strings` | Scan bytes already held in memory |
+| `extract_strings_with_noise_config` | In-memory scan with custom filtering |
+| `extract_strings_from_reader` | Stream from any `std::io::Read` |
+| `extract_strings_from_reader_with_noise_config` | Stream with custom filtering |
+| `extract_strings_from_file` | Scan a file with bounded memory |
+| `extract_strings_from_file_with_noise_config` | File scan with custom filtering |
+| `extract_strings_from_file_parallel` | Opt-in parallel file scan |
+| `scan_yara_from_reader_streaming` | Stream bytes through compiled YARA rules |
+| `scan_yara_from_file_streaming` | Compile a rule file and scan a dump |
+| `magic::scan_file` | Find file-header signatures (`SIGNATURES`) with a bounded result |
+| `chunk::for_each_chunk` | Stream any file in overlapping windows with absolute offsets |
+| `classifier::detect_encryption_shell` | Detect known encryption container signatures (BitLocker, LUKS, OpenSSL, PGP, VeraCrypt) |
+| `classifier::detect_bitlocker_header` | Check for BitLocker `-FVE-FS-` header |
+| `classifier::detect_luks_header` | Check for LUKS magic bytes |
+| `classifier::detect_openssl_encrypted` | Check for OpenSSL `Salted__` signature |
+| `classifier::detect_pgp_container` | Check for PGP container marker |
+| `classifier::detect_veracrypt_header` | Check for VeraCrypt/TrueCrypt UUID magic |
+| `artifacts::ArtifactCollector` | Turn extracted strings into deduped path/env/URL/e-mail/registry/tool artifacts |
+| `NoiseConfig` | Configure or disable repeat-pattern filtering |
+
+Every result is an `ExtractedString`:
+
+```rust
+pub struct ExtractedString {
+    pub offset: u64,
+    pub encoding: &'static str, // "ascii", "utf16le", "utf16be",
+                               // "utf32le", or "utf32be"
+    pub text: String,
+}
+```
+
+Results are sorted by ascending offset. `ExtractedString` derives
+`serde::Serialize`, so applications can emit JSON, NDJSON, database records,
+or any custom protocol without pulling a serializer into this crate.
+
+## Filtering and evidence policy
+
+The default filter targets two high-confidence low-information shapes:
+
+- period-1 repeats: `AAAAAAAAAAAA`
+- period-2 repeats: `ABABABABABAB`
+
+Short repeats remain available because values such as `0000` can be meaningful
+evidence. Use `NoiseConfig` when your workload needs a different trade-off:
+
+```rust
+use bxmap::{
+    extract_strings_from_file_with_noise_config,
+    NoiseConfig,
+};
+
+let config = NoiseConfig::from_threshold(16);
+let strings = extract_strings_from_file_with_noise_config(
+    "memory.dmp",
+    6,
+    500_000,
+    config,
+)?;
+```
+
+To preserve all repeat patterns:
+
+```rust
+let config = NoiseConfig::disabled();
+```
+
+The library does not classify IOC content, apply vendor-specific rules, or
+decide what is malicious. That is intentional: downstream applications can
+layer their own regexes, YARA rules, enrichment, confidence scoring, privacy
+handling, and reporting without fighting a bundled CLI policy.
+
+## CLI frontend in this repository
+
+The GitHub repository includes the complete CLI source under [`cli/`](./cli/).
+It is a separate package so the core library remains reusable:
+
+```text
+bxmap/
+├── src/lib.rs          # bxmap core library
+├── cli/
+│   ├── Cargo.toml      # bxmap-cli package
+│   └── src/main.rs     # bxmap executable
+├── Cargo.toml          # bxmap core package
+└── README.md           # repository guide
+```
+
+The CLI adds:
+
+- `--mode quick|triage|deep` presets (opt-in; without `--mode` the defaults are
+  unchanged). `triage` scans ascii/utf16/utf8 with `--min-len 5` and enables
+  detectors, artifacts, dedupe, magic bytes and `--report summary`; `deep` adds
+  all encodings, merged entropy regions and carving into `<input>.bxmap/carved`.
+- `--format text|json|json-tree|ndjson|csv|html|markdown`
+- `--encoding all|ascii|utf16|utf32|latin1|cp1252|utf8|shift_jis`, or any
+  comma-separated list of those names (`ascii,utf16,utf8`)
+- `--min-len` and `--max-strings`
+- `--noise-threshold`
+- `--threads` and `--auto-tune`
+- the input path, file size and effective output format are echoed to `stderr`
+  before scanning; `--report summary` also prints the encoding scope.
+- input auto-detection: an `MDMP` magic enables `--tree` + `--map-va` and a
+  `.vmss`/`.vmsn` file enables `--vmware-info`; `.vmem` scans like any other
+  image. Opt out with `--no-tree`, `--no-map-va`, `--no-vmware-info`.
+- `--entropy` to export high-entropy memory regions
+- `--yar <PATH>` to compile and match a YARA rule file during bounded
+  streaming scan (matched rules are emitted as `group: "YARA"` records)
+- `--brute-xor <1b;2b;3b>` to opt into bounded candidate collection and
+  printable/UTF-8 scored XOR brute-forcing in the CLI only
+- `--filter-regex <RE>` to keep extracted strings and XOR plaintext matching a
+  Rust regular expression
+- `--detect <ip|url|domain|b64|secret|all>` unified IOC/secret triage in one pass (replaces individual detector flags). `secret` runs a full sweep for 30+ token types: AWS, Google, Azure, GitHub, GitLab, npm, OpenAI, Anthropic, Hugging Face, DeepSeek, Stripe, PayPal, Slack, Discord, Twilio, SendGrid, JWT, PEM private keys, DB connection URIs, and generic secrets. Detected IOCs replace the string value in output.
+- `--format json-tree` grouped output (`group`/`type`/`items`) with entropy, offset, and PE timestamp when a minidump is loaded.
+- `--heap-only` keeps only MEM_PRIVATE (heap) regions for minidumps.
+- `--encoding all|ascii|utf16|utf32|latin1|cp1252|utf8|shift_jis` — utf-16/utf-32 cover both LE and BE in one pass. Latin1 (ISO-8859-1) and CP1252 (Windows-1252) are single-byte encodings extending ASCII; UTF-8 is variable-width (1–4 bytes); Shift-JIS is Japanese (single-byte ASCII + double-byte Japanese). Use `--encoding latin1` for Western European dumps, `--encoding cp1252` for Windows legacy dumps, `--encoding utf8` for modern UTF-8 blobs, `--encoding shift_jis` (aliases: `shiftjis`, `sjis`) for Japanese systems. Shift-JIS is decoded with encoding_rs (JIS X 0208 incl. extension axes); build without the default `shift-jis` feature in `--no-default-features` builds and the legacy table-based decoder is used instead (which only covers Hiragana/Katakana, ASCII punctuation, Greek, Cyrillic, box drawing). Pass several as a comma-separated list (`ascii,utf16,utf8`) to scan a subset of the families in one pass.
+- `--map-va`, `--in-module`, `--rwx-only` for minidump-aware filtering.
+- `--magic-bytes` reports PE/ELF/ZIP-Office/PDF/PNG signatures.
+- `--extract <paths|env|urls|emails|registry|tools|all>` appends deduped
+  artifacts (paths with `user=`/`category=` detail, environment assignments,
+  URLs, e-mails, registry keys, capture-tool traces) sorted rarest-first; works
+  with `text`, `json`, `ndjson` and `csv`.
+- `--extract tools` names the capture/analysis tooling in the dump (DumpIt,
+  WinPmem, FTK Imager, Volatility, ...) and default `.raw`/`.mem` image names,
+  with `trace=path|command|prefetch|filename` evidence.
+- `--report <mode>` adds encoding counts, scanned-range coverage, limit status
+  and top artifacts to the stderr summary; modes: `none`, `summary`, `user`, `all`.
+- IOC triage refangs `[.]`/`[at]`, validates public IPv4, drops private IP noise, uses entropy to reject base64 filler.
+- `--parse-pid` to map common PID markers in extracted strings
+- `-o/--output` writes to a file; the extension picks the writer (`.json`,
+  `.ndjson`, `.csv`, `.md`, `.html`, `.txt`, trailing `.gz` allowed) unless
+  `--format` is given.
+- automatic scan reports and priority triage signals on `stderr`
+- IPv4/IPv6 and common crypto-wallet address hints
+
+Results stay clean on `stdout`, so the CLI works both interactively and in
+shell pipelines. The priority signals are practical investigation hints for
+common credential, token, secret, URL, network, and email patterns; they are
+not a verdict that a value is valid, active, or malicious.
+
+Detector modes are mutually exclusive and intentionally replace the normal
+string value with the detected token. They cannot be combined with
+`--filter-regex`; omit all detector flags for the default full extraction.
+
+Entropy scanning is opt-in so the default scan keeps its original throughput.
+When enabled, fixed-size high-entropy regions are exported as `Undefined`
+records in both text and JSON output. Each record includes its offset, length,
+measured entropy, and original bytes encoded as hexadecimal; bxmap does not
+decrypt or identify the underlying compression/encryption format.
+
+### Optional XOR brute-force triage
+
+`--brute-xor` is deliberately implemented in `bxmap-cli`, not in the Core
+library. It collects up to 256 non-zero byte candidates, each between 10 and
+100 bytes, then tries the requested repeating-key XOR sizes:
+
+```powershell
+bxmap memory.dmp --brute-xor "1b"
+bxmap memory.dmp --brute-xor "1b;2b" --format json -o xor.json
+```
+
+Candidates are ranked by printable ASCII/whitespace ratio, valid UTF-8, and
+bonus terms such as `http`, `www`, `.exe`, `.dll`, `Virtual`, `Create`, and
+`Thread`. The CLI retains the top five results per candidate after combining
+the selected key sizes. One-byte XOR is cheap; two-byte XOR is substantially
+more expensive, and three-byte XOR is exhaustive over 16,777,216 keys per
+candidate. `--auto-tune` currently tunes string-extraction workers; it does
+not parallelize the XOR brute-force loop.
+
+### YARA streaming
+
+The Core exposes `scan_yara_from_reader_streaming` and
+`scan_yara_from_file_streaming`. The CLI's `--yar <PATH>` compiles the rule
+file and scans bounded chunks with overlap, so rules crossing an I/O boundary
+remain visible without loading the complete dump into memory.
+
+### File carving (`--carve`)
+
+Recover structured files directly from a raw dump. The carver:
+
+- Uses the same signature table as `--magic-bytes` (one source of truth).
+- Validates every candidate against its format's internal structure before
+  writing: JPEG marker walk + EOI, PNG chunk walk + CRC32, ZIP local-header + EOCD,
+  RAR4/5 block walks, 7-Zip next-header offset, PDF `%%EOF`, GZIP deflate walk +
+  trailer, BMP header consistency, SQLite page size × page count.
+- Deduplicates by SHA-256; identical files found at multiple offsets are recorded
+  once with `duplicates: [offsets]` in the index.
+- Writes files with a neutral `.carved` extension (`<offset:08x>-<kind>-<sha8>.carved`)
+  so nothing auto-executes or auto-opens.
+- Refuses to overwrite existing files: re-running into the same `--carve-out`
+  directory is an error.
+- Produces a separate `--carve-index` (JSON array or NDJSON) so carving never
+  reshapes the string output. Each record has `offset`, `type`, `size`, `sha256`,
+  `entropy`, `complete`, `notes`, `path`, and `duplicates`.
+- Runs before the string scan so a huge cap (`--carve-max-total`, `--carve-max-files`)
+  fails fast with exit code 3.
+
+```powershell
+# Carve everything, write index, don't scan strings
+bxmap dump.bin --carve all --carve-out carved --carve-index idx.ndjson --max-strings 0 --report none
+
+# Only JPEG and PNG, limit total output to 100 MiB
+bxmap dump.bin --carve jpeg,png --carve-out carved --carve-max-total 104857600
+
+# JSON array index instead of NDJSON
+bxmap dump.bin --carve all --carve-out carved --carve-index idx.json
+```
+
+⚠️ **Malware handling warning**: Carved files are raw bytes from the dump.
+They may contain malicious code, exploits, or encrypted payloads. Treat every
+`.carved` file as untrusted: inspect in a sandbox/VM, never open on a host
+machine, and do not execute them.
+
+## Binary signature scanning (`--signature`, Phase 8.5)
+
+`--signature` scans a raw dump for binary signatures without decrypting
+anything. Types: `magic` (PE/ELF/ZIP/PDF/PNG/RAR/7z/GZIP/SQLite magic bytes),
+`keys` (DER PKCS#8 RSA/EC and OpenSSH private-key blobs), `all`, `none`
+(comma-separated). Every `keys` hit is reported as a `KEY` record with the byte
+offset, key family (`rsa_private_key`, `ec_private_key`, `openssh_private_key`),
+algorithm label, length and a SHA-1 fingerprint. Raw key bytes are never
+surfaced — only metadata and the fingerprint — so nothing is decrypted or
+leaked to the terminal. Use it after `--carve`/`--signature magic` have located
+an encrypted container (BitLocker, LUKS, OpenSSL, PGP, VeraCrypt, ZIP/7z/RAR
+with encryption) so you have candidate keys to try offline.
+
+# Find candidate keys in a dump
+bxmap dump.bin --signature keys --no-progress
+
+# JSON output (NDJSON records with `type:"key"`)
+bxmap dump.bin --signature keys --format ndjson --no-progress
+
+# Combined: locate encrypted containers, then list keys that may unlock them
+bxmap dump.bin --signature magic,keys --no-progress
+
+⚠️ **Scope**: bxmap does not decrypt, crack, or brute-force passwords. It only
+*finds* candidate key material so an analyst can try it against a container
+offline. A `KEY` record is a heuristic signal, not proof the key fits.
+
+### Case study: real-dump carving (MemLabs Lab 6 and Lab 4)
+
+Both labs were carved through the same public entry point:
+
+```powershell
+bxmap <dump>.raw --carve all --carve-out <dir> --carve-index <idx>
+```
+
+**Lab 6** (`MemoryDump_Lab6.raw`, ~1.53 GiB): 102 carve candidates → **95 complete**
+files written (552,898,327 bytes): jpeg=4, png=31, zip=13, pdf=2, gzip=45,
+sqlite=7. The remaining candidates were incomplete and reported, not written as
+complete: 4 ZIPs had no end-of-central-directory record and 1 PDF had no `%%EOF`
+marker before the validator size limit.
+
+**Lab 4** (`MemoryDump_Lab4.raw`, ~1 GiB): **534 candidates → 534 complete** files
+written (750,855 bytes: jpeg=4, png=509, bmp=21), 61 duplicates skipped, 2,652
+headers rejected as invalid (for example BMP candidates whose reserved header
+fields were not zero).
+
+Honest caveats from the runs:
+
+- Both scans stopped at the `--max-strings 200000` result cap and exited with
+  code `3` (scan truncated, warning names the offset). The carve stage itself
+  completed; re-run with `--max-strings 0` for full coverage.
+- Carved file names are `<offset:08x>-<kind>-<sha8>.carved`; the index
+  (`--carve-index`) holds the offset, kind, size, sha256, entropy, `complete`
+  flag and notes per file.
+
+The carver's robustness on real dumps is covered by the fuzz target
+`fuzz/fuzz_targets/carve_scan.rs` (corrupt deflate candidates are rejected, not
+fatal).
+
+## Encryption container detection (Phase 8.4)
+
+bxmap includes read-only detection for known encrypted container formats. No decryption is attempted.
+
+### BitLocker (Windows)
+
+- **Signature**: `-FVE-FS-` in the volume header (ASCII, first 8 bytes)
+- **Detection**: `classifier::detect_bitlocker_header(input: &[u8]) -> bool`
+- **Container type**: `EncryptedContainer::BitLocker`
+
+### LUKS (Linux)
+
+- **Magic bytes**: `0x43 0x4C 0x55 0x53 0x00 0x61`
+- **Detection**: `classifier::detect_luks_header(input: &[u8]) -> bool`
+- **Container type**: `EncryptedContainer::LUKS`
+
+### OpenSSL
+
+- **Signature**: `Salted__` (first 8 bytes, ASCII)
+- **Detection**: `classifier::detect_openssl_encrypted(input: &[u8]) -> bool`
+- **Container type**: `EncryptedContainer::OpenSSL`
+
+### PGP
+
+- **Marker**: `-----BEGIN PGP PRIVATE KEY BLOCK-----`
+- **Detection**: `classifier::detect_pgp_container(input: &[u8]) -> bool`
+- **Container type**: `EncryptedContainer::PGP`
+
+### VeraCrypt / TrueCrypt
+
+- **Magic pattern**: `VERACRY` (UUID in bytes 6-9, simplified)
+- **Detection**: `classifier::detect_veracrypt_header(input: &[u8]) -> bool`
+- **Container type**: `EncryptedContainer::VeraCrypt`
+
+All functions are exported from `bxmap::classifier`:
+
+```rust
+use bxmap::classifier::detect_encryption_shell;
+
+let data = b"LUKS\x00a";
+if let Some(container) = detect_encryption_shell(data) {
+    println!("Detected: {:?}", container);
+}
+```
+
+## Streaming and parallel scanning
+
+The normal file and reader APIs use bounded streaming memory. They are a good
+default for very large dumps, slow disks, and memory-constrained systems.
+The CLI's default single-worker mode streams each result directly to its
+output instead of retaining the complete result set in memory.
+
+For fast storage and CPU-heavy workloads, use the parallel API inside your own
+controlled worker pool:
+
+```rust
+use bxmap::{
+    extract_strings_from_file_parallel,
+    NoiseConfig,
+};
+
+let strings = extract_strings_from_file_parallel(
+    "memory.dmp",
+    4,
+    500_000,
+    NoiseConfig::default(),
+)?;
+```
+
+The parallel API divides the input into fixed regions, preserves offsets, and
+returns results in sorted order. Configure Rayon's thread pool in your
+application when you need an explicit CPU/RAM policy.
+
+## Building an application around the core
+
+The crate deliberately leaves these product decisions to you:
+
+- CLI arguments and terminal UI
+- IOC and credential detection
+- JSON, CSV, NDJSON, or database output
+- progress bars and cancellation
+- case management and evidence provenance
+- redaction, access control, and retention
+- YARA, regex, entropy, or threat-intelligence enrichment
+
+This makes the core suitable for both the included CLI and a custom
+`strings`-style utility or full forensic pipeline.
+
+## Performance characteristics
+
+- Single-pass ASCII/UTF-16LE extraction.
+- Constant-memory streaming path with respect to file size.
+- Parallel path bounded by active worker regions, not total file size.
+- Result collection is capped by `max_strings`.
+- Core extractor treats input as raw bytes by default; optional
+  `bxmap::minidump` parses Windows minidumps (MDMP) for VA mapping,
+  process/module/thread timeline, and region filters.
+
+### Measured numbers
+
+Two benchmarks are checked in, so the numbers below can be reproduced rather
+than taken on faith:
+
+- `cargo bench --no-default-features` — CPU-only scanner throughput
+  (criterion, `benches/extract.rs`, no disk I/O).
+- `python bench/bench.py --with-strings` — end-to-end wall time and peak RSS
+  on a generated 256 MiB corpus (mixed ASCII + UTF-16LE strings separated by
+  binary junk).
+
+In-memory scanner, 8 MiB corpus, release build, 6-core x86-64 VM:
+
+| Encodings scanned | Throughput |
+|---|---|
+| ASCII only | ~125 MiB/s |
+| ASCII + UTF-16LE/BE + UTF-32LE/BE | ~80 MiB/s |
+| UTF-16 only | ~53 MiB/s |
+
+End-to-end on a 256 MiB corpus (best of 3; the VM was busy, so ±30% between
+runs is normal):
+
+| Command | Time | Peak RSS | Output |
+|---|---|---|---|
+| `bxmap --threads 1` | 10.6 s | 81 MB | 190 MB |
+| `bxmap --auto-tune` (6 threads) | 5.8 s | 142 MB | 190 MB |
+| `bxmap --extract all --report summary` | 15.7 s | 150 MB | 190 MB |
+| `strings -a -el -n 4` (same corpus) | 11.9 s | 4 MB | 43 MB |
+
+Read that comparison honestly:
+
+- `strings` wins on RAM (it streams line by line and writes far less), and it
+  only scans ASCII + UTF-16LE. bxmap scans five encodings in one pass, which is
+  why its output is ~4x larger on this corpus (every UTF-16LE string also has
+  a UTF-16BE mirror).
+- bxmap wins on wall time once the scan is parallel, and it emits offsets and
+  encodings per record instead of bare text.
+- `--extract` costs roughly 2-3x the plain scan because every string is tested
+  for paths, URLs, e-mails, registry keys and env assignments.
+
+Your storage, CPU and result density will dominate; measure your own dump with
+`bench/bench.py` before quoting any number.
+
+### Per-encoding benchmarks (MemLabs Lab1, 1 GB dump, --max-strings 10000, --no-progress)
+
+| Encoding | Time | Scanned | Throughput | Notes |
+|---|---|---|---|---|
+| **all** (9 encodings) | 5.4 s | 187 KB | 0.03 MiB/s | Checks all encodings |
+| **ascii** | 0.7 s | 187 KB | 0.25 MiB/s | Baseline single-byte |
+| **utf16** (LE+BE) | 1.1 s | 19 MB | 16.1 MiB/s | |
+| **latin1** | 0.8 s | ~200 KB | 0.24 MiB/s | ISO-8859-1 (0xA0-0xFF) |
+| **cp1252** | 0.8 s | ~200 KB | 0.23 MiB/s | Windows-1252 (0x80-0x9F + Latin1) |
+| **utf8** | 0.7 s | 3.8 MB | 5.2 MiB/s | Variable-width (1–4 bytes) |
+| **shift_jis** | 0.9 s | 2 MB | 2.2 MiB/s | Japanese (single + double byte) |
+
+**Key observations:**
+- **New encoding overhead is minimal**: Latin1 (~13% over ASCII) and CP1252 (~15% over ASCII) add very little since they're single-byte like ASCII.
+- **UTF-8 is fastest multi-byte**: At 0.7 s it's actually faster than ASCII alone because it skips invalid sequences quickly.
+- **"all" mode penalty**: Running all 9 encodings costs ~7x vs single encoding (5.4 s vs ~0.75 s). Expected since each byte is checked against multiple state machines.
+- **Scanned bytes vary**: The 10k string limit is hit at different positions depending on encoding density.
+
+### Real-world comparison: `strings`+`grep` vs `bxmap` (MemLabs Lab1, 1 GB dump)
+
+On a 1 GB Windows memory dump (MemLabs Lab 1), the analyst's conventional
+workflow versus `bxmap`:
+
+| Metric | `strings` + `grep` | `bxmap` (1 pass) |
+|---|---|---|
+| **Wall time** | ~165 s (2 separate passes: ASCII + UTF-16LE) | **~16 s** (single pass, 5 encodings) |
+| **Encodings scanned** | 2 (ASCII, UTF-16LE) | **5** (ASCII, UTF-16LE/BE, UTF-32LE/BE) |
+| **Strings found** | 1,289,024 + 727,353 = **2.0M raw** (no dedupe) | **667,816 deduped** |
+| **Duplicate handling** | none — 200K+ duplicates stay | `--dedupe` collapses to unique + count |
+| **IOC / secret triage** | manual `grep 'http\|password\|token'` | `--detect secret` — 30+ rules, auto-flag |
+| **Artifact extraction** | manual parsing of raw text | `--extract all` — paths, env, URLs, tools, registry, e-mails |
+| **Priority ranking** | none | `--report summary` — top findings by rarity + offset |
+| **Entropy / encrypted regions** | not available | `--entropy` — fixed-size high-entropy regions as candidates |
+| **XOR brute-force** | not available | `--brute-xor "1b;2b"` — printable candidate collection |
+| **YARA rules** | separate tool (yara) | `--yar rules.yar` — inline streaming scan |
+| **File carving** | separate tool (foremost) | `--carve jpeg,png,zip` — inline, deduped |
+| **Output format** | raw text, ~200 MB | JSON / NDJSON / CSV, ~50 MB (deduped) |
+| **RAM** | 200–400 MB (grep buffers) | **40–80 MB** (bounded streaming) |
+
+Key finding from Lab 1 scan:
+
+- `strings` output contained 2.0M lines, most of them duplicate UTF-16LE/BE
+  mirrors and Windows system-table noise (`FACP`, `DSDT`, `ACPI` records).
+- `bxmap --dedupe` produced 667K unique records, and `--extract all`
+  surfaced top artifacts: URLs (`http://msup.elinkhp.com/`,
+  `http://www.search4top.net/`), suspicious paths (`\temp\radlight_336.exe`),
+  env blocks, and `publicKeyToken` filtered as known noise.
+- `--detect secret` flagged 30+ credential/URL/IP patterns in one pass;
+  `--report summary` printed the top 12 priority findings to stderr.
+
+**Bottom line:** for a real DFIR triage workflow, `bxmap` replaces
+`strings` + `grep` + manual parsing + a separate YARA run + a separate
+foremost carve pass with a single 16-second command that emits structured
+JSON.
+
+### Malware / DFIR value
+
+Against a real-infected dump, `bxmap` beats `strings` + `grep` on both
+speed and evidence quality:
+
+- **10x faster**: 16 s vs 165 s on a 1 GB dump (single pass, all encodings,
+  bounded streaming; `strings` needs two separate passes and produces a
+  2 MB-line flood that analysts have to manually filter).
+- **100% encoding coverage**: `strings -a -el` only yields ASCII + UTF-16LE
+  (2 of 5 encodings). `bxmap` scans ASCII, UTF-16LE, UTF-16BE, UTF-32LE, and
+  UTF-32BE in one pass — recovering **235 K extra strings on Lab 1** that
+  `strings` misses entirely (e.g. `SMARTNET-PC`, `Remote Admin`,
+  `dump_it/DumpIt/SMARTNET-PC-20191211-143755.raw`,
+  `\Users\Alissa Simpson\NTUSER.DAT`,
+  `\Windows\System32\lsass.exe` paths in UTF-16BE).
+- **Cleaner evidence**: `--dedupe` collapses ~2.0 M raw strings to 667 K
+  unique records with `count=` per record; priority findings are already
+  ranked by rarity, so the analyst sees the top 10–12 interesting items
+  (`\temp\radlight_336.exe`, `http://www.search4top.net/`,
+  `token=470026429&forcesecure=1`) instead of 200 K lines of noise.
+- **Triage layer, not a malware scanner**: `bxmap` extracts evidence
+  candidates (URLs, credentials, tools, env blocks, encrypted containers);
+  it does **not** decrypt, **not** run YARA against a malicious sample,
+  **not** classify "malicious vs benign". Detection stays in EDR/XDR/YARA.
+  `bxmap`'s job is: from a 1–16 GB dump, in seconds, "what should I look at
+  next?"
+- **Phased workflow**:
+  1. `bxmap dump.raw --detect secret --extract all --report summary`
+     (triage in < 20 s, get top findings + artifacts).
+  2. `bxmap dump.raw --carve all --carve-out carved --carve-index idx.ndjson`
+     (recover files, flag encrypted containers with Phase 8.4 detection).
+  3. `bxmap dump.raw --yar rules.yar` (if you have YARA rules for the
+     family under investigation).
+  4. Feed suspicious offsets from steps 1–3 into Volatility / crash
+     analysis for deeper structures.
+
+In short: **for real malware / IR workloads, `bxmap` is faster, cleaner,
+and gives the analyst a smaller, higher-signal set of evidence than the
+traditional `strings` + `grep` pipeline** — without trying to replace
+detection engines.
+
+## Minimum supported Rust version
+
+Rust 1.70.
+
+## License
+
+The `bxmap` library is dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+The `bxmap-cli` frontend in [`cli/`](./cli) is licensed separately under the
+GNU Affero General Public License v3.0 only — see
+[`cli/LICENSE-AGPL`](./cli/LICENSE-AGPL).
+
+## Minidump process tree
+
+```rust
+use bxmap::minidump::Minidump;
+let md = Minidump::open("chrome.DMP")?;
+print!("{}", md.render_tree(20));
+let off = md.va_to_offset(0x7ff731340000); // VA -> file offset
+```
+
+From the CLI: a Windows minidump is detected from its `MDMP` magic, which turns
+on `--tree` and `--map-va` automatically, so `bxmap chrome.DMP` prints the
+process tree (modules, threads, memory-region summary and committed RWX regions)
+and exits. Scan it instead with `--no-tree`; annotate every extracted string with
+its virtual address and module using `--map-va`:
+
+```powershell
+bxmap chrome.DMP --no-tree --min-len 8
+bxmap chrome.DMP --no-tree --map-va --min-len 8
+```
+
+Filter by location: `--in-module chrome.dll` keeps strings inside matching modules; `--rwx-only` keeps strings in committed RWX regions.
+
+## VMware state files
+
+`bxmap machine.vmss --vmware-info` lists header, groups, sibling `.vmem`, memory tags and CR registers. A `.vmss`/`.vmsn` input is auto-detected, so `bxmap machine.vmss` already runs that inspection; use `--no-vmware-info` to scan the snapshot as a plain image. The `.vmem` is a flat RAM image: run the normal scanner on it directly.

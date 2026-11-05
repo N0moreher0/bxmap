@@ -1,0 +1,57 @@
+[package]
+name = "bxmap"
+version = "1.0.5"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "⚡Bxmap - Fast streaming (ASCII, UTF-16LE, UTF-16BE, UTF-32) string extractor for raw memory dump/binary files"
+readme = "README.md"
+repository = "https://github.com/N0moreher0/bxmap"
+# repository cũ vẫn redirect được, nhưng đổi luôn cho brand mới
+keywords = ["strings", "forensics", "binary", "firmware", "dfir"]
+categories = ["parsing", "command-line-utilities"]
+# MSRV 1.70 chỉ áp dụng cho bản lite (`--no-default-features`). Bản đầy đủ
+# (mặc định, kéo yara-x/wasmtime/cranelift) cần Rust ≥ 1.80 (xác thực qua
+# `cargo +1.80 check --locked`; 1.75 fail do rayon 1.12 yêu cầu 1.80+).
+rust-version = "1.70"
+
+[workspace]
+# Single workspace root so cross/docker mounts one directory and
+# target/ + Cargo.lock live at the repo root.
+members = ["cli"]
+
+[[bench]]
+name = "extract"
+harness = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+aho-corasick = "1"
+base64 = "0.22"
+flate2 = "1"
+rayon = "1"
+regex = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+serde_json = "1"
+yara-x = { version = "1.20", optional = true }
+encoding_rs = { version = "0.8", optional = true }
+
+[dev-dependencies]
+proptest = "1.4"
+criterion = "0.5"
+
+[features]
+# "yara" pulls in yara-x (wasmtime/cranelift): 64-bit only and large.
+# Build with --no-default-features for tiny static builds (routers, 32-bit ARM/MIPS).
+# "shift-jis" enables the encoding_rs-backed Shift-JIS decoder; disable it
+# (`--no-default-features` or `--no-default-features --features yara`) for the
+# smallest binaries and the legacy hand-rolled decoder comes back.
+default = ["yara", "shift-jis"]
+yara = ["dep:yara-x"]
+shift-jis = ["dep:encoding_rs"]
+
+# Release profile for the whole workspace (small, fast binaries)
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

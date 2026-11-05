@@ -1,0 +1,63 @@
+[workspace]
+
+[package]
+name = "bxmap-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bxmap = { path = "..", default-features = false }
+
+[[bin]]
+name = "minidump_parse"
+path = "fuzz_targets/minidump_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "string_scanner"
+path = "fuzz_targets/string_scanner.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "magic_scan"
+path = "fuzz_targets/magic_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "entropy_scan"
+path = "fuzz_targets/entropy_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "classifier_detect"
+path = "fuzz_targets/classifier_detect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vmware_parse"
+path = "fuzz_targets/vmware_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "carve_scan"
+path = "fuzz_targets/carve_scan.rs"
+test = false
+doc = false
+bench = false

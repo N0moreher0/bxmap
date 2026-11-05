@@ -1,0 +1,191 @@
+name: release-binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build CLI
+        env:
+          # Windows: link the C runtime statically so no VC++ redistributable is needed.
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Stage Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p package
+          cp "target/${{ matrix.target }}/release/bxmap" package/bxmap
+          cp LICENSE README.md package/
+
+      - name: Stage Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/bxmap.exe" package/bxmap.exe
+          Copy-Item LICENSE, README.md package/
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bxmap-cli-${{ matrix.target }}
+          path: package
+          if-no-files-found: error
+
+  release:
+    name: publish-github-release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bxmap-cli-*
+          path: packages
+          merge-multiple: false
+
+      - name: Create archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' cli/Cargo.toml | head -n 1)"
+          mkdir -p dist
+          tar -C packages/bxmap-cli-x86_64-unknown-linux-gnu -czf "dist/bxmap-cli-${version}-x86_64-unknown-linux-gnu.tar.gz" .
+          tar -C packages/bxmap-cli-x86_64-apple-darwin -czf "dist/bxmap-cli-${version}-x86_64-apple-darwin.tar.gz" .
+          (
+            cd packages/bxmap-cli-x86_64-pc-windows-msvc
+            zip -q -r "../../dist/bxmap-cli-${version}-x86_64-pc-windows-msvc.zip" .
+          )
+          sha256sum dist/* > dist/SHA256SUMS
+
+      - name: Generate SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx -p bxmap --output-format json --output-file dist/sbom-bxmap.json
+          cargo cyclonedx -p bxmap-cli --output-format json --output-file dist/sbom-bxmap-cli.json
+          sha256sum dist/sbom-*.json >> dist/SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' cli/Cargo.toml | head -n 1)"
+          tag="v${version}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "bxmap-cli ${version}" \
+              --notes "Prebuilt bxmap-cli binaries for commit ${GITHUB_SHA}."
+          fi
+
+  static:
+    name: static-${{ matrix.target }}
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Full builds (with YARA) - 64-bit only
+          - target: x86_64-unknown-linux-musl
+            flags: ""
+          - target: aarch64-unknown-linux-musl
+            flags: ""
+          # Lite builds (no YARA) - small, for routers / 32-bit devices
+          - target: i686-unknown-linux-musl
+            flags: "--no-default-features"
+          - target: armv7-unknown-linux-musleabihf
+            flags: "--no-default-features"
+          - target: arm-unknown-linux-musleabi
+            flags: "--no-default-features"
+          - target: mipsel-unknown-linux-musl
+            flags: "--no-default-features"
+            nightly: true
+          - target: mips-unknown-linux-musl
+            flags: "--no-default-features"
+            nightly: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nightly (tier-3 targets are built with build-std)
+        if: matrix.nightly
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build static binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=""
+          if [ "${{ matrix.nightly }}" = "true" ]; then toolchain="+nightly"; fi
+          cross $toolchain build --release --locked \
+            --manifest-path cli/Cargo.toml \
+            --target "${{ matrix.target }}" ${{ matrix.flags }}
+
+      - name: Stage and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' cli/Cargo.toml | head -n 1)"
+          tag="v${version}"
+          mkdir -p dist
+          out="dist/bxmap-${{ matrix.target }}.bin"
+          cp "target/${{ matrix.target }}/release/bxmap" "$out"
+          chmod +x "$out"
+          (cd dist && sha256sum "$(basename "$out")" > "$(basename "$out").sha256")
+          gh release upload "$tag" dist/* --clobber
