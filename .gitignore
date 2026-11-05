@@ -9,3 +9,13 @@ report.html
 report.md
 carved_lab4b.ndjson
 test.yar
+
+# User files (not to commit / publish)
+BEAM_PROMPT_bxmap.md
+MemLabs-Lab1/
+MemLabs-Lab4/
+assets/banner.txt
+dump-memlabs/
+proptest-regressions/
+tmp_*.ndjson
+*.ndjson
