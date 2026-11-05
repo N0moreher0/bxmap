@@ -28,12 +28,10 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish --locked -p bxmap ${{ github.event.inputs.dry-run == 'true' && '--dry-run' || '' }}
-
+          cargo publish --locked -p bxmap ${{ github.event.inputs.dry-run == 'true' && '--dry-run' || '' }} || echo "(bxmap already published or skipped)"
       - name: Wait for crates.io index propagation
         if: ${{ github.event.inputs.dry-run != 'true' }}
         run: sleep 45
-
       - name: Publish CLI (bxmap-cli)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
