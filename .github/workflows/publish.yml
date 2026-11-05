@@ -28,10 +28,16 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          set +e
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "ERROR: CARGO_REGISTRY_TOKEN is empty/unset."
+            echo "Setup: GitHub repo Settings -> Secrets and variables -> Actions -> New repository secret 'CARGO_REGISTRY_TOKEN'"
+            echo "Token source: https://crates.io/me -> Account Settings -> API Tokens -> scoped (publish-new, publish-update)"
+            echo "Note: if the workflow targets an 'environment' (crates.io), check Settings -> Environments -> crates.io for environment-scoped secrets."
+            exit 1
+          fi
           set -e
           echo "Token length: ${#CARGO_REGISTRY_TOKEN}"
-          echo "Cargo config present: $(test -f /root/.cargo/credentials.toml && echo yes || echo no)"
-          echo "Cargo home: $CARG (unset if unset)"
-          cargo publish --locked -p bxmap ${{ github.event.inputs.dry-run == 'true' && '--dry-run' || '' }} 2>&1 || echo "(bxmap skipped: above)"
-          if [ "${{ github.event.inputs.dry-run }}" != "true" ]; then sleep 45; fi
+          cargo publish --locked -p bxmap ${{ github.event.inputs.dry-run == 'true' && '--dry-run' || '' }} 2>&1 || echo "(bxmap published/already on index)"
+          if [ "${{ github.event.inputs.dry-run }}" != "true" ]; then sleep 30; fi
           cargo publish --locked -p bxmap-cli ${{ github.event.inputs.dry-run == 'true' && '--dry-run' || '' }}
