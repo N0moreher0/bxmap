@@ -679,14 +679,12 @@ fn path_end_at(text: &str, start: usize) -> Option<usize> {
     let drive = first.is_ascii_alphabetic()
         && bytes.get(start + 1) == Some(&b':')
         && matches!(bytes.get(start + 2), Some(&b'\\') | Some(&b'/'));
-    let windows_prefix = text
-        .get(start..)
-        .map_or(false, |s| {
-            s.starts_with("\\\\?\\")
-                || s.starts_with("\\\\.\\")
-                || s.starts_with("\\Device\\")
-                || s.starts_with("\\??\\")
-        });
+    let windows_prefix = text.get(start..).is_some_and(|s| {
+        s.starts_with("\\\\?\\")
+            || s.starts_with("\\\\.\\")
+            || s.starts_with("\\Device\\")
+            || s.starts_with("\\??\\")
+    });
     let unc = first == b'\\' && bytes.get(start + 1) == Some(&b'\\');
     if drive || windows_prefix || unc {
         return Some(consume_windows_path(text, start));
@@ -703,7 +701,9 @@ fn path_end_at(text: &str, start: usize) -> Option<usize> {
             return None;
         }
         let end = consume_unix_path(text, start);
-        let has_slash = text.get(start..end).map_or(false, |s| s.matches('/').count() >= 2);
+        let has_slash = text
+            .get(start..end)
+            .is_some_and(|s| s.matches('/').count() >= 2);
         if has_slash {
             return Some(end);
         }
@@ -712,7 +712,9 @@ fn path_end_at(text: &str, start: usize) -> Option<usize> {
 }
 
 fn consume_windows_path(text: &str, start: usize) -> usize {
-    let allow_question = text.get(start..).map_or(false, |s| s.starts_with("\\\\?\\"));
+    let allow_question = text
+        .get(start..)
+        .is_some_and(|s| s.starts_with("\\\\?\\"));
     let mut end = start;
     let mut opens = 0i32;
     let mut closes = 0i32;
