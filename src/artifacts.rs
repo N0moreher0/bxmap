@@ -668,6 +668,9 @@ fn extract_paths(text: &str) -> Vec<(usize, &str)> {
 }
 
 fn path_end_at(text: &str, start: usize) -> Option<usize> {
+    if !text.is_char_boundary(start) {
+        return None;
+    }
     let bytes = text.as_bytes();
     let first = *bytes.get(start)?;
     let drive = first.is_ascii_alphabetic()

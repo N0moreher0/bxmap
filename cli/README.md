@@ -241,3 +241,101 @@ the CLI adds a hint to write them to a file instead.
 detect code `3` without parsing stderr.
 
 For library usage see the crate README at <https://docs.rs/bxmap>.
+
+---
+
+## Tips & Lệnh tối ưu cho triage mã độc / DFIR
+
+Dưới đây là các lệnh `bxmap-cli` sẵn sàng copy-paste, nhóm theo mục tiêu thực tế. Thay `<dump.raw>` bằng đường dẫn file dump của bạn.
+
+### 1. Triage nhanh (dưới 30 giây, lấy top findings ngay)
+
+```powershell
+.\target\release\bxmap-cli.exe <dump.raw> --mode quick --detect secret --report summary --stats
+```
+
+- `--mode quick`: preset mặc định (tất cả encoding phổ biến, detections, artifacts).
+- `--detect secret`: quét credential, token, API key, URL, IP ngay trên strings.
+- `--report summary`: in top 12 priority findings ra stderr, kèm bảng tóm tắt.
+- `--stats`: hiện số lượng, entropy, thời gian, throughput.
+
+### 2. Triage sâu (khuyến nghị cho dump thật)
+
+```powershell
+.\target\release\bxmap-cli.exe <dump.raw> --mode deep --max-strings 0 --signature all --detect all --entropy --format ndjson --output triage.ndjson --stats
+```
+
+- `--max-strings 0`: không cắt ngắn, quét hết dump.
+- `--signature all`: quét magic bytes (PE/ELF/PDF/ZIP/…) + private-key candidates (RSA/EC/OpenSSH).
+- `--detect all`: quét toàn bộ IOC (ip, url, domain, base64, secret).
+- `--entropy`: tìm vùng mã hóa/packed (entropy 7.2–8.0/8.0) — điển hình mã độc packed.
+- `--format ndjson --output triage.ndjson`: xuất ra file JSON dòng một dòng, dễ lọc bằng `jq` / Python sau này.
+- `--stats`: hiện bảng tóm tắt đầy đủ.
+
+### 3. Chỉ carve file executable (PE/EXE/DLL) — nhóm quan trọng nhất
+
+```powershell
+.\target\release\bxmap-cli.exe <dump.raw> --mode deep --max-strings 0 --carve pe,exe,dll --carve-out ./carved_pe --carve-max-files 5000 --carve-max-total 0 --stats
+```
+
+- `--carve pe,exe,dll`: chỉ carve file executable, tránh rác ảnh/video.
+- `--carve-max-files 5000`: giới hạn 5.000 file (tùy chỉnh theo ổ cứng).
+- `--carve-max-total 0`: không giới hạn tổng dung lượng carved (cẩn thận với ổ nhỏ).
+
+### 4. Carve mọi thứ (khi cần khôi phục toàn diện)
+
+```powershell
+.\target\release\bxmap-cli.exe <dump.raw> --mode deep --max-strings 0 --carve all --carve-out ./carved_all --carve-max-files 10000 --carve-max-total 536870912 --format ndjson --output triage.ndjson --stats
+```
+
+- `--carve all`: carve tất cả định dạng hỗ trợ (jpeg, png, zip, rar, 7z, pdf, gzip, bmp, sqlite, ole, mp4, pe, elf…).
+- `--carve-max-total 536870912`: giới hạn tổng 512 MB (tránh đầy ổ).
+
+### 5. Dump là minidump (.mdmp / .hdmp / .dmp)
+
+```powershell
+.\target\release\bxmap-cli.exe <dump.mdmp> --mode deep --map-va --tree --max-strings 0 --detect all --entropy --stats
+```
+
+- `--map-va`: ánh xạ file offset về virtual address (minidump VA map).
+- `--tree`: in minidump process tree.
+
+---
+
+### Giải thích flags thường dùng
+
+| Flag | Ý nghĩa |
+|------|---------|
+| `--mode quick\|triage\|deep` | Preset: quick = mặc định; triage = quick + detections; deep = triage + tất cả encoding + entropy + carving. |
+| `--max-strings N` | Giới hạn số chuỗi (mặc định 200.000; `0` = không giới hạn). |
+| `--detect all` | Quét ip, url, domain, base64, secret. |
+| `--signature all` | Quét magic bytes + private-key candidates. |
+| `--entropy` | Tìm vùng mã hóa/packed. |
+| `--carve <types>` | Khôi phục file có cấu trúc từ dump ra thư mục `--carve-out`. |
+| `--format ndjson --output file.ndjson` | Xuất ra ndjson, dễ parse scripts. |
+| `--stats` | Bảng tóm tắt kết thúc. |
+
+---
+
+### Lưu ý quan trọng
+
+- **Thời gian**: dump 1 GB tầm 1–2 phút, dump 1.6 GB tầm 3–4 phút (tuỳ máy).
+- **Dung lượng carved**: `--carve-max-total 0` có thể ghi hàng trăm MB–GB. Nếu ổ nhỏ, hãy đặt `--carve-max-total <byte>` (ví dụ `536870912` = 512 MB).
+- **Exit code 1**: thường do `--carve-max-files` hoặc `--max-strings` đạt cap, không phải crash. Kết quả đã ghi ra file vẫn hợp lệ. Xem chi tiết mã thoát ở mục "Exit codes".
+- **bxmap là tầng triage, không thay thế bộ phát hiện mã độc**: nó trích xuất các ứng viên bằng chứng (URL, credential, tool, vùng mã hóa, file PE). Để kết luận "đây là mã độc", hãy kết hợp với Volatility (process/module), YARA rules, và sandbox (ANY.RUN / Cuckoo).
+
+### Workflow gợi ý (phân kỳ)
+
+```
+Bước 1: bxmap dump.raw --mode quick --detect secret --report summary --stats
+        → Triage < 20 s, xem top findings + artifacts ngay.
+
+Bước 2: bxmap dump.raw --mode deep --max-strings 0 --signature all --detect all --entropy --format ndjson --output triage.ndjson --stats
+        → Quét sâu, lưu toàn bộ ra ndjson để lọc sau.
+
+Bước 3: bxmap dump.raw --mode deep --max-strings 0 --carve pe,exe,dll --carve-out ./carved --carve-max-files 5000 --stats
+        → Carve 200–500 file PE, sau đó chạy strings / kiểm tra imports / hash lên VirusTotal.
+
+Bước 4: Dùng Volatility trên cùng dump để liệt kê process, module, kết nối mạng.
+        Kết hợp với YARA rules + sandbox cho mẫu PE đáng ngờ nhất.
+```

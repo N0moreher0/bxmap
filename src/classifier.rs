@@ -391,6 +391,9 @@ fn is_public_client_key_context(text: &str, start: usize, end: usize) -> bool {
     let radius = 200usize;
     let left = start.saturating_sub(radius);
     let right = text.len().min(end + radius);
+    if !text.is_char_boundary(left) || !text.is_char_boundary(right) {
+        return false;
+    }
     let context = &text[left..right];
     let lower = context.to_ascii_lowercase();
     PUBLIC_CLIENT_KEY_DOMAINS
@@ -1553,7 +1556,7 @@ mod tests {
         assert_eq!(
             validate_finding(
                 "GITHUB_PAT_CLASSIC",
-                "ghp-TEST-TEST-TEST-TEST-TEST-TEST-TEST-TEST"
+                "ghp_TEST_TEST_TEST_TEST_TEST_TEST_TEST_TEST",
             ),
             ValidationResult::Valid
         );
@@ -1596,14 +1599,11 @@ mod tests {
     #[test]
     fn validate_slack_token_works() {
         assert_eq!(
-            validate_finding(
-                "SLACK_BOT_TOKEN",
-                "xoxb-TEST-TEST-TEST",
+            validate_finding("SLACK_BOT_TOKEN", "xoxb-TEST-SLACK-TOKEN-FOR-TESTING-ONLY"),
+            ValidationResult::Valid
+        );
         assert_eq!(
-            validate_finding(
-                "SLACK_USER_TOKEN",
-                "xoxp-TEST-TEST-TEST"
-            ),
+            validate_finding("SLACK_USER_TOKEN", "xoxp-TEST-SLACK-TOKEN-FOR-TESTING-ONLY"),
             ValidationResult::Valid
         );
         assert_eq!(
