@@ -520,6 +520,15 @@ pub fn apply_with_features(
                 if !explicit.extract && args.extract == ArtifactKinds::NONE {
                     args.extract = ArtifactKinds::ALL;
                 }
+                // A summary written to a file is a full triage: like the
+                // `triage`/`deep` presets, drop the 200000 default cap when
+                // the user gave `-o` so the report covers the whole input.
+                if _has_output
+                    && !explicit.max_strings
+                    && args.max_strings == MAX_STRINGS
+                {
+                    args.max_strings = usize::MAX;
+                }
             }
             "all" => {
                 for extra in [

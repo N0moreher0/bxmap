@@ -3252,6 +3252,66 @@ fn golden_with_all_runs_full_triage() {
 }
 
 #[test]
+fn golden_with_summarize_lifts_default_cap_when_writing_to_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    // 250000 unique short strings: more than the default 200000 cap.
+    let mut data = Vec::new();
+    for i in 0..250_000 {
+        data.extend_from_slice(format!("s{:06x}\x00", i).as_bytes());
+    }
+    std::fs::write(&path, &data).unwrap();
+    assert!(data.len() > 200_000);
+
+    // With -o and no explicit --max-strings, the summarize bundle switches to
+    // the unlimited cap so the report covers the whole input instead of
+    // stopping after 1% of the file.
+    let out = dir.path().join("triage.ndjson");
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--with",
+            "summarize",
+            "-o",
+            out.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ndjson = std::fs::read_to_string(&out).unwrap();
+    // Every one of the 250000 unique strings must be in the report.
+    assert!(ndjson.contains("s024950"), "{ndjson}");
+}
+
+#[test]
+fn golden_with_summarize_keeps_default_cap_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    let mut data = Vec::new();
+    for i in 0..250_000 {
+        data.extend_from_slice(format!("s{:06x}\x00", i).as_bytes());
+    }
+    std::fs::write(&path, &data).unwrap();
+
+    // No -o: the historical 200000 stdout cap still applies; the CLI exits 3
+    // with a truncation warning telling the user to write a file instead.
+    let output = Command::new(bin_path())
+        .args([path.to_str().unwrap(), "--with", "summarize", "--no-progress"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("TRUNCATED"), "{stderr}");
+}
+
+#[test]
 fn golden_report_user_implies_path_artifacts() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.bin");
