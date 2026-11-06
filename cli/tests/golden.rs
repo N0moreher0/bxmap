@@ -862,11 +862,13 @@ fn golden_entropy_with_data_includes_payload() {
 }
 
 #[test]
-fn golden_entropy_no_data_requires_entropy() {
+fn golden_entropy_no_data_implies_entropy() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.bin");
-    std::fs::write(&path, b"aaaa\x00").unwrap();
+    std::fs::write(&path, high_entropy_bytes(16 * 1024)).unwrap();
 
+    // `--entropy-no-data` alone now turns entropy scanning on instead of
+    // erroring out.
     let output = Command::new(bin_path())
         .args([
             path.to_str().unwrap(),
@@ -875,16 +877,20 @@ fn golden_entropy_no_data_requires_entropy() {
             "--encoding",
             "ascii",
             "--entropy-no-data",
+            "--format",
+            "json",
         ])
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--entropy-no-data requires --entropy"),
-        "{stderr}"
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"group\":\"Undefined\""), "{stdout}");
+    assert!(!stdout.contains("data_hex"), "{stdout}");
 }
 
 #[test]
@@ -1031,22 +1037,31 @@ fn golden_entropy_threshold_out_of_range_is_rejected() {
 }
 
 #[test]
-fn golden_entropy_flags_require_entropy() {
+fn golden_entropy_flags_imply_entropy() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.bin");
-    std::fs::write(&path, b"aaaa\x00").unwrap();
+    std::fs::write(&path, high_entropy_bytes(16 * 1024)).unwrap();
 
+    // `--entropy-merge` on its own enables entropy scanning.
     let output = Command::new(bin_path())
-        .args([path.to_str().unwrap(), "--entropy-merge"])
+        .args([
+            path.to_str().unwrap(),
+            "--entropy-merge",
+            "--entropy-window",
+            "1024",
+            "--format",
+            "json",
+        ])
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--entropy-merge requires --entropy"),
-        "{stderr}"
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"group\":\"Undefined\""), "{stdout}");
 }
 
 #[test]
@@ -1719,19 +1734,25 @@ fn golden_carve_max_files_truncation_exits_3() {
 }
 
 #[test]
-fn golden_carve_requires_out_dir() {
+fn golden_carve_defaults_out_dir() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dump.bin");
     std::fs::write(&path, b"hello world\x00").unwrap();
 
+    // Carving now defaults its output directory to <input>.bxmap/carved
+    // instead of demanding --carve-out.
     let output = Command::new(bin_path())
         .args([path.to_str().unwrap(), "--carve", "png"])
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--carve requires --carve-out"), "{stderr}");
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let default_dir = dir.path().join("dump.bin.bxmap").join("carved");
+    assert!(default_dir.is_dir(), "carve defaults dir not created");
 }
 
 // ---------------------------------------------------------------------------
@@ -2298,11 +2319,13 @@ fn golden_conflict_detect_with_filter_regex() {
 }
 
 #[test]
-fn golden_conflict_rich_requires_detect() {
+fn golden_conflict_rich_detect_format_implies_detect() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.bin");
-    std::fs::write(&path, b"hello world\x00").unwrap();
+    std::fs::write(&path, b"config AKIAIOSFODNN7EXAMPLE end\x00").unwrap();
 
+    // `--detect-format rich` now enables the default (secret) detector set
+    // instead of erroring.
     let output = Command::new(bin_path())
         .args([
             path.to_str().unwrap(),
@@ -2312,14 +2335,20 @@ fn golden_conflict_rich_requires_detect() {
             "ascii",
             "--detect-format",
             "rich",
+            "--format",
+            "json",
             "--no-progress",
         ])
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("requires --detect"), "{stderr}");
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"rule\":\"AWS_ACCESS_KEY\""), "{stdout}");
 }
 
 #[test]
@@ -2379,11 +2408,12 @@ fn golden_conflict_xor_exhaustive_requires_brute_xor() {
 }
 
 #[test]
-fn golden_conflict_carve_out_requires_carve() {
+fn golden_conflict_carve_out_implies_carve() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.bin");
     std::fs::write(&path, b"hello world\x00").unwrap();
 
+    // `--carve-out` on its own now starts an all-kinds carve.
     let output = Command::new(bin_path())
         .args([
             path.to_str().unwrap(),
@@ -2398,13 +2428,16 @@ fn golden_conflict_carve_out_requires_carve() {
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("requires --carve"), "{stderr}");
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("carved").is_dir());
 }
 
 #[test]
-fn golden_conflict_carve_requires_carve_out() {
+fn golden_conflict_carve_defaults_out_dir() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.bin");
     std::fs::write(&path, b"hello world\x00").unwrap();
@@ -2423,9 +2456,13 @@ fn golden_conflict_carve_requires_carve_out() {
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--carve requires --carve-out"), "{stderr}");
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let default_dir = dir.path().join("input.bin.bxmap").join("carved");
+    assert!(default_dir.is_dir(), "default carve dir missing");
 }
 
 #[test]
@@ -2443,14 +2480,24 @@ fn golden_conflict_entropy_flags_require_entropy() {
             "ascii",
             "--entropy-window",
             "1024",
+            "--format",
+            "json",
             "--no-progress",
         ])
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("requires --entropy"), "{stderr}");
+    // Entropy sub-flags enable entropy scanning by themselves now.
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\"group\":\"Undefined\""),
+        "plain text must not look encrypted"
+    );
 }
 
 #[test]
@@ -3086,4 +3133,182 @@ fn golden_detect_non_strict_keeps_invalid_jwt_with_lower_confidence() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Non-strict: keeps the finding (confidence halved instead of dropped).
     assert!(stdout.contains("JWT_TOKEN"), "{stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// --with feature bundles and option-implies-feature behaviour
+// ---------------------------------------------------------------------------
+
+#[test]
+fn golden_with_iocs_detects_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"config AKIAIOSFODNN7EXAMPLE end\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--with",
+            "iocs",
+            "--detect-format",
+            "rich",
+            "--format",
+            "json",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("AWS_ACCESS_KEY"), "{stdout}");
+}
+
+#[test]
+fn golden_with_all_is_rejected_passing_feature_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"hello world\x00").unwrap();
+
+    // --with all parses in any position/combination and stays explicit-safe.
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--with",
+            "entropy",
+            "--with",
+            "magic",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn golden_with_unknown_feature_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"hello world\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([path.to_str().unwrap(), "--with", "wat"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown --with feature"), "{stderr}");
+}
+
+#[test]
+fn golden_with_all_runs_full_triage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    // Mixed content: plain text plus an IOC, so the bundle proves every
+    // feature ran. Detector mode (like --detect) prints matching findings
+    // instead of raw strings.
+    std::fs::write(
+        &path,
+        b"hello world AKIAIOSFODNN7EXAMPLE C:\\Users\\bob\\payload.exe\x00",
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--with",
+            "all",
+            "--max-strings",
+            "50",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // IOC detectors fired on the secret...
+    assert!(stdout.contains("AKIAIOSFODNN7EXAMPLE"), "{stdout}");
+    // ...and the artifact collector picked up the user path.
+    assert!(stdout.contains("payload.exe"), "{stdout}");
+}
+
+#[test]
+fn golden_report_user_implies_path_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(
+        &path,
+        b"C:\\Users\\alice\\Documents\\secret.txt\x00".as_slice(),
+    )
+    .unwrap();
+
+    // --report used to demand --extract; collecting paths is now automatic.
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--report",
+            "user",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\tARTIFACT\tpath"), "{stdout}");
+}
+
+#[test]
+fn golden_heap_only_implies_map_va() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, b"hello world\x00").unwrap();
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--min-len",
+            "4",
+            "--encoding",
+            "ascii",
+            "--heap-only",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    // Non-minidump input ignores --map-va, but the flag combination must not
+    // complain ("--heap-only requires --map-va" is gone).
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

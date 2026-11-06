@@ -358,7 +358,7 @@ mod tests {
         //            OCTET STRING { SEQUENCE { INTEGER n, INTEGER e } } }
         let blob = pkcs8_envelope(
             &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01],
-            vec![tlv(0x02, &[1]), tlv(0x02, &[5])].concat(),
+            [tlv(0x02, &[1]), tlv(0x02, &[5])].concat(),
         );
         let candidate = detect_key_at(&blob, 0).expect("RSA key blob must be detected");
         assert_eq!(candidate.kind, KIND_RSA_PRIVATE_KEY);
@@ -372,7 +372,7 @@ mod tests {
     fn detects_ec_private_key_blob() {
         let blob = pkcs8_envelope(
             &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01],
-            vec![tlv(0x02, &[1])].concat(),
+            [tlv(0x02, &[1])].concat(),
         );
         let candidate = detect_key_at(&blob, 0).expect("EC key blob must be detected");
         assert_eq!(candidate.kind, KIND_EC_PRIVATE_KEY);
@@ -416,7 +416,7 @@ mod tests {
             &path,
             pkcs8_envelope(
                 &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01],
-                vec![tlv(0x02, &[1]), tlv(0x02, &[5])].concat(),
+                [tlv(0x02, &[1]), tlv(0x02, &[5])].concat(),
             ),
         )
         .unwrap();

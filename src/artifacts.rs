@@ -712,9 +712,7 @@ fn path_end_at(text: &str, start: usize) -> Option<usize> {
 }
 
 fn consume_windows_path(text: &str, start: usize) -> usize {
-    let allow_question = text
-        .get(start..)
-        .is_some_and(|s| s.starts_with("\\\\?\\"));
+    let allow_question = text.get(start..).is_some_and(|s| s.starts_with("\\\\?\\"));
     let mut end = start;
     let mut opens = 0i32;
     let mut closes = 0i32;

@@ -19,3 +19,11 @@ dump-memlabs/
 proptest-regressions/
 tmp_*.ndjson
 *.ndjson
+
+# Local verification / fuzz scratch (not published)
+gate.log
+fuzz/*.log
+fuzz/artifacts/
+_slice64.bin
+_strings_ascii.txt
+_bxmap_ascii.txt

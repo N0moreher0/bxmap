@@ -51,12 +51,13 @@ Then scan immediately:
 
 ```powershell
 bxmap memory.dmp --auto-tune
-bxmap memory.dmp --entropy --format json -o triage.json
+bxmap memory.dmp --with iocs --format json -o iocs.json
 bxmap memory.dmp --yar rules.yar --format json -o yara.json
 bxmap memory.dmp --brute-xor "1b;2b" --format json -o xor.json
 
-# Malware dump: single-pass IOC + private-key triage
-bxmap suspicious.dmp --encoding all --format json-tree --detect --map-va --heap-only -o triage.json
+# One flag, whole triage: IOCs + artifacts + magic bytes + keys + entropy
+# regions + carving + minidump VA mapping + dedupe + summary report
+bxmap suspicious.dmp --with all -o triage.ndjson
 
 # Presets: one flag instead of a long option list (opt-in)
 bxmap memory.dmp --mode triage -o case1.ndjson   # writer picked from .ndjson
@@ -64,7 +65,10 @@ bxmap memory.dmp --mode deep                     # + entropy regions and carving
 ```
 
 A preset only fills the options you did not pass, so `--mode triage --encoding
-ascii` still means exactly that. `-o` chooses the writer from the extension
+ascii` still means exactly that. `--with` composes the same way: it never
+overrides a flag you passed explicitly, and `--with iocs,artifacts` accepts
+comma-separated (or repeated) tokens. `-o` chooses the writer from the
+extension
 (`.json`, `.ndjson`, `.csv`, `.md`, `.html`, `.txt`; a trailing `.gz` is
 ignored) unless you pass `--format`.
 
@@ -80,8 +84,9 @@ See all available options:
 bxmap --help
 ```
 
-`--help` prints the full option list with the ASCII logo; normal scans stay
-quiet (no logo on stderr).
+`--help` prints the short, one-screen cheat sheet (modes, `--with`, essential
+options); `--help-advanced` lists every flag including the classic feature
+options. Normal scans stay quiet (no logo on stderr).
 
 ## Static builds for any machine (routers, embedded, old distros)
 
@@ -429,13 +434,13 @@ Recover structured files directly from a raw dump. The carver:
 
 ```powershell
 # Carve everything, write index, don't scan strings
-bxmap dump.bin --carve all --carve-out carved --carve-index idx.ndjson --max-strings 0 --report none
+bxmap dump.bin --with carve --carve-index idx.ndjson --max-strings 0 --report none
 
 # Only JPEG and PNG, limit total output to 100 MiB
-bxmap dump.bin --carve jpeg,png --carve-out carved --carve-max-total 104857600
+bxmap dump.bin --carve jpeg,png --carve-max-total 104857600
 
 # JSON array index instead of NDJSON
-bxmap dump.bin --carve all --carve-out carved --carve-index idx.json
+bxmap dump.bin --with carve --carve-index idx.json
 ```
 
 ⚠️ **Malware handling warning**: Carved files are raw bytes from the dump.
@@ -474,8 +479,11 @@ offline. A `KEY` record is a heuristic signal, not proof the key fits.
 Both labs were carved through the same public entry point:
 
 ```powershell
-bxmap <dump>.raw --carve all --carve-out <dir> --carve-index <idx>
+bxmap <dump>.raw --with carve --carve-index <idx>
 ```
+
+The carved files land in `<dump>.raw.bxmap/carved` by default; add
+`--carve-out <dir>` to choose a different directory.
 
 **Lab 6** (`MemoryDump_Lab6.raw`, ~1.53 GiB): 102 carve candidates → **95 complete**
 files written (552,898,327 bytes): jpeg=4, png=31, zip=13, pdf=2, gzip=45,
@@ -724,10 +732,11 @@ speed and evidence quality:
   `bxmap`'s job is: from a 1–16 GB dump, in seconds, "what should I look at
   next?"
 - **Phased workflow**:
-  1. `bxmap dump.raw --detect secret --extract all --report summary`
+  1. `bxmap dump.raw --with iocs --report summary`
      (triage in < 20 s, get top findings + artifacts).
-  2. `bxmap dump.raw --carve all --carve-out carved --carve-index idx.ndjson`
-     (recover files, flag encrypted containers with Phase 8.4 detection).
+  2. `bxmap dump.raw --with carve --carve-index idx.ndjson`
+     (recover files, flag encrypted containers with Phase 8.4 detection; the
+     carved files land in `<input>.bxmap/carved` by default).
   3. `bxmap dump.raw --yar rules.yar` (if you have YARA rules for the
      family under investigation).
   4. Feed suspicious offsets from steps 1–3 into Volatility / crash
@@ -742,94 +751,117 @@ detection engines.
 
 The `bxmap-cli` commands below are ready to copy-paste, grouped by real-world triage target. Replace `<dump.raw>` with your dump file path.
 
-### 1. Quick triage (under 30 seconds, get top findings immediately)
+### 1. One-command triage (the short way)
 
 ```powershell
-.\target\release\bxmap-cli.exe <dump.raw> --mode quick --detect secret --report summary --stats
+bxmap <dump.raw> --with all -o triage.ndjson
+```
+
+- `--with all` turns on IOC detectors, artifact extraction, magic-byte and
+  private-key signatures, entropy regions, carving into
+  `<input>.bxmap/carved`, minidump VA mapping and the summary report.
+- `-o triage.ndjson`: one JSON record per line, easy to filter with
+  `jq` / Python later; the extension picks the writer.
+- Pick a subset instead: `--with iocs,magic,entropy,carve`.
+
+### 2. Quick triage (under 30 seconds, get top findings immediately)
+
+```powershell
+bxmap <dump.raw> --mode quick --with iocs --report summary --stats
 ```
 
 - `--mode quick`: default preset (common encodings, detections, artifacts).
-- `--detect secret`: scan credentials, tokens, API keys, URLs, IPs on strings.
-- `--report summary`: print top-12 priority findings to stderr plus summary table.
-- `--stats`: show counts, entropy, elapsed time, throughput.
+- `--with iocs`: scan credentials, tokens, API keys, URLs, IPs, base64 blobs.
+- `--report summary`: print top priority findings to stderr plus summary table.
+- `--stats`: show counts, elapsed time, throughput.
 
-### 2. Deep triage (recommended for real dumps)
+### 3. Deep triage (recommended for real dumps)
 
 ```powershell
-.\target\release\bxmap-cli.exe <dump.raw> --mode deep --max-strings 0 --signature all --detect all --entropy --format ndjson --output triage.ndjson --stats
+bxmap <dump.raw> --mode deep --max-strings 0 --with all -o triage.ndjson --stats
 ```
 
 - `--max-strings 0`: no result cap, scan entire dump.
-- `--signature all`: scan magic bytes (PE/ELF/PDF/ZIP/…) + private-key candidates (RSA/EC/OpenSSH).
-- `--detect all`: scan all IOCs (ip, url, domain, base64, secret).
-- `--entropy`: find encrypted/packed regions (entropy 7.2–8.0/8.0) — typical of packed malware.
-- `--format ndjson --output triage.ndjson`: one JSON record per line, easy to filter with `jq` / Python later.
+- `--mode deep` adds all nine encodings, entropy regions and carving.
+- `--with all`: detectors + artifacts + magic bytes + keys + carve + summary
+  in one bundle; sub-flags you pass explicitly always win.
 - `--stats`: full summary table.
 
-### 3. Carve executables only (PE/EXE/DLL) — most critical group
+### 4. Carve executables only (PE/EXE/DLL) — most critical group
 
 ```powershell
-.\target\release\bxmap-cli.exe <dump.raw> --mode deep --max-strings 0 --carve pe,exe,dll --carve-out ./carved_pe --carve-max-files 5000 --carve-max-total 0 --stats
+bxmap <dump.raw> --with carve --carve pe,exe,dll --carve-max-files 5000 --stats
 ```
 
-- `--carve pe,exe,dll`: only carve executables, avoids image/video noise.
+- `--with carve` starts carving; `--carve pe,exe,dll` narrows it to
+  executables (explicit flags never get overridden by the bundle).
+- The output directory defaults to `<input>.bxmap/carved`; name your own with
+  `--carve-out <dir>`.
 - `--carve-max-files 5000`: cap at 5,000 files (adjust for disk size).
-- `--carve-max-total 0`: unlimited carved bytes (careful on small disks).
 
-### 4. Carve everything (full recovery)
+### 5. Full recovery carve
 
 ```powershell
-.\target\release\bxmap-cli.exe <dump.raw> --mode deep --max-strings 0 --carve all --carve-out ./carved_all --carve-max-files 10000 --carve-max-total 536870912 --format ndjson --output triage.ndjson --stats
+bxmap <dump.raw> --with carve --carve all --carve-max-total 536870912 --stats
 ```
 
-- `--carve all`: carve all supported formats (jpeg, png, zip, rar, 7z, pdf, gzip, bmp, sqlite, ole, mp4, pe, elf, …).
+- `--carve all`: carve all supported formats (jpeg, png, zip, rar, 7z, pdf,
+  gzip, bmp, sqlite, ole, mp4, pe, elf, …).
 - `--carve-max-total 536870912`: 512 MB cap total (avoids filling disk).
 
-### 5. Minidump inputs (.mdmp / .hdmp / .dmp)
+### 6. Minidump inputs (.mdmp / .hdmp / .dmp)
 
 ```powershell
-.\target\release\bxmap-cli.exe <dump.mdmp> --mode deep --map-va --tree --max-strings 0 --detect all --entropy --stats
+bxmap <dump.mdmp> --with minidump,iocs --tree --stats
 ```
 
-- `--map-va`: map file offsets to virtual addresses via minidump VA map.
-- `--tree`: print minidump process tree.
+- `--with minidump` turns on `--map-va` (file offsets mapped to virtual
+  addresses via the minidump VA map).
+- `--tree`: print the minidump process tree.
 
 ---
 
-## Tips & Optimal Commands for Malware / DFIR Triage
-
-### Flag reference
+## Flag reference
 
 | Flag | Meaning |
 |------|---------|
+| `--with <list>` | Feature bundle: `iocs`, `artifacts`, `magic`, `keys`, `entropy`, `carve`, `minidump` (implies `--map-va`), `dedupe`, `summarize` or `all`. Comma-separated and repeatable; never overrides a flag you passed explicitly. |
 | `--mode quick\|triage\|deep` | Preset: quick = defaults; triage = quick + detections; deep = triage + all encodings + entropy + carving. |
 | `--max-strings N` | Result cap (default 200,000; `0` = unlimited). |
-| `--detect all` | Scan ip, url, domain, base64, secret. |
+| `--detect all` | Scan ip, url, domain, base64, secret (`--with iocs` is the bundled form). |
 | `--signature all` | Scan magic bytes + private-key candidates. |
-| `--entropy` | Find encrypted/packed regions. |
-| `--carve <types>` | Recover structured files from dump into `--carve-out` dir. |
-| `--format ndjson --output file.ndjson` | Write ndjson for easy script parsing. |
+| `--entropy` | Find encrypted/packed regions (`--entropy-window` etc. imply it). |
+| `--carve <types>` | Recover structured files from dump into `--carve-out` dir (defaults to `<input>.bxmap/carved`). |
+| `--format ndjson --output file.ndjson` | Write ndjson for easy script parsing (or just `-o file.ndjson`). |
 | `--stats` | Final summary table. |
+
+**Sub-flags imply their feature**: `--entropy-window/--entropy-threshold/etc.`
+turn entropy scanning on; `--carve-out` alone starts an all-kinds carve;
+`--report user/all` collects path artifacts; `--in-module`/`--rwx-only`/
+`--heap-only` switch on VA mapping. The old "X requires Y" hard errors are
+gone — the obvious thing just happens.
 
 ---
 
 ### Important notes
 
-- **Time**: 1 GB dump takes ~1–2 min, 1.6 GB dump ~3–4 min (machine-dependent).
-- **Carved size**: `--carve-max-total 0` can write hundreds of MB–GB. On small disks use `--carve-max-total <bytes>` (e.g. `536870912` = 512 MB).
+- **Time**: 1 GB dump takes ~1–2 min, 1.6 GB dump ~3–4 min on a modest laptop (machine-dependent).
+- **Carved size**: carving can write hundreds of MB–GB. On small disks use `--carve-max-total <bytes>` (e.g. `536870912` = 512 MB).
 - **Exit code 1**: usually means `--carve-max-files` or `--max-strings` cap reached, not a crash. Results are still written to file. See "Exit codes" for details.
 - **bxmap is a triage layer, not a full malware scanner**: it extracts evidence candidates (URLs, credentials, tools, encrypted regions, PE files). To conclude "this is malware", combine with Volatility (process/module), YARA rules, and sandbox (ANY.RUN / Cuckoo).
+- **Typos fail fast**: unknown `--with` tokens are rejected with an error
+  listing the valid ones.
 
 ### Suggested workflow (phased)
 
 ```
-Step 1: bxmap dump.raw --mode quick --detect secret --report summary --stats
+Step 1: bxmap dump.raw --with iocs --report summary --stats
         → < 20 s triage, view top findings + artifacts immediately.
 
-Step 2: bxmap dump.raw --mode deep --max-strings 0 --signature all --detect all --entropy --format ndjson --output triage.ndjson --stats
+Step 2: bxmap dump.raw --mode deep --max-strings 0 --with all -o triage.ndjson
         → Deep scan, save all to ndjson for later filtering.
 
-Step 3: bxmap dump.raw --mode deep --max-strings 0 --carve pe,exe,dll --carve-out ./carved --carve-max-files 5000 --stats
+Step 3: bxmap dump.raw --with carve --carve pe,exe,dll --carve-max-files 5000
         → Carve 200–500 PE files, run strings / check imports / hash on VirusTotal.
 
 Step 4: Run Volatility on same dump to enumerate processes, modules, network connections.

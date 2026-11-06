@@ -234,6 +234,8 @@ pub fn encoding_filter_for(encoding: Encoding) -> EncodingFilter {
 
 pub fn completions_for(shell: &str) -> String {
     let flags = [
+        "--with",
+        "--mode",
         "--min-len",
         "--max-str-len",
         "--max-strings",
@@ -281,6 +283,7 @@ pub fn completions_for(shell: &str) -> String {
         "--carve-max-total",
         "--carve-max-files",
         "--mode",
+        "--with",
         "-o",
         "--output",
         "-h",
@@ -325,7 +328,10 @@ pub fn completions_for(shell: &str) -> String {
 pub fn parse_args() -> Result<Args, String> {
     let mut values = std::env::args().skip(1).collect::<Vec<_>>();
     if values.is_empty() || values.iter().any(|v| v == "-h" || v == "--help") {
-        print!("{HELP}");
+        let advanced = values
+            .iter()
+            .any(|v| v == "--help-advanced" || v == "--help-all");
+        print!("{}", if advanced { HELP_ADVANCED } else { HELP });
         std::process::exit(0);
     }
     if values.iter().any(|v| v == "-V" || v == "--version") {
@@ -403,6 +409,7 @@ pub fn parse_args() -> Result<Args, String> {
     let mut i = 0;
     let mut format_explicit = false;
     let mut mode: Option<Mode> = None;
+    let mut with_tokens: Vec<String> = Vec::new();
     let mut explicit = ExplicitFlags::default();
     while i < values.len() {
         let flag = values[i].as_str();
@@ -415,6 +422,15 @@ pub fn parse_args() -> Result<Args, String> {
         };
         match flag {
             "--mode" => mode = Some(parse_mode(&next(&mut i)?)?),
+            "--with" => {
+                let value = next(&mut i)?;
+                for part in value.split(',') {
+                    let part = part.trim().to_ascii_lowercase();
+                    if !part.is_empty() {
+                        with_tokens.push(part);
+                    }
+                }
+            }
             "--min-len" => {
                 explicit.min_len = true;
                 args.min_len = next(&mut i)?
@@ -576,7 +592,10 @@ pub fn parse_args() -> Result<Args, String> {
             }
             "--tree" => args.tree = true,
             "--no-tree" => args.no_tree = true,
-            "--map-va" => args.map_va = true,
+            "--map-va" => {
+                explicit.map_va = true;
+                args.map_va = true;
+            }
             "--no-map-va" => args.no_map_va = true,
             "--in-module" => args.in_module = Some(next(&mut i)?),
             "--rwx-only" => args.rwx_only = true,
@@ -638,6 +657,14 @@ pub fn parse_args() -> Result<Args, String> {
         let has_output = args.output.is_some();
         apply_mode_preset(mode, &explicit, has_output, &mut args);
     }
+    // `--with <list>` runs after the mode preset: it is the composable
+    // mechanism that can turn a plain scan into a full triage in one flag.
+    if !with_tokens.is_empty() {
+        apply_with_features(&with_tokens, &explicit, args.output.is_some(), &mut args)?;
+    }
+    // Sub-flags imply their parent (`--entropy-window` -> `--entropy`,
+    // `--carve-out` -> `--carve all`, `--report user` -> path artifacts, ...).
+    apply_implications(&mut args);
     // `-o case.ndjson` picks the writer from the extension unless --format was
     // given explicitly.
     if !format_explicit {
@@ -675,19 +702,6 @@ pub fn validate(args: &Args, filter_regex: Option<&Regex>) -> Result<(), String>
             return Err("--detect-format rich supports --format text or json".to_string());
         }
     }
-    if !args.entropy {
-        for (flag, set) in [
-            ("--entropy-no-data", args.entropy_no_data),
-            ("--entropy-window", args.entropy_window.is_some()),
-            ("--entropy-threshold", args.entropy_threshold.is_some()),
-            ("--entropy-merge", args.entropy_merge),
-            ("--entropy-max-data", args.entropy_max_data.is_some()),
-        ] {
-            if set {
-                return Err(format!("{flag} requires --entropy"));
-            }
-        }
-    }
     if !args.extract.is_empty() && args.format == Format::JsonTree {
         return Err(
             "--extract does not support --format json-tree; use text, json, ndjson or csv"
@@ -697,28 +711,13 @@ pub fn validate(args: &Args, filter_regex: Option<&Regex>) -> Result<(), String>
     if args.xor_exhaustive && args.brute_xor.is_none() {
         return Err("--xor-exhaustive requires --brute-xor".to_string());
     }
-    if args.carve.is_none() {
-        for (flag, set) in [
-            ("--carve-out", args.carve_out.is_some()),
-            ("--carve-index", args.carve_index.is_some()),
-        ] {
-            if set {
-                return Err(format!("{flag} requires --carve"));
-            }
-        }
-    } else {
-        if args.carve_out.is_none() {
-            return Err("--carve requires --carve-out <dir>".to_string());
-        }
+    if args.carve.is_some() {
         if args.carve_max_size == 0 {
             return Err("--carve-max-size must be greater than 0".to_string());
         }
         if args.carve_min_size > args.carve_max_size {
             return Err("--carve-min-size must not exceed --carve-max-size".to_string());
         }
-    }
-    if args.reassemble && args.carve.is_none() {
-        return Err("--reassemble requires --carve".to_string());
     }
     if args.entropy_window == Some(0) {
         return Err("--entropy-window must be greater than 0".to_string());

@@ -343,6 +343,7 @@ pub struct ExplicitFlags {
     pub carve: bool,
     pub carve_out: bool,
     pub signature: bool,
+    pub map_va: bool,
 }
 
 pub fn apply_mode_preset(mode: Mode, explicit: &ExplicitFlags, has_output: bool, args: &mut Args) {
@@ -429,7 +430,211 @@ pub fn apply_mode_preset(mode: Mode, explicit: &ExplicitFlags, has_output: bool,
     }
 }
 
+/// Default output directory for carving when a preset/bundle enables carving
+/// but the user did not name one.
+fn default_carve_out(path: &str) -> String {
+    format!("{}.bxmap{sep}carved", path, sep = std::path::MAIN_SEPARATOR)
+}
+
+/// Apply `--with <tokens>` after any `--mode` preset. Tokens map onto the same
+/// machinery as the classic feature flags, but never override an explicitly
+/// passed flag, so `--with all --entropy` / `--entropy --with all` behave
+/// identically.
+pub fn apply_with_features(
+    tokens: &[String],
+    explicit: &ExplicitFlags,
+    _has_output: bool,
+    args: &mut Args,
+) -> Result<(), String> {
+    const IOC_TOKENS: &[&str] = &["ip", "url", "domain", "b64", "secret", "base64"];
+    fn push_detector(list: &mut Vec<Detector>, detector: Detector) {
+        if !list.contains(&detector) {
+            list.push(detector);
+        }
+    }
+    for token in tokens {
+        match token.as_str() {
+            "ioc" | "iocs" => {
+                if !explicit.detectors {
+                    push_detector(&mut args.detectors, Detector::Ip);
+                    push_detector(&mut args.detectors, Detector::Url);
+                    push_detector(&mut args.detectors, Detector::Domain);
+                    push_detector(&mut args.detectors, Detector::Base64);
+                    push_detector(&mut args.detectors, Detector::Secret);
+                }
+            }
+            "ip" | "url" | "domain" | "b64" | "base64" | "secret" => {
+                if !explicit.detectors {
+                    let detector = match token.as_str() {
+                        "ip" => Detector::Ip,
+                        "url" => Detector::Url,
+                        "domain" => Detector::Domain,
+                        "b64" | "base64" => Detector::Base64,
+                        _ => Detector::Secret,
+                    };
+                    push_detector(&mut args.detectors, detector);
+                }
+            }
+            "artifact" | "artifacts" => {
+                if !explicit.extract {
+                    args.extract = ArtifactKinds::ALL;
+                }
+            }
+            "magic" => {
+                if !explicit.signature {
+                    args.signature = Some("magic".to_string());
+                }
+            }
+            "keys" => {
+                if !explicit.signature {
+                    args.signature = Some("keys".to_string());
+                }
+            }
+            "entropy" => {
+                if !explicit.entropy {
+                    args.entropy = true;
+                }
+            }
+            "dedupe" => {
+                if !explicit.dedupe {
+                    args.dedupe = true;
+                }
+            }
+            "map-va" | "minidump" => {
+                if !explicit.map_va {
+                    args.map_va = true;
+                }
+            }
+            "carve" => {
+                if !explicit.carve {
+                    args.carve = Some("all".to_string());
+                }
+                if !explicit.carve_out && args.carve_out.is_none() {
+                    args.carve_out = Some(default_carve_out(&args.path));
+                }
+            }
+            "summarize" | "summary" => {
+                if !explicit.report {
+                    args.report_mode = ReportMode::Summary;
+                }
+                if !explicit.extract && args.extract == ArtifactKinds::NONE {
+                    args.extract = ArtifactKinds::ALL;
+                }
+            }
+            "all" => {
+                for extra in [
+                    "iocs",
+                    "artifacts",
+                    "magic",
+                    "keys",
+                    "entropy",
+                    "carve",
+                    "map-va",
+                ] {
+                    if let Err(e) =
+                        apply_with_features(&[extra.to_string()], explicit, _has_output, args)
+                    {
+                        return Err(e);
+                    }
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown --with feature '{other}' (expected {} or all)",
+                    IOC_TOKENS.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Option implies feature: passing `--entropy-window` alone turns entropy on,
+/// `--carve-out` starts an all-kinds carve, `--report user` collects paths,
+/// minidump filters switch on `--map-va`. This removes the old
+/// "sub-flag requires parent flag" hard errors: the obvious thing happens
+/// instead.
+pub fn apply_implications(args: &mut Args) {
+    if !args.entropy
+        && (args.entropy_no_data
+            || args.entropy_window.is_some()
+            || args.entropy_threshold.is_some()
+            || args.entropy_merge
+            || args.entropy_max_data.is_some())
+    {
+        args.entropy = true;
+    }
+    if args.carve.is_none()
+        && (args.carve_out.is_some() || args.carve_index.is_some() || args.reassemble)
+    {
+        args.carve = Some("all".to_string());
+    }
+    if args.carve.is_some() && args.carve_out.is_none() {
+        args.carve_out = Some(default_carve_out(&args.path));
+    }
+    if args.detectors.is_empty()
+        && (args.detect_format == DetectFormat::Rich
+            || args.detect_strict
+            || args.custom_rules.is_some())
+    {
+        args.detectors.push(Detector::Secret);
+    }
+    if matches!(args.report_mode, ReportMode::User | ReportMode::All)
+        && args.extract == ArtifactKinds::NONE
+    {
+        args.extract = ArtifactKinds::paths();
+    }
+    if args.in_module.is_some() || args.rwx_only || args.heap_only {
+        args.map_va = true;
+    }
+}
+
+/// Short help: the one-command workflow. Full flag list printed on
+/// `--help-advanced` (everything the classic enums supported stays valid).
 pub const HELP: &str = concat!(
+    include_str!("banner.txt"),
+    "\nUSAGE:
+    bxmap <path> [MODES / FEATURES / OPTIONS]
+
+FEATURES -- one flag does one complete job:
+    --with <list>        Turn capabilities on in one flag. Tokens: iocs,
+                           artifacts, magic, keys, entropy, carve, minidump,
+                           dedupe, summarize, all (comma-separated and
+                           repeatable). `bxmap dump.raw --with all` is a full
+                           blind triage in a single command.
+    --mode <quick|triage|deep>
+                           Ready-made bundles: quick = raw strings; triage =
+                           strings + IOCs + artifacts + magic bytes + summary;
+                           deep = triage + all 9 encodings + entropy regions +
+                           carving into <input>.bxmap/carved with no result cap.
+                           Options you pass explicitly always win, wherever
+                           they appear.
+
+ESSENTIAL OPTIONS:
+    -o, --output <PATH>  Write to a file; the extension picks the format
+                           (.json .ndjson .csv .md .html .txt, trailing .gz ok).
+    --format <FMT>       text|json|json-tree|ndjson|csv|html|markdown
+    --encoding <list>    Restrict encodings (default all): ascii,utf16,utf32,
+                           latin1,cp1252,utf8,shift_jis
+    --min-len <N>        Minimum string length (default 4)
+    --max-strings <N>    Maximum results (default 200000; 0 = unlimited)
+    --threads <N>        Parallel worker count
+    --auto-tune          Choose a safe worker count for this machine
+    --report <mode>      none|summary|user|all (top artifacts, per-user lists)
+    --stats              Per-encoding counts and timing on stderr
+
+SUB-FLAGS IMPLY THEIR FEATURE:
+    --entropy-window/threshold/merge/max-data imply --entropy;
+    --carve-out/-index imply carving (default dir: <input>.bxmap/carved);
+    --in-module/--rwx-only/--heap-only imply --map-va; --report user/all
+    collect path artifacts automatically.
+
+    -V, --version        Print the bxmap-cli version
+    -h, --help           Show this help (`--help-advanced` for every flag)
+"
+);
+
+pub const HELP_ADVANCED: &str = concat!(
     include_str!("banner.txt"),
     "\nUSAGE:
     bxmap <path> [OPTIONS]
@@ -446,6 +651,10 @@ MODES:
                          win, wherever they appear on the command line.
 
 OPTIONS:
+    --with <list>        One-flag feature bundle (repeatable, comma-separated):
+                           iocs, artifacts, magic, keys, entropy, carve,
+                           minidump (implies --map-va), dedupe, summarize or
+                           all. Never overrides a flag you passed explicitly.
     --min-len <N>        Minimum string length (default 4)
     --max-str-len <N>    Truncate very long strings to N chars in output (default unlimited)
     --max-strings <N>    Maximum results (default 200000; 0 = unlimited)
@@ -572,7 +781,7 @@ OPTIONS:
     --filter-regex <RE>   Legacy generic regex filter
     --stats              Always-on report compatibility flag
     -V, --version        Print the bxmap-cli version
-    -h, --help           Show this help
+    -h, --help           Show the short help (--help-advanced shows this list)
 "
 );
 

@@ -249,6 +249,9 @@ impl Minidump {
         }
         if let Some(e) = find(ST_MODULE_LIST) {
             let b = s.bytes(e.rva as u64, e.size as u64)?;
+            if b.len() < 4 {
+                return Err(bad("module list truncated"));
+            }
             let cnt = u32le(&b, 0) as usize;
             let needed = cnt
                 .checked_mul(108)
@@ -270,6 +273,9 @@ impl Minidump {
         }
         if let Some(e) = find(ST_THREAD_LIST) {
             let b = s.bytes(e.rva as u64, e.size as u64)?;
+            if b.len() < 4 {
+                return Err(bad("thread list truncated"));
+            }
             let cnt = u32le(&b, 0) as usize;
             let needed = cnt
                 .checked_mul(48)
@@ -313,6 +319,12 @@ impl Minidump {
         }
         if let Some(e) = find(ST_MEMORY_INFO_LIST) {
             let b = s.bytes(e.rva as u64, e.size as u64)?;
+            if b.len() < 16 {
+                // The MINIDUMP_MEMORY_INFO_LIST header is 12 bytes, but
+                // `u64le(&b, 8)` reads the 8-byte NumberOfEntries, so 16 bytes
+                // must be present first; a 13-byte stream used to panic here.
+                return Err(bad("memory info list truncated"));
+            }
             let hs = u32le(&b, 0) as usize;
             let es = u32le(&b, 4) as usize;
             let cnt = u64le(&b, 8) as usize;
@@ -552,5 +564,34 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(Minidump::from_reader(Cursor::new(vec![0u8; 64])).is_err());
+    }
+
+    #[test]
+    fn tiny_index_like_streams_error_instead_of_panic() {
+        // Regression for a crash found by fuzz/fuzz_targets/minidump_parse.rs:
+        // a directory entry whose declared size is smaller than the fixed
+        // fields the parser reads (`u32le(&b, 0)` used to index out of bounds
+        // when SizeOfHeader/SizeOfEntry never arrived).
+        for stream_type in [ST_THREAD_LIST, ST_MODULE_LIST, ST_MEMORY_INFO_LIST] {
+            for stream_size in [1u32, 2, 3, 8, 11, 12, 13, 15] {
+                let mut v = Vec::new();
+                v.extend_from_slice(b"MDMP");
+                le32(&mut v, 0xa793);
+                le32(&mut v, 1); // one stream
+                le32(&mut v, 32); // directory rva
+                le32(&mut v, 0);
+                le32(&mut v, 1);
+                le64(&mut v, 0);
+                le32(&mut v, stream_type);
+                le32(&mut v, stream_size);
+                le32(&mut v, 44); // entry rva
+                v.resize(44, 0xEE);
+                let result = Minidump::from_reader(Cursor::new(v));
+                assert!(
+                    result.is_err(),
+                    "stream {stream_type} with size {stream_size} must be rejected"
+                );
+            }
+        }
     }
 }
