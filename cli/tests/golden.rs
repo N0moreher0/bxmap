@@ -3302,7 +3302,12 @@ fn golden_with_summarize_keeps_default_cap_on_stdout() {
     // No -o: the historical 200000 stdout cap still applies; the CLI exits 3
     // with a truncation warning telling the user to write a file instead.
     let output = Command::new(bin_path())
-        .args([path.to_str().unwrap(), "--with", "summarize", "--no-progress"])
+        .args([
+            path.to_str().unwrap(),
+            "--with",
+            "summarize",
+            "--no-progress",
+        ])
         .output()
         .unwrap();
 
