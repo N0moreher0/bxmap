@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "bxmap"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "bxmap-cli"
-version = "1.0.17"
+version = "1.0.18"
 dependencies = [
  "bxmap",
  "criterion",

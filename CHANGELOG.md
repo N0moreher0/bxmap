@@ -3,6 +3,23 @@
 All notable changes to `bxmap` / `bxmap-cli` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.18] - 2026-11-10
+
+CLI release aligned with `bxmap` 1.0.7. No CLI code changes.
+
+### Changed
+- Depends on `bxmap` 1.0.7.
+
+## [1.0.7] - 2026-11-10
+
+### Fixed
+- Multi-byte decoding (UTF-8, Shift-JIS) no longer emits unreadable text:
+  invalid UTF-8 structure, unassigned Shift-JIS pairs, undefined CP1252 bytes,
+  replacement/C1/private-use characters and decoded runs made mostly of them
+  are rejected.
+- Long decoded runs are scored by bad-character and non-readable ratios while
+  short runs require hard evidence, so normal text and short strings survive.
+
 ## [1.0.17] - 2026-11-10
 
 ### Changed
