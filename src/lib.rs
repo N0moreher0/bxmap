@@ -1998,6 +1998,7 @@ fn is_decoded_readable_char(c: char) -> bool {
 ///  * is short (< `DECODED_NOISE_MIN_CHARS`) and contains any "bad" char, or
 ///  * is longer and more than 10% of its chars are "bad", or fewer than 60%
 ///    of its chars look readable.
+///
 /// Disabled together with the rest of the noise filter
 /// (`NoiseConfig::disabled()` / `--noise-threshold 0`).
 fn decoded_text_noise(text: &str, cfg: &NoiseConfig) -> bool {
@@ -2675,7 +2676,7 @@ fn scan_parallel_chunk(
 }
 
 fn parallel_chunk_count(file_len: u64) -> usize {
-    ((file_len + PARALLEL_CHUNK_SIZE - 1) / PARALLEL_CHUNK_SIZE) as usize
+    file_len.div_ceil(PARALLEL_CHUNK_SIZE) as usize
 }
 
 /// Same as `extract_strings_from_file`, but scans the file in parallel
@@ -2801,7 +2802,7 @@ pub fn extract_strings_from_file_parallel_streaming_with_encodings_progress<
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+                .map_err(std::io::Error::other)?,
         )
     } else {
         None
