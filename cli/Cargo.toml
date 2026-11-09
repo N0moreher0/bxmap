@@ -1,6 +1,6 @@
 [package]
 name = "bxmap-cli"
-version = "1.0.15"
+version = "1.0.16"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Command-line frontend for the bxmap memory-dump string extraction library"
@@ -8,9 +8,9 @@ readme = "README.md"
 repository = "https://github.com/N0moreher0/bxmap"
 keywords = ["strings", "forensics", "memory-dump", "malware", "dfir"]
 categories = ["command-line-utilities"]
-rust-version = "1.70"
-# MSRV 1.70 chỉ áp dụng cho bản lite (`--no-default-features`). Bản đầy đủ
-# (mặc định, kéo yara-x/wasmtime/cranelift) cần Rust ≥ 1.80.
+rust-version = "1.85"
+# 1.85 là MSRV của bản lite (`--no-default-features`), do Cargo phải hiểu
+# manifest edition2024 trong lock. Bản đầy đủ (mặc định, kéo yara-x) cần Rust ≥ 1.95.
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }{ archive-suffix }"
@@ -23,7 +23,7 @@ yara = ["bxmap/yara"]
 shift-jis = ["bxmap/shift-jis"]
 
 [dependencies]
-bxmap = { version = "1.0.5", path = "..", default-features = false }
+bxmap = { version = "1.0.6", path = "..", default-features = false }
 flate2 = "1"
 memchr = "2"
 rayon = "1"

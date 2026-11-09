@@ -3,6 +3,23 @@
 All notable changes to `bxmap` / `bxmap-cli` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.16] - 2026-11-10
+
+CLI release aligned with `bxmap` 1.0.6.
+
+### Fixed
+- `--detect-strict` now drops findings below confidence 0.60, so noisy
+  generic/public-client matches no longer survive strict scans.
+- `--dedupe` merges findings by value across rules (including rich output)
+  and keeps the lowest-confidence classification instead of promoting it.
+- Secret detection on real memory dumps no longer reports Azure SAS tokens for
+  non-Azure signed URLs, or generic secrets for identifiers, UUIDs, paths and
+  low-entropy values.
+
+### Changed
+- Depends on `bxmap` 1.0.6.
+- Lite MSRV is 1.85; the full default build requires Rust 1.95 (yara-x 1.23).
+
 ## [1.0.6] - 2026-11-09
 
 ### Fixed
