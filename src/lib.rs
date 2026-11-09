@@ -614,7 +614,10 @@ const fn build_cp1252_printable_table() -> [bool; 256] {
             b'a'..=b'z' => true,
             b' ' | b'\t' | b'\n' | b'\r' => true,
             0x21..=0x2F | 0x3A..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E => true,
-            // CP1252 specific: 0x80-0x9F are printable (unlike Latin1)
+            // CP1252 specific: 0x80-0x9F are printable (unlike Latin1), except the
+            // five bytes Windows leaves undefined (0x81, 0x8D, 0x8F, 0x90, 0x9D):
+            // they decode to C1 control characters, which no one can read.
+            0x81 | 0x8D | 0x8F | 0x90 | 0x9D => false,
             0x80..=0x9F => true,
             // Latin1 extended: 0xA0-0xFF
             0xA0..=0xFF => true,
@@ -664,6 +667,15 @@ fn utf8_expected_len(first: u8) -> usize {
 
 /// Validates a UTF-8 byte sequence.
 fn utf8_validate_seq(seq: &[u8]) -> bool {
+    utf8_validate_structure(seq)
+        && std::str::from_utf8(seq)
+            .ok()
+            .and_then(|s| s.chars().next())
+            .is_some_and(is_readable_char)
+}
+
+/// Structural UTF-8 check only (lead/continuation bytes, overlong, surrogates).
+fn utf8_validate_structure(seq: &[u8]) -> bool {
     if seq.is_empty() {
         return false;
     }
@@ -699,6 +711,49 @@ fn shift_jis_is_lead_byte(b: u8) -> bool {
 /// Checks if a byte is a valid Shift-JIS trail byte.
 fn shift_jis_is_trail_byte(b: u8) -> bool {
     (0x40..=0x7E).contains(&b) || (0x80..=0xFC).contains(&b)
+}
+
+/// True for characters a reader can actually see. Rejects U+FFFD, control
+/// characters (C0/C1), private-use areas and noncharacters. Random binary data
+/// that merely *looks* like a multi-byte encoding decodes to these, and they show
+/// up as "?" / "<?>" in most terminals.
+fn is_readable_char(c: char) -> bool {
+    let cp = c as u32;
+    !(c == '\u{FFFD}'
+        || c.is_control()
+        || (0xE000..=0xF8FF).contains(&cp)
+        // Planes 15-16 are entirely private use.
+        || (0xF0000..=0x10FFFF).contains(&cp)
+        || (0xFDD0..=0xFDEF).contains(&cp)
+        // U+xFFFE / U+xFFFF of every plane are noncharacters.
+        || (cp & 0xFFFE) == 0xFFFE)
+}
+
+/// True when `(lead, trail)` is a Shift-JIS pair that decodes to exactly one
+/// readable character. Checking only the byte ranges also accepts unassigned
+/// pairs (decoded as U+FFFD) and the user-defined area (decoded as private use).
+fn shift_jis_pair_valid(lead: u8, trail: u8) -> bool {
+    static TABLE: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = vec![false; 256 * 256];
+        for l in 0u8..=255 {
+            if !shift_jis_is_lead_byte(l) {
+                continue;
+            }
+            for r in 0u8..=255 {
+                if !shift_jis_is_trail_byte(r) {
+                    continue;
+                }
+                let s = shift_jis_to_utf8(&[l, r]);
+                let mut chars = s.chars();
+                if let (Some(c), None) = (chars.next(), chars.next()) {
+                    t[l as usize * 256 + r as usize] = is_readable_char(c);
+                }
+            }
+        }
+        t
+    });
+    table[lead as usize * 256 + trail as usize]
 }
 
 /// Converts a CP1252 byte to a Unicode character.
@@ -1020,7 +1075,9 @@ impl<'a> StringRunScanner<'a> {
             let latin1_cp1252_enabled = encodings.latin1 || encodings.cp1252;
             *slot = (le_enabled && is_printable(b))
                 || (be_enabled && (b == 0 || is_printable(b)))
-                || (latin1_cp1252_enabled && (is_latin1_printable(b) || is_cp1252_printable(b)));
+                || (latin1_cp1252_enabled && (is_latin1_printable(b) || is_cp1252_printable(b)))
+                || (encodings.utf8 && (0xC2..=0xF4).contains(&b))
+                || (encodings.shift_jis && shift_jis_is_lead_byte(b));
         }
         Self {
             min_len,
@@ -1122,8 +1179,8 @@ impl<'a> StringRunScanner<'a> {
     ) {
         let mut k = 0usize;
         while k < process_count {
-            // -- Fast-skip: when NO run is currently open (neither ascii
-            // nor utf16), the current position can only be the START of a
+            // -- Fast-skip: when NO run is currently open, the current
+            // position can only be the START of a
             // new run, never a CONTINUATION point -- and both run kinds
             // require the current byte (ascii) / "lo" byte (utf16) to be
             // printable, so a non-printable byte can't open any run at all
@@ -1140,6 +1197,8 @@ impl<'a> StringRunScanner<'a> {
                 && self.u16be_start < 0
                 && self.u32le_start < 0
                 && self.u32be_start < 0
+                && self.utf8_start < 0
+                && self.shift_jis_start < 0
             {
                 let valid_end = offset + buffer_valid_len;
                 while k < process_count {
@@ -1452,7 +1511,10 @@ impl<'a> StringRunScanner<'a> {
                 let aligned = self.shift_jis_start < 0 || g as i64 == self.shift_jis_next_pos;
                 if aligned && has_next {
                     let b2 = buffer[i + 1];
-                    if shift_jis_is_lead_byte(b) && shift_jis_is_trail_byte(b2) {
+                    if shift_jis_is_lead_byte(b)
+                        && shift_jis_is_trail_byte(b2)
+                        && shift_jis_pair_valid(b, b2)
+                    {
                         if self.shift_jis_start < 0 {
                             self.shift_jis_start = g as i64;
                             self.shift_jis_buf.clear();
@@ -1712,18 +1774,20 @@ impl<'a> StringRunScanner<'a> {
         }
         if self.utf8_start >= 0
             && self.utf8_buf.len() >= self.min_len
-            // All-ASCII UTF-8 is the ASCII family; keep only runs that contain
-            // a multi-byte (>= 0x80) sequence.
-            && (!self.encodings.ascii || self.utf8_buf.iter().any(|&b| b >= 0x80))
+            // All-ASCII UTF-8 belongs to the ASCII family; keep only runs that
+            // contain a multi-byte (>= 0x80) sequence.
+            && self.utf8_buf.iter().any(|&b| b >= 0x80)
             && !is_low_information_repeat(&self.utf8_buf, &self.noise_cfg)
         {
             // Validate and decode UTF-8
             let text = String::from_utf8_lossy(&self.utf8_buf).into_owned();
-            self.pending.push(ExtractedString {
-                offset: self.utf8_start as u64,
-                encoding: "utf8",
-                text,
-            });
+            if !decoded_text_noise(&text, &self.noise_cfg) {
+                self.pending.push(ExtractedString {
+                    offset: self.utf8_start as u64,
+                    encoding: "utf8",
+                    text,
+                });
+            }
         }
         self.utf8_start = -1;
         self.utf8_next_pos = -1;
@@ -1739,18 +1803,20 @@ impl<'a> StringRunScanner<'a> {
         }
         if self.shift_jis_start >= 0
             && self.shift_jis_buf.len() >= self.min_len
-            // Single-byte ASCII Shift-JIS runs are already emitted as "ascii";
-            // keep only runs with a lead byte / half-width katakana.
-            && (!self.encodings.ascii || self.shift_jis_buf.iter().any(|&b| b >= 0x80))
+            // ASCII-only runs belong to the ASCII family; keep only Shift-JIS
+            // runs containing a lead byte or half-width katakana.
+            && self.shift_jis_buf.iter().any(|&b| b >= 0x80)
             && !is_low_information_repeat(&self.shift_jis_buf, &self.noise_cfg)
         {
             // Decode Shift-JIS to UTF-8
             let text = shift_jis_to_utf8(&self.shift_jis_buf);
-            self.pending.push(ExtractedString {
-                offset: self.shift_jis_start as u64,
-                encoding: "shift_jis",
-                text,
-            });
+            if !decoded_text_noise(&text, &self.noise_cfg) {
+                self.pending.push(ExtractedString {
+                    offset: self.shift_jis_start as u64,
+                    encoding: "shift_jis",
+                    text,
+                });
+            }
         }
         self.shift_jis_start = -1;
         self.shift_jis_next_pos = -1;
@@ -1888,6 +1954,74 @@ fn single_byte_high_entropy_noise(buf: &[u8], cfg: &NoiseConfig) -> bool {
         return true;
     }
     false
+}
+
+/// Strings shorter than this (in decoded chars) are judged only on hard
+/// evidence (U+FFFD / control / private-use chars), never on a ratio, so short
+/// real artifacts are not lost to a statistical heuristic.
+const DECODED_NOISE_MIN_CHARS: usize = 8;
+
+/// Characters that essentially never occur in genuine text but are common in
+/// binary data decoded as text: the replacement character, control chars
+/// (C0/C1, except tab/LF/CR), Private Use areas and Unicode noncharacters.
+fn is_decoded_bad_char(c: char) -> bool {
+    match c {
+        '\t' | '\n' | '\r' => false,
+        '\u{FFFD}' => true,
+        '\u{E000}'..='\u{F8FF}' => true,
+        '\u{FDD0}'..='\u{FDEF}' | '\u{FFFE}' | '\u{FFFF}' => true,
+        '\u{F0000}'..='\u{10FFFF}' => true,
+        c => c.is_control(),
+    }
+}
+
+/// Characters that look like part of readable text: letters/digits (incl.
+/// CJK, kana), whitespace, ASCII punctuation, and the common Latin-1,
+/// general-punctuation, currency, CJK-punctuation and full/half-width blocks.
+fn is_decoded_readable_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || c.is_whitespace()
+        || c.is_ascii_punctuation()
+        || matches!(
+            c,
+            '\u{00A0}'..='\u{00BF}'
+                | '\u{2000}'..='\u{206F}'
+                | '\u{20A0}'..='\u{20CF}'
+                | '\u{3000}'..='\u{303F}'
+                | '\u{FF00}'..='\u{FFEF}'
+        )
+}
+
+/// Post-decode noise check for the multi-byte encodings (UTF-8, Shift-JIS),
+/// whose byte-level filters cannot tell real text from binary that merely
+/// happens to decode. Drops a string when it
+///  * is short (< `DECODED_NOISE_MIN_CHARS`) and contains any "bad" char, or
+///  * is longer and more than 10% of its chars are "bad", or fewer than 60%
+///    of its chars look readable.
+/// Disabled together with the rest of the noise filter
+/// (`NoiseConfig::disabled()` / `--noise-threshold 0`).
+fn decoded_text_noise(text: &str, cfg: &NoiseConfig) -> bool {
+    if cfg.repeat1_min_len == usize::MAX {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut bad = 0usize;
+    let mut readable = 0usize;
+    for c in text.chars() {
+        total += 1;
+        if is_decoded_bad_char(c) {
+            bad += 1;
+        } else if is_decoded_readable_char(c) {
+            readable += 1;
+        }
+    }
+    if total == 0 {
+        return false;
+    }
+    if total < DECODED_NOISE_MIN_CHARS {
+        return bad > 0;
+    }
+    bad * 10 > total || readable * 10 < total * 6
 }
 
 /// Returns a list of `ExtractedString`, sorted by ascending offset, from a
@@ -2541,7 +2675,7 @@ fn scan_parallel_chunk(
 }
 
 fn parallel_chunk_count(file_len: u64) -> usize {
-    file_len.div_ceil(PARALLEL_CHUNK_SIZE) as usize
+    ((file_len + PARALLEL_CHUNK_SIZE - 1) / PARALLEL_CHUNK_SIZE) as usize
 }
 
 /// Same as `extract_strings_from_file`, but scans the file in parallel
@@ -2667,7 +2801,7 @@ pub fn extract_strings_from_file_parallel_streaming_with_encodings_progress<
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
-                .map_err(std::io::Error::other)?,
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
         )
     } else {
         None
@@ -3081,6 +3215,48 @@ mod tests {
             .any(|s| s.encoding == "latin1" && s.text == "plain ascii"));
     }
     #[test]
+    fn utf8_filter_skips_ascii_only_runs() {
+        let filter = EncodingFilter {
+            ascii: false,
+            utf8: true,
+            ..EncodingFilter::ascii()
+        };
+        let data = b"plain ascii\x00caf\xc3\xa9\x00";
+        let out = extract_strings_with_encodings(data, 4, 1000, filter);
+
+        assert!(!out
+            .iter()
+            .any(|s| s.encoding == "utf8" && s.text == "plain ascii"));
+        assert!(
+            out.iter()
+                .any(|s| s.encoding == "utf8" && s.text == "caf\u{00e9}"),
+            "{out:?}"
+        );
+    }
+
+    #[cfg(feature = "shift-jis")]
+    #[test]
+    fn shift_jis_filter_skips_ascii_only_runs() {
+        let filter = EncodingFilter {
+            ascii: false,
+            shift_jis: true,
+            ..EncodingFilter::ascii()
+        };
+        let mut data = b"plain ascii\x00".to_vec();
+        data.extend_from_slice(&[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA, 0x00]);
+        let out = extract_strings_with_encodings(&data, 4, 1000, filter);
+
+        assert!(!out
+            .iter()
+            .any(|s| s.encoding == "shift_jis" && s.text == "plain ascii"));
+        assert!(
+            out.iter()
+                .any(|s| s.encoding == "shift_jis" && s.text.contains("日本語")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
     fn ascii_and_utf16_basic() {
         let mut data = Vec::new();
         data.extend_from_slice(b"\x00\x01hello world\x00");
@@ -3252,6 +3428,71 @@ mod tests {
         let data = b"\x00aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x00".to_vec();
         let out = extract_strings_with_noise_config(&data, 4, 200_000, cfg);
         assert!(out.iter().any(|s| s.text.starts_with("aaaa")));
+    }
+
+    #[test]
+    fn decoded_noise_keeps_normal_text() {
+        let cfg = NoiseConfig::default();
+        assert!(!decoded_text_noise("Hello, world! 2026", &cfg));
+        assert!(!decoded_text_noise("caf\u{e9} au lait", &cfg));
+        assert!(!decoded_text_noise("日本語のテキストです", &cfg));
+        assert!(!decoded_text_noise("\u{20ac}100", &cfg));
+        // Tab/LF/CR are legitimate whitespace, not "bad" chars.
+        assert!(!decoded_text_noise("line one\r\nline two\tend", &cfg));
+    }
+
+    #[test]
+    fn decoded_noise_short_strings_judged_on_hard_evidence_only() {
+        let cfg = NoiseConfig::default();
+        assert!(decoded_text_noise("ab\u{fffd}d", &cfg));
+        assert!(decoded_text_noise("ab\u{1}d", &cfg));
+        assert!(decoded_text_noise("ab\u{e000}d", &cfg));
+        // Short symbol-only text is kept (no ratio test below the minimum).
+        assert!(!decoded_text_noise("\u{2605}\u{2605}\u{2605}", &cfg));
+    }
+
+    #[test]
+    fn decoded_noise_long_strings_use_ratios() {
+        let cfg = NoiseConfig::default();
+        // 2 U+FFFD in 14 chars (> 10%) -> noise.
+        assert!(decoded_text_noise("hello\u{fffd}wor\u{fffd}ld ok", &cfg));
+        // 1 U+FFFD in 40+ chars (< 10%) -> kept (e.g. a truncated multibyte tail).
+        assert!(!decoded_text_noise(
+            "this is a long readable sentence with one \u{fffd}",
+            &cfg
+        ));
+        // Long run of unreadable symbols -> noise.
+        assert!(decoded_text_noise(
+            "\u{2605}\u{2606}\u{2605}\u{2606}\u{2605}\u{2606}\u{2605}\u{2606}\u{2605}\u{2606}",
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn decoded_noise_disabled_with_noise_threshold_zero() {
+        let cfg = NoiseConfig::from_threshold(0);
+        assert!(!decoded_text_noise(
+            "\u{fffd}\u{fffd}\u{fffd}\u{fffd}",
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn utf8_run_with_replacement_chars_is_filtered_end_to_end() {
+        // A valid UTF-8 string is kept ...
+        let good = b"\x00caf\xc3\xa9 au lait\x00".to_vec();
+        let out = extract_strings(&good, 4, 200_000);
+        assert!(out
+            .iter()
+            .any(|s| s.encoding == "utf8" && s.text.contains("caf\u{e9}")));
+        // ... but no utf8 record may ever carry U+FFFD / control chars by default.
+        let mut junk = b"\x00".to_vec();
+        junk.extend_from_slice(b"ab\xc3\xa9\xff\xfe\xc3\xa9cd");
+        junk.push(0);
+        let out = extract_strings(&junk, 4, 200_000);
+        assert!(!out
+            .iter()
+            .any(|s| s.encoding == "utf8" && s.text.contains('\u{fffd}')));
     }
 
     #[test]
@@ -3832,5 +4073,86 @@ mod yara_window_tests {
         hits.sort_unstable();
         let expected: Vec<u64> = positions.iter().map(|&p| p as u64).collect();
         assert_eq!(hits, expected);
+    }
+}
+
+/// Regression tests: no encoding may emit strings made of characters nobody can
+/// read (U+FFFD, C1 controls, private use). Seen as "?" / "<?>" in terminals.
+#[cfg(test)]
+mod unreadable_text_tests {
+    use super::*;
+
+    fn texts(data: &[u8], encoding: &str) -> Vec<String> {
+        extract_strings_with_encodings(data, 4, 100_000, EncodingFilter::all())
+            .into_iter()
+            .filter(|s| s.encoding == encoding)
+            .map(|s| s.text)
+            .collect()
+    }
+
+    fn is_bad(c: char) -> bool {
+        !is_readable_char(c) && !matches!(c, '\n' | '\r' | '\t')
+    }
+
+    #[test]
+    fn cp1252_undefined_bytes_are_not_emitted() {
+        let data = b"\x00caf\xe9 \x81\x8d\x8f\x90\x9d na\xefve text\x00";
+        for t in texts(data, "cp1252") {
+            assert!(!t.chars().any(is_bad), "unreadable char in {t:?}");
+        }
+        // Defined 0x80-0x9F bytes (euro sign, curly quotes) must still work.
+        let ok = texts(b"\x00price \x80 99 \x93quoted\x94 ok\x00", "cp1252");
+        assert!(ok.iter().any(|t| t.contains('€')), "{ok:?}");
+    }
+
+    #[test]
+    fn utf8_rejects_replacement_c1_and_private_use() {
+        // U+FFFD, U+0085 (C1), U+E000 (private use), U+10FFFF (noncharacter).
+        let data = b"\x00abcd\xef\xbf\xbdefgh\xc2\x85ijkl\xee\x80\x80mnop\xf4\x8f\xbf\xbfqrst\x00";
+        for t in texts(data, "utf8") {
+            assert!(!t.chars().any(is_bad), "unreadable char in {t:?}");
+        }
+        let ok = texts("\0h\u{e9}llo w\u{f6}rld\0".as_bytes(), "utf8");
+        assert!(ok.iter().any(|t| t.contains("h\u{e9}llo")), "{ok:?}");
+    }
+
+    #[test]
+    fn shift_jis_rejects_unassigned_and_user_defined_pairs() {
+        // 0x8540 is unassigned (decodes to U+FFFD); 0xF040.. is the user-defined area.
+        let bad = b"\x00\x85\x40\x85\x40\x85\x40\xf0\x40\xf0\x41\xf0\x42\x00";
+        assert!(texts(bad, "shift_jis").is_empty());
+        assert!(!shift_jis_pair_valid(0x85, 0x40));
+        assert!(!shift_jis_pair_valid(0xF0, 0x40));
+        // Real text still decodes (full Shift-JIS table only; the lite fallback
+        // has no kanji).
+        #[cfg(feature = "shift-jis")]
+        {
+            let jp = [0x00, 0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA, 0x00];
+            assert!(texts(&jp, "shift_jis").iter().any(|t| t.contains("日本語")));
+        }
+    }
+
+    #[test]
+    fn pseudo_random_data_never_yields_unreadable_strings() {
+        // Deterministic xorshift noise: lots of byte pairs that merely look like
+        // multi-byte text.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let data: Vec<u8> = (0..512 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        for s in extract_strings_with_encodings(&data, 4, 1_000_000, EncodingFilter::all()) {
+            assert!(
+                !s.text.chars().any(is_bad),
+                "{} @0x{:x} has an unreadable char: {:?}",
+                s.encoding,
+                s.offset,
+                s.text
+            );
+        }
     }
 }
