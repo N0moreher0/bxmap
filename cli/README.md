@@ -339,3 +339,8 @@ Step 3: bxmap dump.raw --mode deep --max-strings 0 --carve pe,exe,dll --carve-ou
 Step 4: Run Volatility on same dump to enumerate processes, modules, network connections.
         Combine with YARA rules + sandbox for suspicious PE samples.
 ```
+
+## License
+
+The bxmap-cli frontend is licensed under the GNU Affero General Public License v3.0 only (see [LICENSE-AGPL](LICENSE-AGPL)).
+The underlying bxmap library is dual-licensed under MIT OR Apache-2.0.

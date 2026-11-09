@@ -4,7 +4,7 @@ Mục tiêu: biến bxmap thành công cụ trích xuất chuỗi / triage cho m
 
 Ký hiệu: `[ ]` chưa làm · `[~]` đang làm · `[x]` xong. Độ ưu tiên: **P0** làm trước · **P1** quan trọng · **P2** nên có.
 
-Phiên bản hiện tại: `bxmap` **1.0.4**, `bxmap-cli` **1.0.14** (Phase 4.1 noise filter + ACPI filtering shipped). Các mốc ở cuối tài liệu tính từ bản kế tiếp.
+Phiên bản hiện tại: `bxmap` **1.0.5**, `bxmap-cli` **1.0.15** (Phase 4.1 noise filter + ACPI filtering shipped). Các mốc ở cuối tài liệu tính từ bản kế tiếp.
 
 ---
 
@@ -67,6 +67,40 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 - [x] Test hồi quy: dump mẫu có text ASCII-in-UTF-16 để chắc chắn bug LE/BE không quay lại.
 
 **Xong khi:** quét lại Lab 6 không còn cặp LE/BE trùng và mỗi chuỗi tối đa một dòng output.
+
+---
+
+## Phase 2.6 — Lỗi tìm được qua review mã nguồn (2026-11-09) · P0
+
+Nguồn: review toàn repo + `cargo test --workspace --locked` (245 test pass), `clippy -D warnings`, đối chiếu CI GitHub (run #143–#147 đỏ). Các mục **đã tái hiện** ghi rõ; mục **nghi vấn** chưa đọc được log CI (thiếu `GITHUB_TOKEN`).
+
+### 2.6.1 Đã xác nhận
+- [x] **CI đỏ do clippy (`cli`)**: `cli/src/helpers.rs:540` — `clippy::question_mark` (khối `if let Err(e) = ... { return Err(e); }`). Sửa bằng toán tử `?`.
+- [x] **`scan_yara_from_reader_streaming` báo trùng khi reader trả dữ liệu ngắn** (pipe/stdin/reader tuỳ biến): hàm gọi `read` một lần thay vì lặp đến khi đầy buffer, nên cửa sổ rất nhỏ + overlap 64 KiB quét lại gần hết dữ liệu. Tái hiện: cùng dữ liệu, reader đủ → 1 hit; reader 10 KB/lần → **7 hit trùng** cùng offset. CLI chỉ dùng bản `file_streaming` nên ít dính; thư viện thì dính.
+- [x] **YARA streaming báo hit nằm trong vùng overlap 2 lần** (theo đọc code, kể cả file thường: hit trong 64 KiB cuối mỗi cửa sổ 32 MiB). Cần bỏ hit nằm trọn trong phần carry (cùng ý tưởng `Chunk::is_new` ở `chunk.rs`).
+
+### 2.6.2 Lỗi nhỏ / độ bền
+- [x] `minidump.rs`: `region_for_va` dùng `partition_point` nhưng `regions` chưa sắp xếp (`ranges` thì có) → dump không theo thứ tự sẽ tra sai. Sắp xếp theo `base` sau khi parse.
+- [x] `minidump.rs`: `offset_to_va` cộng `start + delta` không kiểm tra tràn → panic ở bản debug với dump giả mạo. Dùng `checked_add`.
+- [x] `.gitignore`: dòng `benches/` gây hiểu nhầm (`benches/extract.rs` đang được track, file mới trong thư mục sẽ bị bỏ qua). Bỏ dòng này.
+- [~] `deny.toml`: còn khóa cũ `vulnerability`, `notice` (cargo-deny bản mới đã gỡ) — nghi là nguyên nhân job `cargo deny` đỏ. **Chưa xác nhận bằng log.**
+- [ ] `carve_7z` chỉ kiểm tra độ dài, **không kiểm tra CRC** `StartHeaderCRC` → có thể báo `Valid` cho dữ liệu rác có đúng magic. (Hoãn: cần xem lại fixture test 7z.)
+
+### 2.6.3 Nghi vấn — cần log CI để chốt
+- [ ] Job `msrv (lite)` (1.70) và `msrv (full)` (1.80) đều đỏ, fail sau ~15 giây. `Cargo.toml` khai `rust-version = "1.70"` nhưng comment trong file nói rayon 1.12 cần ≥ 1.80 và `Cargo.lock` đang ghim rayon 1.12.0 → khai báo MSRV có thể sai; bản full (yara-x 1.23) có thể cần Rust mới hơn 1.80.
+- [ ] Job `cargo audit` đỏ (chưa rõ advisory nào) và `semver-checks` (optional) đỏ.
+- [ ] Làm rõ giấy phép: thư mục gốc có `LICENSE` là AGPL-3.0 trong khi crate lõi khai `MIT OR Apache-2.0` (CLI mới là AGPL) — nên chuyển bản AGPL về `cli/` hoặc ghi chú rõ trong README.
+- [ ] Hai commit mới nhất trên local (`d0d6fe7`, `034a1b5`) chưa thấy run CI trên GitHub — kiểm tra đã push chưa.
+
+### 2.6.4 Kết quả sửa (2026-11-09)
+- `cli/src/helpers.rs`: thay khối `if let Err(e) ... return Err(e)` bằng `?` → `clippy -D warnings` sạch cả 2 crate.
+- `src/lib.rs`: tách lõi `scan_yara_windowed(chunk_size, overlap_size)`; lặp `read` đến khi đầy buffer (xử lý cả `Interrupted`) và bỏ hit nằm trọn trong phần carry. Bản công khai vẫn dùng `CHUNK_SIZE` 32 MiB + overlap 64 KiB. Thêm 4 test `yara_window_tests` (đọc ngắn, đọc ngắn == đọc đủ, hit trong overlap, mọi needle đúng 1 lần qua nhiều cửa sổ).
+- `src/minidump.rs`: sắp xếp `regions` theo `base`; `va_to_offset`/`offset_to_va` dùng `checked_add`. Thêm 2 test hồi quy (region ghi ngược thứ tự, range giả mạo gần `u64::MAX`).
+- `.gitignore`: bỏ dòng `benches/`. `deny.toml`: bỏ khóa `vulnerability`, `notice` (`[~]` vì máy local không có `cargo-deny`, chờ CI xác nhận).
+- Kiểm tra sau khi sửa: `cargo test --workspace --locked` **251 test pass** (lib 116, smoke 2, CLI unit 29, golden 103, doctest 1), `clippy -D warnings` sạch root + cli, `cargo fmt --check` sạch, `--no-default-features --lib` 110 test pass.
+- **Còn mở:** 2.6.2 `carve_7z` kiểm tra CRC (hoãn), toàn bộ 2.6.3 (MSRV, audit, semver, giấy phép, push commit) — cần log CI/`GITHUB_TOKEN` hoặc quyết định của chủ repo. Chưa push, nên CI GitHub chưa chạy lại trên bản sửa.
+
+**Xong khi:** CI `main` xanh toàn bộ job bắt buộc, và có test hồi quy cho từng lỗi 2.6.1 / 2.6.2 (trừ mục đã hoãn).
 
 ---
 

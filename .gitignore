@@ -3,7 +3,6 @@ sample_demo.dmp
 carved_lab*/
 demo/
 bench/
-benches/
 out.json.gz
 report.html
 report.md
@@ -21,6 +20,7 @@ tmp_*.ndjson
 *.ndjson
 
 # Local verification / fuzz scratch (not published)
+/.cargo/
 gate.log
 fuzz/*.log
 fuzz/artifacts/

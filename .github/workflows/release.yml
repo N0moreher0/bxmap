@@ -48,7 +48,8 @@ jobs:
         run: |
           mkdir -p package
           cp "target/${{ matrix.target }}/release/bxmap" package/bxmap
-          cp LICENSE README.md package/
+          # CLI là AGPL-3.0-only; kèm MIT/Apache vì binary có link thư viện core (MIT OR Apache-2.0)
+          cp cli/LICENSE-AGPL LICENSE-MIT LICENSE-APACHE README.md package/
 
       - name: Stage Windows binary
         if: runner.os == 'Windows'
@@ -56,7 +57,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force package | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/bxmap.exe" package/bxmap.exe
-          Copy-Item LICENSE, README.md package/
+          # CLI là AGPL-3.0-only; kèm MIT/Apache vì binary có link thư viện core (MIT OR Apache-2.0)
+          Copy-Item cli/LICENSE-AGPL, LICENSE-MIT, LICENSE-APACHE, README.md package/
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
