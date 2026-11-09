@@ -2541,7 +2541,7 @@ fn scan_parallel_chunk(
 }
 
 fn parallel_chunk_count(file_len: u64) -> usize {
-    ((file_len + PARALLEL_CHUNK_SIZE - 1) / PARALLEL_CHUNK_SIZE) as usize
+    file_len.div_ceil(PARALLEL_CHUNK_SIZE) as usize
 }
 
 /// Same as `extract_strings_from_file`, but scans the file in parallel
@@ -2667,7 +2667,7 @@ pub fn extract_strings_from_file_parallel_streaming_with_encodings_progress<
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+                .map_err(std::io::Error::other)?,
         )
     } else {
         None
