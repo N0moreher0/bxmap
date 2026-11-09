@@ -1,6 +1,12 @@
 use super::*;
 use std::sync::OnceLock;
 
+/// In strict mode, secret findings below this confidence are dropped. It sits
+/// above the generic, public-client, OAuth-client-id and Google API key rules
+/// (0.20-0.50) and below structurally validated rules (0.75+), so strict mode
+/// only reports findings with real secret semantics.
+pub const STRICT_MIN_CONFIDENCE: f64 = 0.60;
+
 pub fn detected_ip_match(text: &str) -> Option<(String, usize, usize)> {
     static IPV4: OnceLock<Regex> = OnceLock::new();
     let ipv4 = IPV4.get_or_init(|| {
@@ -224,6 +230,7 @@ pub fn detect_findings(
                 }
             }
             Detector::Secret => {
+                let before = out.len();
                 for finding in bxmap::classifier::detect_secrets_detailed(&result.text) {
                     let validation =
                         bxmap::classifier::validate_finding(finding.rule, &finding.value);
@@ -274,6 +281,13 @@ pub fn detect_findings(
                             });
                         }
                     }
+                }
+                if strict {
+                    let kept: Vec<_> = out
+                        .drain(before..)
+                        .filter(|f| f.confidence >= STRICT_MIN_CONFIDENCE)
+                        .collect();
+                    out.extend(kept);
                 }
             }
         }

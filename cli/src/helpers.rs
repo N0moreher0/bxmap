@@ -1424,7 +1424,8 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_findings_groups_by_rule_and_value() {
+    fn dedupe_findings_groups_by_value_across_rules() {
+        // Same AWS key in two strings: one row, two offsets.
         let result = sample_string(0, "key AKIAIOSFODNN7EXAMPLE");
         let mut findings = super::detect_findings(&result, &[super::Detector::Secret], false);
         findings.extend(super::detect_findings(
@@ -1438,6 +1439,25 @@ mod tests {
         assert_eq!(deduped[0].count, 2);
         assert_eq!(deduped[0].offsets, vec![0, 30]);
         assert!(!deduped[0].offsets_truncated);
+
+        // The same AIza key is a public client key in one string and a plain
+        // API key in another. Dedupe must keep the lower-confidence rule so a
+        // public key is never promoted back to a server secret.
+        let key = "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ1234567";
+        let public = sample_string(100, &format!("https://clients6.google.com/?key={key}"));
+        let plain = sample_string(200, &format!("config key {key}"));
+        let mut mixed = super::detect_findings(&public, &[super::Detector::Secret], false);
+        mixed.extend(super::detect_findings(
+            &plain,
+            &[super::Detector::Secret],
+            false,
+        ));
+        assert_eq!(mixed.len(), 2);
+        let deduped = super::dedupe_findings(mixed);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].finding.rule, "PUBLIC_CLIENT_KEY");
+        assert!((deduped[0].finding.confidence - 0.30).abs() < 1e-9);
+        assert_eq!(deduped[0].count, 2);
     }
 
     #[test]
@@ -1594,14 +1614,19 @@ pub struct DedupedFinding {
 /// Maximum number of offsets kept per deduped finding.
 pub const MAX_DEDUPE_OFFSETS: usize = 100;
 
-/// Collapse identical detector findings by `(rule, value)`, keeping the first
-/// occurrence plus a count and a (truncated) list of byte offsets.
+/// Collapse identical detector findings by `value`, keeping a count and a
+/// (truncated) list of byte offsets.
+///
+/// The same bytes can match several rules (an `AIza...` key is
+/// `GOOGLE_API_KEY` in one string and `PUBLIC_CLIENT_KEY` when a Google
+/// client domain is nearby). Deduplicating by value and keeping the
+/// *lowest-confidence* rule prevents a public client key from being promoted
+/// back to a high-confidence API key by an unrelated occurrence.
 pub fn dedupe_findings(findings: Vec<bxmap::classifier::DetectedFinding>) -> Vec<DedupedFinding> {
-    let mut index: std::collections::HashMap<(String, String), usize> =
-        std::collections::HashMap::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut unique: Vec<DedupedFinding> = Vec::new();
     for finding in findings {
-        let key = (finding.rule.to_string(), finding.value.clone());
+        let key = finding.value.clone();
         if let Some(&slot) = index.get(&key) {
             let entry = &mut unique[slot];
             entry.count += 1;
@@ -1609,6 +1634,9 @@ pub fn dedupe_findings(findings: Vec<bxmap::classifier::DetectedFinding>) -> Vec
                 entry.offsets.push(finding.offset);
             } else {
                 entry.offsets_truncated = true;
+            }
+            if finding.confidence < entry.finding.confidence {
+                entry.finding = finding;
             }
         } else {
             index.insert(key, unique.len());

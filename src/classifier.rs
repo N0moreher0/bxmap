@@ -52,11 +52,16 @@ pub struct DetectedFinding {
 /// Severity bucket for a rule name.
 pub fn severity_for(rule: &str) -> &'static str {
     match rule {
-        "GENERIC_SECRET" | "DOMAIN" | "BASE64_DECODED" | "PUBLIC_CLIENT_KEY" => "low",
+        "GENERIC_SECRET"
+        | "DOMAIN"
+        | "BASE64_DECODED"
+        | "PUBLIC_CLIENT_KEY"
+        | "GOOGLE_OAUTH_CLIENT_ID" => "low",
         "AWS_SECRET_KEY"
         | "AZURE_SAS_TOKEN"
         | "PAYPAL_CLIENT_SECRET"
         | "TWILIO_AUTH_TOKEN"
+        | "GOOGLE_API_KEY"
         | "URL"
         | "IPV4"
         | "IPV6" => "medium",
@@ -68,10 +73,17 @@ pub fn severity_for(rule: &str) -> &'static str {
 /// are triage hints, not proof.
 pub fn confidence_for(rule: &str) -> f64 {
     match rule {
-        "GENERIC_SECRET" => 0.40,
+        // A name=value hit is a triage hint, not proof: keep it low enough
+        // that strict mode and confidence filters discard it by default.
+        "GENERIC_SECRET" => 0.20,
         "DOMAIN" => 0.60,
         "BASE64_DECODED" => 0.50,
         "PUBLIC_CLIENT_KEY" => 0.30,
+        // A Google OAuth client id is a public identifier, never a secret.
+        "GOOGLE_OAUTH_CLIENT_ID" => 0.20,
+        // AIza keys are usually browser-embedded public client keys; a
+        // server-side key can be escalated by the analyst after review.
+        "GOOGLE_API_KEY" => 0.50,
         "URL" => 0.85,
         "IPV4" | "IPV6" => 0.90,
         "AWS_SECRET_KEY" | "AZURE_SAS_TOKEN" | "PAYPAL_CLIENT_SECRET" | "TWILIO_AUTH_TOKEN" => 0.75,
@@ -117,12 +129,12 @@ pub fn context_around(text: &str, start: usize, end: usize, radius: usize) -> St
 /// Built-in secret/API-key detection patterns (name, regex).
 /// Order matters only for `classify()` preference (first match wins).
 pub static SECRET_PATTERNS: &[(&str, &str)] = &[
-    ("AWS_ACCESS_KEY", r"AKIA[0-9A-Z]{16}"),
+    ("AWS_ACCESS_KEY", r"\bAKIA[0-9A-Z]{16}\b"),
     (
         "AWS_SECRET_KEY",
         r"(?i)aws.{0,20}secret.{0,20}[A-Za-z0-9/+=]{30,}",
     ),
-    ("GOOGLE_API_KEY", r"AIza[0-9A-Za-z_-]{35}"),
+    ("GOOGLE_API_KEY", r"\bAIza[0-9A-Za-z_-]{35}\b"),
     (
         "GOOGLE_OAUTH_CLIENT_ID",
         r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com",
@@ -131,52 +143,61 @@ pub static SECRET_PATTERNS: &[(&str, &str)] = &[
         "AZURE_STORAGE_KEY",
         r"(?i)azure.{0,20}(?:storage|account).{0,20}key.{0,20}[A-Za-z0-9+/=]{40,}",
     ),
-    ("AZURE_SAS_TOKEN", r"(?i)\?[^ ]*sig=[A-Za-z0-9%+/=]{20,}"),
-    ("GITHUB_PAT_CLASSIC", r"ghp_[A-Za-z0-9]{36,}"),
-    ("GITHUB_FINE_GRAINED_PAT", r"github_pat_[A-Za-z0-9_]{20,}"),
-    ("GITHUB_OAUTH_TOKEN", r"gho_[A-Za-z0-9]{36,}"),
-    ("GITHUB_APP_TOKEN", r"(ghu|ghs)_[A-Za-z0-9]{36,}"),
-    ("GITLAB_PAT", r"glpat-[A-Za-z0-9_-]{20,}"),
-    ("NPM_TOKEN", r"npm_[A-Za-z0-9]{36,}"),
-    ("OPENAI_API_KEY", r"sk-[A-Za-z0-9]{20,}"),
-    ("ANTHROPIC_API_KEY", r"sk-ant-[A-Za-z0-9_-]{20,}"),
-    ("HUGGINGFACE_TOKEN", r"hf_[A-Za-z0-9]{20,}"),
-    ("DEEPSEEK_API_KEY", r"sk-[A-Za-z0-9]{20,}"),
-    ("STRIPE_SECRET_KEY", r"sk_(?:live|test)_[A-Za-z0-9]{20,}"),
+    (
+        "AZURE_SAS_TOKEN",
+        r#"(?i)https?://[a-z0-9.-]+\.(?:blob|queue|table|file)\.core\.windows\.net/[^\s"'<>]*[?&]sig=[A-Za-z0-9%+/=_-]{20,}"#,
+    ),
+    ("GITHUB_PAT_CLASSIC", r"\bghp_[A-Za-z0-9]{36,}\b"),
+    (
+        "GITHUB_FINE_GRAINED_PAT",
+        r"\bgithub_pat_[A-Za-z0-9_]{20,}\b",
+    ),
+    ("GITHUB_OAUTH_TOKEN", r"\bgho_[A-Za-z0-9]{36,}\b"),
+    ("GITHUB_APP_TOKEN", r"\b(?:ghu|ghs)_[A-Za-z0-9]{36,}\b"),
+    ("GITLAB_PAT", r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
+    ("NPM_TOKEN", r"\bnpm_[A-Za-z0-9]{36,}\b"),
+    ("OPENAI_API_KEY", r"\bsk-[A-Za-z0-9]{20,}\b"),
+    ("ANTHROPIC_API_KEY", r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
+    ("HUGGINGFACE_TOKEN", r"\bhf_[A-Za-z0-9]{20,}\b"),
+    ("DEEPSEEK_API_KEY", r"\bsk-[A-Za-z0-9]{20,}\b"),
+    (
+        "STRIPE_SECRET_KEY",
+        r"\bsk_(?:live|test)_[A-Za-z0-9]{20,}\b",
+    ),
     (
         "STRIPE_PUBLISHABLE_KEY",
-        r"pk_(?:live|test)_[A-Za-z0-9]{20,}",
+        r"\bpk_(?:live|test)_[A-Za-z0-9]{20,}\b",
     ),
     (
         "STRIPE_RESTRICTED_KEY",
-        r"rk_(?:live|test)_[A-Za-z0-9]{20,}",
+        r"\brk_(?:live|test)_[A-Za-z0-9]{20,}\b",
     ),
     (
         "PAYPAL_CLIENT_SECRET",
         r"(?i)paypal.{0,20}secret.{0,20}[A-Za-z0-9]{20,}",
     ),
-    ("SLACK_BOT_TOKEN", r"xoxb-[0-9A-Za-z-]{20,}"),
-    ("SLACK_USER_TOKEN", r"xoxp-[0-9A-Za-z-]{20,}"),
+    ("SLACK_BOT_TOKEN", r"\bxoxb-[0-9A-Za-z-]{20,}\b"),
+    ("SLACK_USER_TOKEN", r"\bxoxp-[0-9A-Za-z-]{20,}\b"),
     (
         "SLACK_WEBHOOK",
-        r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",
+        r"\bhttps://hooks\.slack\.com/services/[A-Za-z0-9/]+",
     ),
     (
         "DISCORD_BOT_TOKEN",
-        r"[MN][A-Za-z0-9]{23}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}",
+        r"\b[MN][A-Za-z0-9]{23}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}\b",
     ),
-    ("TWILIO_API_KEY_SID", r"SK[0-9a-fA-F]{32}"),
+    ("TWILIO_API_KEY_SID", r"\bSK[0-9a-fA-F]{32}\b"),
     (
         "TWILIO_AUTH_TOKEN",
         r"(?i)twilio.{0,20}auth.{0,20}token.{0,20}[0-9a-f]{32}",
     ),
     (
         "SENDGRID_API_KEY",
-        r"SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}",
+        r"\bSG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b",
     ),
     (
         "JWT_TOKEN",
-        r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
     ),
     (
         "PRIVATE_KEY_BLOCK",
@@ -410,21 +431,69 @@ fn generic_secret_plausible(full_match: &str) -> bool {
     };
     let value = value
         .trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | ']' | '}' | '>' | '<'));
-    if value.len() < 6 {
+    // Real credentials are compact tokens. Prose, short counters and single
+    // query parameters all fail this length gate before anything else.
+    if value.len() < 12 {
         return false;
     }
     let lower = value.to_ascii_lowercase();
     if NON_SECRET_VALUES.contains(&lower.as_str()) {
         return false;
     }
-    // JavaScript / code fragments.
-    if lower.starts_with("function")
-        || value.contains("=>")
-        || value.contains('{')
-        || value.contains('}')
-        || value.contains(';')
-        || value.contains('(')
+    // Structural characters mean we caught a query string, path, JSON/XML
+    // fragment or code snippet instead of one credential value.
+    if value.chars().any(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\''
+                    | ','
+                    | ';'
+                    | '&'
+                    | '\\'
+                    | '%'
+                    | '{'
+                    | '}'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '<'
+                    | '>'
+                    | '|'
+            )
+    }) {
+        return false;
+    }
+    // A UUID is an identifier, not a credential.
+    if value.len() == 36
+        && value.as_bytes().iter().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                *b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
     {
+        return false;
+    }
+    // JavaScript / code fragments.
+    if lower.starts_with("function") || value.contains("=>") {
+        return false;
+    }
+    // CamelCase identifiers such as GetTokenInformation2 are API names.
+    let has_underscore = value.contains('_');
+    let camel_case = value
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase());
+    if camel_case && !has_underscore {
+        return false;
+    }
+    // Short all-hex values are GUID/CLSID halves and .NET assembly public
+    // key tokens (b77a5c561934e089), not credentials. Real hex keys (MD5,
+    // SHA-1/256, HMAC) are 32+ characters.
+    if value.len() < 24 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
     }
     let has_digit = value.bytes().any(|b| b.is_ascii_digit());
@@ -434,12 +503,16 @@ fn generic_secret_plausible(full_match: &str) -> bool {
     let identifier = value
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    // `GetTokenInformation`, `Malloc`, `DigiCert`: identifier-shaped words.
+    // Identifier-shaped words like GetTokenInformation, Malloc, DigiCert.
     if identifier && !has_digit && value.len() < 24 {
         return false;
     }
     // Short alphabetic words are natural language, not keys.
     if !has_digit && !has_symbol && value.len() < 20 {
+        return false;
+    }
+    // Low-entropy values (repeated words, counters) are not credentials.
+    if entropy_of(value) < 2.5 {
         return false;
     }
     true
@@ -985,6 +1058,27 @@ pub fn validate_jwt(token: &str) -> ValidationResult {
     ValidationResult::Valid
 }
 
+/// Validate an Azure SAS token: the URL must point at an Azure storage host
+/// and carry a non-trivial `sig=`. YouTube and other signed URLs use the same
+/// query parameter name, so the host check is what separates them.
+fn validate_azure_sas(value: &str) -> ValidationResult {
+    let lower = value.to_ascii_lowercase();
+    let azure_host = [
+        ".blob.core.windows.net",
+        ".queue.core.windows.net",
+        ".table.core.windows.net",
+        ".file.core.windows.net",
+    ]
+    .iter()
+    .any(|host| lower.contains(host));
+    let has_sig = lower.contains("sig=") && value.len() >= 40;
+    if azure_host && has_sig {
+        ValidationResult::Valid
+    } else {
+        ValidationResult::Invalid
+    }
+}
+
 /// Validate an AWS access key ID: starts with `AKIA` or `ASIA` and is exactly
 /// 20 characters. No checksum exists for AWS keys, so prefix + length is the
 /// only structural check available.
@@ -1041,6 +1135,14 @@ pub fn validate_finding(rule: &str, value: &str) -> ValidationResult {
         "BTC_ADDR" => validate_base58check(value),
         "ETH_ADDR" => ValidationResult::NotApplicable,
         "AWS_ACCESS_KEY" => validate_aws_key(value),
+        "AZURE_SAS_TOKEN" => validate_azure_sas(value),
+        "GENERIC_SECRET" => {
+            if generic_secret_plausible(value) {
+                ValidationResult::Valid
+            } else {
+                ValidationResult::Invalid
+            }
+        }
         "GITHUB_PAT_CLASSIC"
         | "GITHUB_FINE_GRAINED_PAT"
         | "GITHUB_OAUTH_TOKEN"
@@ -1433,8 +1535,9 @@ mod tests {
     fn generic_secret_keeps_real_looking_values() {
         for text in [
             "password=hunter2hunter2",
-            "api_key=abcdef123456",
+            "api_key=abc123def456ghi789",
             "token=sk-live-abc123def456",
+            "password=0123456789abcdef0123456789abcdef",
             "Password: correcthorsebatterystaple",
         ] {
             let found = detect_secrets(text);
@@ -1443,6 +1546,87 @@ mod tests {
                 "missed plausible secret {text:?}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn azure_sas_requires_azure_host() {
+        // YouTube signed URLs use the same ?...&sig= shape and used to be
+        // reported as Azure SAS tokens at confidence 0.75.
+        let youtube = "https://r1---sn-abc.googlevideo.com/videoplayback?expire=1566225713&ip=137.97.68.29&id=o-abc&sig=ALgxI2wwABCDEFGHIJKLMNOP";
+        let found = detect_secrets(youtube);
+        assert!(
+            !found.iter().any(|m| m.typ == "AZURE_SAS_TOKEN"),
+            "YouTube signed URL misreported as Azure SAS: {found:?}"
+        );
+
+        let azure = "https://acct.blob.core.windows.net/container/blob?sv=2019-02-02&ss=b&srt=sco&sp=rl&se=2026-01-01T00:00:00Z&sig=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%2Babc%3D";
+        let found = detect_secrets(azure);
+        assert!(
+            found.iter().any(|m| m.typ == "AZURE_SAS_TOKEN"),
+            "real Azure SAS not detected: {found:?}"
+        );
+        assert_eq!(
+            validate_finding("AZURE_SAS_TOKEN", azure),
+            ValidationResult::Valid
+        );
+        assert_eq!(
+            validate_finding("AZURE_SAS_TOKEN", youtube),
+            ValidationResult::Invalid
+        );
+    }
+
+    #[test]
+    fn fixed_prefix_rules_are_case_sensitive_and_bounded() {
+        // Lowercase "akia" appears inside base64 blobs in real memory dumps.
+        let found = detect_secrets("lNHAAYGAIAABA8uvE+UbrR4T5tmKAAAAKIAAAAAACAAAAAAAAAAAAwDAAAAAAAFApBwYAQHA1BgcAUGAzBAAAAEAzBAaAUGAsBAbAMDAyAgLAQGAsBAbAwCAtAgMAEDA3AwNAkDAAAAGAAAAyBAAAwBAAAwAAAAAcAAAA0CAAAAOAAAAgBAAAEBAAAwAAAAAsQcNkBBAAAAADpDXVNXZyNHXAAAKAAAACAAAAQBAAAAAAAAAAAgAAwFXT1UQSRlTFRVLQNEXVNXZyNHAT1WYyRnTlRHXQl2Y0VnclNHAQAAAAUAAAA6JAAAA1FAAAwBAAAwCAAAowEo4z4hT2Z0gahZOctzw7WXAAAQmAAAAJAAAg2IAAAQMTB1UirIWGxLT4M0u8PxkmgZbOHHAAAABAAAAA8BAAAwLAAAATBQLAEDAtAQNA0CAyAQMA0CAzAAMAcDAzAQNAcDAwAgNAQDA4AQLAMDAxAANAkDAzAQOAcDA1AANAADAtAgMAIDA2AQOAYDA0AAOAMDAzAgMA0CAxAAMAADAxAAAAAAAAAAAAAAAAAAYAAAADAAAgiFAAAAAAAAAz1WYyRnblRXLwNGAAAAAAgKc1TyfF7gROyteDxqb6wYkiCAhJch6RIopIAwJGjlmoCX9k8XxOYkjcr3Qs6mOMGpoAQYCXoeECaKCAcixYpJAAAAA");
+        assert!(
+            !found.iter().any(|m| m.typ == "AWS_ACCESS_KEY"),
+            "lowercase akia inside base64 matched AWS_ACCESS_KEY: {found:?}"
+        );
+        // The real uppercase key is still found and passes validation.
+        let found = detect_secrets("AKIAIOSFODNN7EXAMPLE");
+        assert!(
+            found.iter().any(|m| m.typ == "AWS_ACCESS_KEY"),
+            "uppercase AWS key missed: {found:?}"
+        );
+    }
+
+    #[test]
+    fn lab6_generic_secret_false_positives_are_rejected() {
+        for text in [
+            "GetSidFromToken: GetTokenInformation2 failed with %d",
+            "Token: GetTokenInformation2",
+            "token=470026429&forcesecure=1",
+            "Token=\"6595b64144ccf1df\",type=\"win32\",version=\"1.0.7600.16385\"",
+            "Secret: status:",
+            "publicKeyToken=\"6595b64144ccf1df\"",
+            "Token=b03f5f7f11d50a3",
+            "Token=b77a5c561934e089",
+            "Token=b77a5c561934e08",
+            "API_KEY: \"7e40f68c-7938-4c5d-9f95-e61647c213eb\",",
+        ] {
+            let found = detect_secrets(text);
+            assert!(
+                !found.iter().any(|m| m.typ == "GENERIC_SECRET"),
+                "generic false positive for {text:?}: {found:?}"
+            );
+            assert_eq!(
+                validate_finding("GENERIC_SECRET", text),
+                ValidationResult::Invalid,
+                "validator accepted false positive {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_rules_are_calibrated_low() {
+        assert!(confidence_for("GENERIC_SECRET") <= 0.20);
+        assert!(confidence_for("GOOGLE_OAUTH_CLIENT_ID") <= 0.20);
+        assert!(confidence_for("GOOGLE_API_KEY") <= 0.50);
+        assert_eq!(severity_for("GOOGLE_OAUTH_CLIENT_ID"), "low");
+        assert_eq!(severity_for("GOOGLE_API_KEY"), "medium");
+        // High-signal, structurally validated rules stay high.
+        assert!(confidence_for("AWS_ACCESS_KEY") >= 0.75);
     }
 
     #[test]
@@ -1661,7 +1845,9 @@ mod tests {
             .find(|f| f.rule == "GOOGLE_API_KEY")
             .expect("should be GOOGLE_API_KEY without domain context");
         assert_eq!(gapi.value, "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ1234567");
-        assert!(gapi.confidence >= 0.9);
+        // Server-side-looking Google keys are medium signal, not proof.
+        assert!((0.5..0.75).contains(&gapi.confidence));
+        assert_eq!(gapi.severity, "medium");
     }
 
     #[test]
