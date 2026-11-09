@@ -346,6 +346,9 @@ impl Minidump {
                     kind: u32le(&b, o + 40),
                 });
             }
+            // region_for_va dùng partition_point nên bắt buộc phải sắp xếp;
+            // dump lạ/giả mạo có thể ghi các region không theo thứ tự.
+            md.regions.sort_by_key(|r| r.base);
         }
         Ok(md)
     }
@@ -355,7 +358,11 @@ impl Minidump {
         let i = self.ranges.partition_point(|r| r.start <= va);
         let r = self.ranges.get(i.checked_sub(1)?)?;
         let d = va - r.start;
-        (d < r.size).then(|| r.file_offset + d)
+        if d < r.size {
+            r.file_offset.checked_add(d)
+        } else {
+            None
+        }
     }
 
     /// File offset -> virtual address (linear scan; ranges are few thousand).
@@ -363,7 +370,7 @@ impl Minidump {
         self.ranges
             .iter()
             .find(|r| off >= r.file_offset && off - r.file_offset < r.size)
-            .map(|r| r.start + (off - r.file_offset))
+            .and_then(|r| r.start.checked_add(off - r.file_offset))
     }
 
     pub fn module_for_va(&self, va: u64) -> Option<&Module> {
@@ -593,5 +600,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Dump chỉ có MemoryInfoList với 2 region ghi NGƯỢC thứ tự (base lớn trước).
+    fn synth_unsorted_regions() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"MDMP");
+        le32(&mut v, 0xa793);
+        le32(&mut v, 1); // một stream
+        le32(&mut v, 32); // directory rva
+        le32(&mut v, 0);
+        le32(&mut v, 1);
+        le64(&mut v, 0);
+        le32(&mut v, ST_MEMORY_INFO_LIST);
+        le32(&mut v, 16 + 2 * 48);
+        le32(&mut v, 44); // rva của stream
+        le32(&mut v, 16); // SizeOfHeader
+        le32(&mut v, 48); // SizeOfEntry
+        le64(&mut v, 2); // NumberOfEntries
+        for base in [0x2000u64, 0x1000] {
+            le64(&mut v, base); // BaseAddress
+            le64(&mut v, base); // AllocationBase
+            le32(&mut v, 0x04); // AllocationProtect
+            le32(&mut v, 0);
+            le64(&mut v, 0x1000); // RegionSize
+            le32(&mut v, MemoryRegion::MEM_COMMIT); // State
+            le32(&mut v, 0x04); // Protect
+            le32(&mut v, 0x20000); // Type
+            le32(&mut v, 0);
+        }
+        v
+    }
+
+    #[test]
+    fn unsorted_memory_info_regions_are_sorted_for_lookup() {
+        let md = Minidump::from_reader(Cursor::new(synth_unsorted_regions())).unwrap();
+        assert_eq!(md.regions.len(), 2);
+        // Trước khi sửa: partition_point trên mảng chưa sắp xếp trả None.
+        assert_eq!(md.region_for_va(0x1500).map(|r| r.base), Some(0x1000));
+        assert_eq!(md.region_for_va(0x2500).map(|r| r.base), Some(0x2000));
+        assert!(md.region_for_va(0x3000).is_none());
+    }
+
+    #[test]
+    fn offset_to_va_does_not_overflow_on_hostile_ranges() {
+        // start gần u64::MAX: `start + delta` từng tràn và panic ở bản debug.
+        let md = Minidump {
+            ranges: vec![MemoryRange {
+                start: u64::MAX - 4,
+                size: 0x100,
+                file_offset: 10,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(md.offset_to_va(10), Some(u64::MAX - 4));
+        assert_eq!(md.offset_to_va(20), None); // tràn -> None, không panic
+        assert_eq!(md.va_to_offset(u64::MAX - 4), Some(10));
     }
 }
