@@ -252,7 +252,7 @@ pub fn infer_format_from_output_path(path: &str) -> Option<Format> {
 /// written even on early exits (e.g. `--max-strings` truncation).
 pub enum Sink {
     Plain(BufWriter<Box<dyn Write>>),
-    Gzip(BufWriter<flate2::write::GzEncoder<File>>),
+    Gzip(Box<BufWriter<flate2::write::GzEncoder<File>>>),
 }
 
 impl Sink {
@@ -262,9 +262,8 @@ impl Sink {
         };
         let file = File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?;
         if path.to_ascii_lowercase().ends_with(".gz") {
-            Ok(Sink::Gzip(BufWriter::new(flate2::write::GzEncoder::new(
-                file,
-                flate2::Compression::default(),
+            Ok(Sink::Gzip(Box::new(BufWriter::new(
+                flate2::write::GzEncoder::new(file, flate2::Compression::default()),
             ))))
         } else {
             Ok(Sink::Plain(BufWriter::new(Box::new(file))))

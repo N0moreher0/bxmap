@@ -1,6 +1,6 @@
 [package]
 name = "bxmap"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "⚡Bxmap - Fast streaming (ASCII, UTF-16LE, UTF-16BE, UTF-32) string extractor for raw memory dump/binary files"
@@ -9,10 +9,10 @@ repository = "https://github.com/N0moreher0/bxmap"
 # repository cũ vẫn redirect được, nhưng đổi luôn cho brand mới
 keywords = ["strings", "forensics", "binary", "firmware", "dfir"]
 categories = ["parsing", "command-line-utilities"]
-# MSRV 1.70 chỉ áp dụng cho bản lite (`--no-default-features`). Bản đầy đủ
-# (mặc định, kéo yara-x/wasmtime/cranelift) cần Rust ≥ 1.80 (xác thực qua
-# `cargo +1.80 check --locked`; 1.75 fail do rayon 1.12 yêu cầu 1.80+).
-rust-version = "1.70"
+# MSRV 1.80 áp dụng cho bản lite (`--no-default-features`). Cargo 1.70-1.75
+# không phân giải được feature `dep:` trong dependency graph của yara-x dù
+# feature yara bị tắt. Bản đầy đủ (yara-x 1.23) yêu cầu Rust ≥ 1.95.
+rust-version = "1.80"
 
 [workspace]
 # Single workspace root so cross/docker mounts one directory and

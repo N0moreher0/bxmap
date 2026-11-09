@@ -1,0 +1,5 @@
+[advisories]
+# RSA Marvin timing sidechannel (RUSTSEC-2023-0071) comes from yara-x's crypto
+# feature. bxmap uses yara-x for pattern matching only and never performs RSA
+# private-key operations, so the attack surface is not reachable here.
+ignore = ["RUSTSEC-2023-0071"]

@@ -3,6 +3,25 @@
 All notable changes to `bxmap` / `bxmap-cli` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.6] - 2026-11-09
+
+### Fixed
+- Secret detection false positives on real memory dumps: fixed-prefix rules now
+  use token boundaries; `AZURE_SAS_TOKEN` requires an Azure storage host, so
+  YouTube signed URLs are no longer reported as SAS tokens.
+- `GENERIC_SECRET` now rejects query strings, paths, camelCase API identifiers,
+  short hex GUID/.NET assembly tokens, UUIDs and low-entropy values.
+- `--detect-strict` drops findings below confidence 0.60 (generic, public
+  client, OAuth client id and Google API key stay available in non-strict mode).
+- `--dedupe` collapses findings by value across rules and keeps the
+  lowest-confidence classification, so a public client key cannot be promoted.
+- Calibrated `GENERIC_SECRET`, `PUBLIC_CLIENT_KEY`, `GOOGLE_OAUTH_CLIENT_ID`
+  and `GOOGLE_API_KEY` confidence/severity.
+
+### Changed
+- Lite MSRV is 1.80 (Cargo 1.70-1.75 cannot resolve the optional yara-x graph);
+  the full default build requires Rust 1.95 (yara-x 1.23).
+
 ## [Unreleased]
 
 ### Added

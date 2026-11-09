@@ -20,7 +20,8 @@ tmp_*.ndjson
 *.ndjson
 
 # Local verification / fuzz scratch (not published)
-/.cargo/
+/.cargo/*
+!/.cargo/audit.toml
 gate.log
 fuzz/*.log
 fuzz/artifacts/

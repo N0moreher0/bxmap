@@ -1,7 +1,14 @@
 [advisories]
 # Các khóa `vulnerability` và `notice` đã bị cargo-deny bản mới gỡ bỏ
 # (lỗ hổng luôn là lỗi mặc định) nên không khai báo nữa.
-unmaintained = "warn"
+# Chỉ báo unmaintained cho dependency trực tiếp của workspace; các crate
+# transitive (ví dụ bincode qua yara-x) không chặn CI.
+unmaintained = "workspace"
+ignore = [
+  # RSA Marvin timing sidechannel (2023-0071). yara-x only uses this crate
+  # for signature verification; bxmap never performs RSA private-key ops.
+  "RUSTSEC-2023-0071",
+]
 yanked = "warn"
 
 [licenses]
@@ -28,4 +35,4 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allowed = ["https://github.com/rust-lang/crates.io-index"]
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

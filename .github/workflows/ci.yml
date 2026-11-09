@@ -22,7 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.70
+      # Cargo 1.70-1.75 cannot resolve the `dep:` feature syntax in the
+      # optional yara-x graph; 1.80 can, and lite never compiles yara-x.
+      - uses: dtolnay/rust-toolchain@1.80
       - name: Check core (lite, MSRV)
         run: cargo check --locked --no-default-features
       - name: Check CLI (lite, MSRV)
@@ -33,10 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.80
-      - name: Check core (default, MSRV 1.80)
+      # yara-x 1.23 declares rust-version 1.95.
+      - uses: dtolnay/rust-toolchain@1.95
+      - name: Check core (default, MSRV 1.95)
         run: cargo check --locked
-      - name: Check CLI (default, MSRV 1.80)
+      - name: Check CLI (default, MSRV 1.95)
         run: cargo check --locked --manifest-path cli/Cargo.toml
 
   clippy:
@@ -71,7 +74,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-semver-checks --locked
-      - run: cargo semver-checks --crate bxmap
+      - run: cargo semver-checks
 
   package:
     name: package
