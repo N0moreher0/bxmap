@@ -537,11 +537,8 @@ pub fn apply_with_features(
                     "carve",
                     "map-va",
                 ] {
-                    if let Err(e) =
-                        apply_with_features(&[extra.to_string()], explicit, _has_output, args)
-                    {
-                        return Err(e);
-                    }
+                    // Dùng `?` để lan truyền lỗi (clippy::question_mark)
+                    apply_with_features(&[extra.to_string()], explicit, _has_output, args)?;
                 }
             }
             other => {
