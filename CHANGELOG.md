@@ -3,6 +3,11 @@
 All notable changes to `bxmap` / `bxmap-cli` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.17] - 2026-11-10
+
+### Changed
+- Internal clippy cleanups only (`Option::is_none_or`); no behaviour change.
+
 ## [1.0.16] - 2026-11-10
 
 CLI release aligned with `bxmap` 1.0.6.

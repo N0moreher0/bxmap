@@ -830,7 +830,7 @@ pub fn hex_encode(data: &[u8]) -> String {
 }
 
 pub fn matches_filter(regex: Option<&Regex>, text: &str) -> bool {
-    regex.map_or(true, |regex| regex.is_match(text))
+    regex.is_none_or(|regex| regex.is_match(text))
 }
 
 pub fn scan_magic_bytes(path: &str) -> io::Result<Vec<MagicMatch>> {

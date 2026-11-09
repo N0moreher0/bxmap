@@ -219,7 +219,7 @@ pub fn run_streaming(ctx: &ScanContext<'_>) -> Result<(), String> {
                 .map_err(|e| format!("write failed: {e}"))?;
         }
         for result in &ctx.xor_results {
-            if ctx.filter_regex.as_ref().map_or(true, |regex| {
+            if ctx.filter_regex.as_ref().is_none_or(|regex| {
                 regex.is_match(&String::from_utf8_lossy(&result.plaintext))
             }) {
                 write_xor_json(result, &mut writer, &mut json_count, json_layout)
@@ -282,7 +282,7 @@ pub fn run_streaming(ctx: &ScanContext<'_>) -> Result<(), String> {
             write_yara_text(matched, &mut writer).map_err(|e| format!("write failed: {e}"))?;
         }
         for result in &ctx.xor_results {
-            if ctx.filter_regex.as_ref().map_or(true, |regex| {
+            if ctx.filter_regex.as_ref().is_none_or(|regex| {
                 regex.is_match(&String::from_utf8_lossy(&result.plaintext))
             }) {
                 write_xor_text(result, &mut writer).map_err(|e| format!("write failed: {e}"))?;
@@ -580,7 +580,7 @@ pub fn run_buffered(ctx: &ScanContext<'_>) -> Result<(), String> {
         .filter(|result| {
             ctx.filter_regex
                 .as_ref()
-                .map_or(true, |regex| regex.is_match(&result.text))
+                .is_none_or(|regex| regex.is_match(&result.text))
         })
         .collect();
     let counts = if args.dedupe {
@@ -700,7 +700,7 @@ pub fn run_buffered(ctx: &ScanContext<'_>) -> Result<(), String> {
                 .map_err(|e| format!("write failed: {e}"))?;
         }
         for result in &ctx.xor_results {
-            if ctx.filter_regex.as_ref().map_or(true, |regex| {
+            if ctx.filter_regex.as_ref().is_none_or(|regex| {
                 regex.is_match(&String::from_utf8_lossy(&result.plaintext))
             }) {
                 write_xor_json(result, &mut writer, &mut json_count, json_layout)
@@ -800,7 +800,7 @@ pub fn run_buffered(ctx: &ScanContext<'_>) -> Result<(), String> {
             write_yara_text(matched, &mut writer).map_err(|e| format!("write failed: {e}"))?;
         }
         for result in &ctx.xor_results {
-            if ctx.filter_regex.as_ref().map_or(true, |regex| {
+            if ctx.filter_regex.as_ref().is_none_or(|regex| {
                 regex.is_match(&String::from_utf8_lossy(&result.plaintext))
             }) {
                 write_xor_text(result, &mut writer).map_err(|e| format!("write failed: {e}"))?;

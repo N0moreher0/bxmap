@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "bxmap-cli"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "bxmap",
  "criterion",
