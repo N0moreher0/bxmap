@@ -1,4 +1,5 @@
-//! `bxmap` -- a standalone crate (open source, licensed under AGPLv3).
+//! `bxmap` -- a standalone crate (open source, dual-licensed under MIT OR Apache-2.0;
+//! the `bxmap-cli` frontend is licensed separately under AGPL-3.0-only).
 //! Depends on `serde` (so `ExtractedString` can be
 //! serialized -- the caller decides how to wrap it in JSON/its own protocol
 //! if needed, this crate only returns a plain `Vec<ExtractedString>`) and
@@ -92,8 +93,9 @@ pub struct YaraMatch {
 /// Compiles YARA source and scans a reader in bounded chunks (windowed mode).
 ///
 /// A small overlap is retained between chunks so literals and regular
-/// expressions crossing an I/O boundary are still visible to YARA. Each
-/// matching rule is reported for every window in which it matches; `offset`
+/// expressions crossing an I/O boundary are still visible to YARA. Pattern
+/// hits lying entirely inside the overlap were already reported by the previous
+/// window and are skipped. A rule is reported for every window with new hits; `offset`
 /// is the real offset of the first pattern hit in that window (not the window
 /// start), and `matches` lists every hit with its pattern id and range.
 ///
@@ -104,42 +106,77 @@ pub struct YaraMatch {
 /// path, prefer yara-x's `Scanner::scan_file` directly.
 #[cfg(feature = "yara")]
 pub fn scan_yara_from_reader_streaming<R: Read, F: FnMut(YaraMatch)>(
+    reader: R,
+    rules_source: &str,
+    on_match: F,
+) -> std::io::Result<usize> {
+    scan_yara_windowed(
+        reader,
+        rules_source,
+        CHUNK_SIZE,
+        YARA_OVERLAP_SIZE,
+        on_match,
+    )
+}
+
+/// Lõi quét YARA theo cửa sổ. Tách `chunk_size`/`overlap_size` thành tham số
+/// để test dùng cửa sổ nhỏ; hàm công khai truyền hằng số mặc định.
+#[cfg(feature = "yara")]
+fn scan_yara_windowed<R: Read, F: FnMut(YaraMatch)>(
     mut reader: R,
     rules_source: &str,
+    chunk_size: usize,
+    overlap_size: usize,
     mut on_match: F,
 ) -> std::io::Result<usize> {
+    let chunk_size = chunk_size.max(1);
     let rules = yara_x::compile(rules_source).map_err(|error| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
     })?;
     let mut scanner = yara_x::Scanner::new(&rules);
-    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut buffer = vec![0u8; chunk_size];
     let mut carry = Vec::new();
     let mut global_offset = 0u64;
     let mut count = 0usize;
 
     loop {
-        let read = reader.read(&mut buffer)?;
+        // Lấp đầy buffer: pipe/stdin/reader tuỳ biến có thể trả ngắn, nếu chỉ
+        // `read` một lần thì mỗi cửa sổ rất nhỏ và vùng overlap bị quét lặp.
+        let mut read = 0usize;
+        while read < chunk_size {
+            match reader.read(&mut buffer[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
         if read == 0 {
             break;
         }
-        let mut window = Vec::with_capacity(carry.len() + read);
+        let carried = carry.len();
+        let mut window = Vec::with_capacity(carried + read);
         window.extend_from_slice(&carry);
         window.extend_from_slice(&buffer[..read]);
-        let window_offset = global_offset.saturating_sub(carry.len() as u64);
+        let window_offset = global_offset.saturating_sub(carried as u64);
         let results = scanner.scan(&window).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
         })?;
         for rule in results.matching_rules() {
-            // Collect every pattern hit with its real offset inside this
-            // window, rather than reporting the window start as the match
-            // offset (which was misleading) and rather than dropping repeat
-            // hits of the same rule.
+            // Gom mọi hit với offset thật; bỏ hit nằm trọn trong phần carry vì
+            // cửa sổ trước đã nhìn thấy và báo rồi (tránh báo trùng).
             let mut hits = Vec::new();
             let mut first_offset = window_offset;
             let mut have_first = false;
+            let mut skipped_old = false;
             for pattern in rule.patterns() {
                 for m in pattern.matches() {
-                    let off = window_offset + m.range().start as u64;
+                    let range = m.range();
+                    if range.end <= carried {
+                        skipped_old = true;
+                        continue;
+                    }
+                    let off = window_offset + range.start as u64;
                     if !have_first {
                         first_offset = off;
                         have_first = true;
@@ -147,9 +184,13 @@ pub fn scan_yara_from_reader_streaming<R: Read, F: FnMut(YaraMatch)>(
                     hits.push(YaraMatchHit {
                         pattern: pattern.identifier().to_string(),
                         offset: off,
-                        length: m.range().len(),
+                        length: range.len(),
                     });
                 }
+            }
+            // Rule chỉ khớp lại đúng dữ liệu cũ trong overlap: đã báo trước đó.
+            if hits.is_empty() && skipped_old {
+                continue;
             }
             on_match(YaraMatch {
                 rule: rule.identifier().to_string(),
@@ -160,13 +201,12 @@ pub fn scan_yara_from_reader_streaming<R: Read, F: FnMut(YaraMatch)>(
             count += 1;
         }
         carry.clear();
-        let overlap = window.len().min(YARA_OVERLAP_SIZE);
+        let overlap = window.len().min(overlap_size);
         carry.extend_from_slice(&window[window.len() - overlap..]);
         global_offset += read as u64;
     }
     Ok(count)
 }
-
 /// Stub used by lite builds (`--no-default-features`): YARA is not compiled in.
 #[cfg(not(feature = "yara"))]
 pub fn scan_yara_from_reader_streaming<R: Read, F: FnMut(YaraMatch)>(
@@ -3702,5 +3742,95 @@ mod tests {
         assert_eq!(seen, 0);
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Test hồi quy cho quét YARA theo cửa sổ (lỗi review 2026-11-09, ROADMAP 2.6.1).
+#[cfg(all(test, feature = "yara"))]
+mod yara_window_tests {
+    use super::*;
+
+    /// Reader giả lập pipe/stdin: mỗi lần `read` chỉ trả tối đa `max` byte.
+    struct Dribble<'a> {
+        data: &'a [u8],
+        pos: usize,
+        max: usize,
+    }
+
+    impl Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.max.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    const RULE: &str = r#"rule r { strings: $a = "NEEDLE" condition: $a }"#;
+
+    /// Chạy quét và trả về offset của mọi hit đã được báo.
+    fn hit_offsets<R: Read>(reader: R, chunk: usize, overlap: usize) -> Vec<u64> {
+        let mut out = Vec::new();
+        scan_yara_windowed(reader, RULE, chunk, overlap, |m| {
+            out.extend(m.matches.iter().map(|h| h.offset));
+        })
+        .unwrap();
+        out
+    }
+
+    fn data_with_needles(len: usize, at: &[usize]) -> Vec<u8> {
+        let mut data = vec![b'.'; len];
+        for &pos in at {
+            data[pos..pos + 6].copy_from_slice(b"NEEDLE");
+        }
+        data
+    }
+
+    #[test]
+    fn short_reads_do_not_duplicate_hits() {
+        // Trước khi sửa: reader trả 10 KB/lần làm hit bị báo 7 lần.
+        let data = data_with_needles(300_000, &[1000]);
+        let reader = Dribble {
+            data: &data,
+            pos: 0,
+            max: 10_000,
+        };
+        assert_eq!(hit_offsets(reader, 64 * 1024, 64 * 1024), vec![1000]);
+    }
+
+    #[test]
+    fn short_reads_match_full_reads() {
+        let data = data_with_needles(5000, &[10, 126, 700, 4990]);
+        let full = hit_offsets(std::io::Cursor::new(&data), 128, 16);
+        let short = hit_offsets(
+            Dribble {
+                data: &data,
+                pos: 0,
+                max: 7,
+            },
+            128,
+            16,
+        );
+        assert_eq!(full, short);
+        assert_eq!(full, vec![10, 126, 700, 4990]);
+    }
+
+    #[test]
+    fn hit_inside_overlap_is_reported_once() {
+        // Cửa sổ 100 byte, overlap 32: hit ở 90..96 nằm trọn trong phần carry
+        // của cửa sổ thứ hai; hit ở 98..104 vắt ngang ranh giới.
+        let data = data_with_needles(1000, &[90, 98, 500]);
+        let hits = hit_offsets(std::io::Cursor::new(&data), 100, 32);
+        assert_eq!(hits, vec![90, 98, 500]);
+    }
+
+    #[test]
+    fn every_needle_found_exactly_once_across_windows() {
+        let positions: Vec<usize> = (0..10).map(|i| 126 + i * 200).collect();
+        let data = data_with_needles(2200, &positions);
+        let mut hits = hit_offsets(std::io::Cursor::new(&data), 128, 16);
+        hits.sort_unstable();
+        let expected: Vec<u64> = positions.iter().map(|&p| p as u64).collect();
+        assert_eq!(hits, expected);
     }
 }
