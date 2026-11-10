@@ -274,9 +274,9 @@ fn get_string_array(
                 .ok_or_else(|| format!("config option '{key}' must be a list of strings"))?;
             let mut out = Vec::with_capacity(array.len());
             for item in array {
-                let text = item.as_str().ok_or_else(|| {
-                    format!("config option '{key}' must be a list of strings")
-                })?;
+                let text = item
+                    .as_str()
+                    .ok_or_else(|| format!("config option '{key}' must be a list of strings"))?;
                 out.push(text.to_string());
             }
             Ok(Some(out))

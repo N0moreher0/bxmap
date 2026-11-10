@@ -437,11 +437,17 @@ fn looks_like_date_or_time(value: &str) -> bool {
     let b = value.as_bytes();
     let digits = |range: std::ops::Range<usize>| range.all(|i| b[i].is_ascii_digit());
     // HH:MM:SS
-    if b.len() >= 8 && digits(0..2) && b[2] == b':' && digits(3..5) && b[5] == b':' && digits(6..8) {
+    if b.len() >= 8 && digits(0..2) && b[2] == b':' && digits(3..5) && b[5] == b':' && digits(6..8)
+    {
         return true;
     }
     // YYYY-MM-DD
-    if b.len() >= 10 && digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10)
+    if b.len() >= 10
+        && digits(0..4)
+        && b[4] == b'-'
+        && digits(5..7)
+        && b[7] == b'-'
+        && digits(8..10)
     {
         return true;
     }
