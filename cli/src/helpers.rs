@@ -622,6 +622,8 @@ ESSENTIAL OPTIONS:
     --max-strings <N>    Maximum results (default 200000; 0 = unlimited)
     --threads <N>        Parallel worker count
     --auto-tune          Choose a safe worker count for this machine
+    --max-memory <BYTES> Cap the scanner's own RAM (0 = unlimited); fewer
+                           workers are used when the cap requires it
     --report <mode>      none|summary|user|all (top artifacts, per-user lists)
     --stats              Per-encoding counts and timing on stderr
 
@@ -711,6 +713,11 @@ OPTIONS:
                           Repeat-noise threshold; 0 disables filtering
     --threads <N>        Parallel worker count
     --auto-tune          Choose a safe worker count for this machine
+    --max-memory <BYTES>
+                           Cap the RAM the scanner may use for its own buffers
+                           (0 = unlimited, the default). When the cap does not
+                           fit the requested worker count, fewer workers are
+                           used and the change is reported on stderr.
     --entropy            Scan and export high-entropy regions
     --entropy-window <N> Bytes per entropy window (default 65536)
     --entropy-threshold <F>
@@ -1197,18 +1204,64 @@ pub fn is_crypto_address(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l'))
 }
 
+/// Clamp the worker count so the scanner's own buffers stay inside a memory
+/// budget.
+///
+/// The budget covers the read buffers (one region per worker), not the
+/// extracted results -- those are streamed out -- and not the OS page cache.
+/// Returns the worker count to use, or an error when even a single worker
+/// does not fit.
+pub fn apply_memory_budget(threads: usize, max_memory: u64) -> Result<usize, String> {
+    if max_memory == 0 {
+        return Ok(threads);
+    }
+    let minimum = bxmap::scan_working_set_bytes(1);
+    if minimum > max_memory {
+        return Err(format!(
+            "--max-memory {max_memory} bytes is too small: one worker needs about {minimum} bytes"
+        ));
+    }
+    let mut allowed = threads.max(1);
+    while allowed > 1 && bxmap::scan_working_set_bytes(allowed) > max_memory {
+        allowed -= 1;
+    }
+    if allowed < threads {
+        eprintln!(
+            "  [!] --max-memory limited the scan to {allowed} thread(s) (requested {threads})"
+        );
+    }
+    Ok(allowed)
+}
+
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::{
-        contains_crypto_address, contains_jwt_shape, contains_meaningful_base64,
-        detected_domain_value, detected_ip_value, detected_url_value, hex_encode, important_reason,
-        is_email_address, matches_filter, parse_pid_marker, refang_ioc_text, scan_magic_bytes,
-        xor_printable_score, ExtractedString,
+        apply_memory_budget, contains_crypto_address, contains_jwt_shape,
+        contains_meaningful_base64, detected_domain_value, detected_ip_value, detected_url_value,
+        hex_encode, important_reason, is_email_address, matches_filter, parse_pid_marker,
+        refang_ioc_text, scan_magic_bytes, xor_printable_score, ExtractedString,
     };
     use regex::Regex;
+
+    #[test]
+    fn memory_budget_keeps_the_worker_count_or_reduces_it() {
+        // 0 means "no budget": nothing changes.
+        assert_eq!(apply_memory_budget(8, 0).unwrap(), 8);
+
+        let one = bxmap::scan_working_set_bytes(1);
+        let two = bxmap::scan_working_set_bytes(2);
+
+        // A budget that fits the requested workers leaves them alone.
+        assert_eq!(apply_memory_budget(2, two).unwrap(), 2);
+        // A budget that only fits one worker reduces the count.
+        assert_eq!(apply_memory_budget(4, one + 1024).unwrap(), 1);
+        // A budget that cannot even fit one worker is an error, not a panic.
+        let err = apply_memory_budget(4, 1024).unwrap_err();
+        assert!(err.contains("--max-memory"), "{err}");
+    }
 
     #[test]
     fn highlights_ipv4_and_ipv6() {

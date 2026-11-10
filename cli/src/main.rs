@@ -216,6 +216,8 @@ fn run() -> Result<(), String> {
     } else {
         args.threads
     };
+    // A memory budget may force fewer workers than requested.
+    let threads = apply_memory_budget(threads, args.max_memory)?;
     let noise = args
         .noise_threshold
         .map(NoiseConfig::from_threshold)

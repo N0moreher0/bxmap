@@ -26,6 +26,8 @@ pub struct Args {
     pub noise_threshold: Option<usize>,
     pub threads: usize,
     pub auto_tune: bool,
+    /// Upper bound in bytes for the scanner's own buffers (0 = unlimited).
+    pub max_memory: u64,
     pub entropy: bool,
     pub entropy_no_data: bool,
     pub entropy_window: Option<usize>,
@@ -245,6 +247,7 @@ pub fn completions_for(shell: &str) -> String {
         "--noise-threshold",
         "--threads",
         "--auto-tune",
+        "--max-memory",
         "--format",
         "--compact",
         "--dedupe",
@@ -385,6 +388,7 @@ fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
         noise_threshold: None,
         threads: 1,
         auto_tune: false,
+        max_memory: 0,
         entropy: false,
         entropy_no_data: false,
         entropy_window: None,
@@ -529,6 +533,9 @@ fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
                 }
             }
             "--auto-tune" => args.auto_tune = true,
+            "--max-memory" => {
+                args.max_memory = parse_offset(&next(&mut i)?, "--max-memory")?;
+            }
             "--entropy" => {
                 explicit.entropy = true;
                 args.entropy = true;

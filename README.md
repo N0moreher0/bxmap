@@ -335,6 +335,9 @@ The CLI adds:
 - `--min-len` and `--max-strings`
 - `--noise-threshold`
 - `--threads` and `--auto-tune`
+- `--max-memory <bytes>` to cap the RAM the scanner may use for its own
+  buffers (0 = unlimited). When the cap does not fit the requested worker
+  count, fewer workers are used and the change is reported on `stderr`.
 - the input path, file size and effective output format are echoed to `stderr`
   before scanning; `--report summary` also prints the encoding scope.
 - input auto-detection: an `MDMP` magic enables `--tree` + `--map-va` and a

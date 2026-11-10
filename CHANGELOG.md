@@ -6,11 +6,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `--max-memory <bytes>` caps the RAM the scanner may use for its own buffers
+  (0 = unlimited, the default). When the cap does not fit the requested worker
+  count, fewer workers are used and the change is reported on stderr; a cap
+  that cannot fit a single worker is a clear error. The library exposes
+  `scan_working_set_bytes`, `PARALLEL_REGION_SIZE` and `SEQUENTIAL_BUFFER_SIZE`
+  so callers can size the budget themselves.
+- `BTC_SEGWIT` classification: bech32/bech32m addresses are recognised and
+  validated with the Bech32 checksum.
 - `CREDIT_CARD` classification (new `FINANCE` group): a number is only
   reported as a card when its length, issuer prefix and Luhn checksum all
   match.
-- `BTC_SEGWIT` classification: bech32/bech32m addresses are recognised and
-  validated with the Bech32 checksum.
 - `validate_credit_card` is exported from the library root.
 - CI `fuzz` job runs every `cargo-fuzz` target for 30 s on each push/PR, as a
   panic/OOM gate for the parsers.

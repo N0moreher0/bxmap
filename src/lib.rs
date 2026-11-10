@@ -306,9 +306,12 @@ impl NoiseConfig {
     }
 }
 
-// File chunk size per read -- large enough for efficient I/O,
-// small enough to not accumulate too much RAM for the buffer.
-const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+/// Size of the buffer the sequential scanner reads into (32 MiB).
+///
+/// File chunk size per read -- large enough for efficient I/O, small enough to
+/// not accumulate too much RAM for the buffer.
+pub const SEQUENTIAL_BUFFER_SIZE: usize = 32 * 1024 * 1024;
+const CHUNK_SIZE: usize = SEQUENTIAL_BUFFER_SIZE;
 // Keeps ordinary YARA literals and bounded regexes visible across chunk
 // boundaries without turning the streaming scan into a whole-file read.
 #[cfg(feature = "yara")]
@@ -2625,10 +2628,29 @@ pub fn extract_strings_from_file_with_encodings(
 // lost at the boundary. Results are concatenated and re-sorted by offset
 // (each region's own results are already offset-sorted, but merge order
 // across regions/threads isn't guaranteed).
+/// Size of the region one parallel worker reads (16 MiB).
+///
+/// Public so callers can reason about the memory a scan will use before
+/// starting it; see [`scan_working_set_bytes`].
+pub const PARALLEL_REGION_SIZE: u64 = 16 * 1024 * 1024;
 #[cfg(not(test))]
-const PARALLEL_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16MB per region
+const PARALLEL_CHUNK_SIZE: u64 = PARALLEL_REGION_SIZE;
 #[cfg(test)]
 const PARALLEL_CHUNK_SIZE: u64 = 4 * 1024; // small regions so boundary tests stay fast
+
+/// Approximate RAM the scanner needs for its own buffers when `threads`
+/// workers are used, in bytes.
+///
+/// This counts the read buffers (and the small overlap each worker keeps) but
+/// not the extracted results, which are streamed out, nor the OS page cache.
+/// It is what a `--max-memory` budget has to be compared against.
+pub fn scan_working_set_bytes(threads: usize) -> u64 {
+    if threads > 1 {
+        threads as u64 * (PARALLEL_REGION_SIZE + MAX_RUN_CHARS as u64)
+    } else {
+        SEQUENTIAL_BUFFER_SIZE as u64 + MAX_RUN_CHARS as u64
+    }
+}
 
 /// Scan one `PARALLEL_CHUNK_SIZE` region of `dump_path` and return the
 /// strings that *start* inside it, in ascending offset order.
