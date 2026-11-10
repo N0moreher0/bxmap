@@ -326,8 +326,15 @@ pub fn completions_for(shell: &str) -> String {
 }
 
 pub fn parse_args() -> Result<Args, String> {
-    let mut values = std::env::args().skip(1).collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|v| v == "-h" || v == "--help") {
+    let values = std::env::args().skip(1).collect::<Vec<_>>();
+    if values.is_empty()
+        || values.iter().any(|v| {
+            matches!(
+                v.as_str(),
+                "-h" | "--help" | "--help-advanced" | "--help-all"
+            )
+        })
+    {
         let advanced = values
             .iter()
             .any(|v| v == "--help-advanced" || v == "--help-all");
@@ -350,9 +357,15 @@ pub fn parse_args() -> Result<Args, String> {
         print!("{}", completions_for(&shell));
         std::process::exit(0);
     }
-    let path = values.remove(0);
+    parse_args_from(values)
+}
+
+/// Parse the argument list (without the program name). The dump path may
+/// appear anywhere: `bxmap dump.bin --carve jpeg` and
+/// `bxmap --carve jpeg dump.bin` are equivalent.
+fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
     let mut args = Args {
-        path,
+        path: String::new(),
         start: None,
         end: None,
         min_len: MIN_STRING_LEN,
@@ -639,6 +652,17 @@ pub fn parse_args() -> Result<Args, String> {
             "--detect-rules" => {
                 args.custom_rules = Some(next(&mut i)?);
             }
+            other if !other.starts_with('-') => {
+                // A bare token is the dump path, wherever it sits on the
+                // command line. Only one path is accepted.
+                if !args.path.is_empty() {
+                    return Err(format!(
+                        "unexpected extra argument '{other}' (one dump path only; \
+                         quote paths that contain spaces)"
+                    ));
+                }
+                args.path = other.to_string();
+            }
             other => return Err(format!("unknown option '{other}'")),
         }
 
@@ -649,6 +673,9 @@ pub fn parse_args() -> Result<Args, String> {
             Ok(())
         }
         i += 1;
+    }
+    if args.path.is_empty() {
+        return Err("missing dump path\n\nRun `bxmap --help` for usage.".to_string());
     }
     // Presets only fill flags the user did not spell out, so the order on the
     // command line never matters: `--mode triage --encoding ascii` and
@@ -802,5 +829,52 @@ pub fn apply_input_autodetect(args: &mut Args) {
             "  [i] MDMP minidump detected: enabled {} (disable with --no-tree/--no-map-va)",
             enabled.join(" + ")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        parse_args_from(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn dump_path_may_come_before_or_after_flags() {
+        let before = parse(&["dump.bin", "--min-len", "6", "--carve", "jpeg"]).unwrap();
+        let after = parse(&["--min-len", "6", "--carve", "jpeg", "dump.bin"]).unwrap();
+        for args in [before, after] {
+            assert_eq!(args.path, "dump.bin");
+            assert_eq!(args.min_len, 6);
+            assert_eq!(args.carve.as_deref(), Some("jpeg"));
+        }
+    }
+
+    #[test]
+    fn a_second_bare_token_is_rejected_as_extra_argument() {
+        let err = parse(&["dump.bin", "other.bin"])
+            .err()
+            .expect("expected an error");
+        assert!(
+            err.contains("unexpected extra argument 'other.bin'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn missing_dump_path_has_a_clear_error() {
+        let err = parse(&["--min-len", "6"]).err().expect("expected an error");
+        assert!(err.contains("missing dump path"), "{err}");
+    }
+
+    #[test]
+    fn flag_values_are_not_mistaken_for_the_dump_path() {
+        // `--start` takes a numeric value; the path that follows must still
+        // be recognised as the dump path.
+        let args = parse(&["--start", "0x10", "--end", "0x40", "dump.bin"]).unwrap();
+        assert_eq!(args.path, "dump.bin");
+        assert_eq!(args.start, Some(0x10));
+        assert_eq!(args.end, Some(0x40));
     }
 }

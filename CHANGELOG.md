@@ -19,6 +19,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   plus encoding filters and `max_strings` truncation parity.
 
 ### Fixed
+- `bxmap --carve jpeg dump.bin` no longer fails with `unknown option 'jpeg'`:
+  the dump path may now appear anywhere on the command line, a second bare
+  token is reported as an extra argument, and a missing path says so instead
+  of parsing the first flag as the file name. `--help-advanced` / `--help-all`
+  now print the advanced help instead of being treated as a path.
 - `--carve 7z` now verifies `StartHeaderCRC` over the start header before
   trusting the declared sizes, so random data with the 7-Zip signature is
   rejected instead of reported as a complete archive.
