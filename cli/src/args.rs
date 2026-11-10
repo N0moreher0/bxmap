@@ -420,10 +420,13 @@ pub fn parse_args() -> Result<Args, String> {
 
     // Optional configuration file. It fills in the options the command line
     // did not spell out and wins over the `--mode` / `--with` presets.
-    let config_path = args.config.clone().or_else(|| {
-        let candidate = std::path::PathBuf::from(crate::config::DEFAULT_CONFIG_FILE);
-        candidate.is_file().then_some(candidate)
-    });
+    let config_path: Option<std::path::PathBuf> = match args.config.clone() {
+        Some(path) => Some(std::path::PathBuf::from(path)),
+        None => {
+            let candidate = std::path::PathBuf::from(crate::config::DEFAULT_CONFIG_FILE);
+            candidate.is_file().then_some(candidate)
+        }
+    };
     if let Some(path) = config_path {
         let config = crate::config::load_config(&path)?;
         eprintln!("  [i] using config {}", path.display());
