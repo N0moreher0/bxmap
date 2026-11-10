@@ -28,6 +28,8 @@ pub struct Args {
     pub auto_tune: bool,
     /// Upper bound in bytes for the scanner's own buffers (0 = unlimited).
     pub max_memory: u64,
+    /// Optional configuration file (`--config`).
+    pub config: Option<String>,
     pub entropy: bool,
     pub entropy_no_data: bool,
     pub entropy_window: Option<usize>,
@@ -152,6 +154,59 @@ pub fn parse_encoding_spec(spec: &str) -> Result<Encoding, String> {
     })
 }
 
+/// Parse a `--format` value.
+pub fn parse_format(spec: &str) -> Result<Format, String> {
+    Ok(match spec {
+        "text" => Format::Text,
+        "json" => Format::Json,
+        "json-tree" => Format::JsonTree,
+        "ndjson" => Format::Ndjson,
+        "csv" => Format::Csv,
+        "html" => Format::Html,
+        "markdown" | "md" => Format::Markdown,
+        other => return Err(format!("invalid format '{other}'")),
+    })
+}
+
+/// Parse a `--report` value.
+///
+/// `flag` names the option in the error message, so the command line and the
+/// configuration file can be told apart.
+pub fn parse_report_mode(spec: &str, flag: &str) -> Result<ReportMode, String> {
+    Ok(match spec {
+        "none" => ReportMode::None,
+        "summary" => ReportMode::Summary,
+        "user" => ReportMode::User,
+        "all" => ReportMode::All,
+        other => {
+            return Err(format!(
+                "invalid {flag} mode '{other}' (expected none, summary, user or all)"
+            ))
+        }
+    })
+}
+
+/// Parse a `--detect-format` value.
+pub fn parse_detect_format(spec: &str) -> Result<DetectFormat, String> {
+    Ok(match spec {
+        "flat" => DetectFormat::Flat,
+        "rich" => DetectFormat::Rich,
+        other => return Err(format!("invalid detect format '{other}'")),
+    })
+}
+
+/// Parse one detector name.
+pub fn parse_detector(spec: &str) -> Result<Detector, String> {
+    Ok(match spec {
+        "ip" => Detector::Ip,
+        "url" => Detector::Url,
+        "domain" => Detector::Domain,
+        "b64" | "base64" => Detector::Base64,
+        "secret" | "all" => Detector::Secret,
+        other => return Err(format!("unknown detector '{other}'")),
+    })
+}
+
 pub fn encoding_mask(encoding: Encoding) -> u8 {
     match encoding {
         Encoding::All => ENC_ALL_BITS,
@@ -248,6 +303,7 @@ pub fn completions_for(shell: &str) -> String {
         "--threads",
         "--auto-tune",
         "--max-memory",
+        "--config",
         "--format",
         "--compact",
         "--dedupe",
@@ -360,13 +416,41 @@ pub fn parse_args() -> Result<Args, String> {
         print!("{}", completions_for(&shell));
         std::process::exit(0);
     }
-    parse_args_from(values)
+    let (mut args, mut explicit) = parse_args_from(values)?;
+
+    // Optional configuration file. It fills in the options the command line
+    // did not spell out and wins over the `--mode` / `--with` presets.
+    let config_path = args.config.clone().or_else(|| {
+        let candidate = std::path::PathBuf::from(crate::config::DEFAULT_CONFIG_FILE);
+        candidate.is_file().then_some(candidate)
+    });
+    if let Some(path) = config_path {
+        let config = crate::config::load_config(&path)?;
+        eprintln!("  [i] using config {}", path.display());
+        crate::config::apply_config(&mut args, &mut explicit, &config)?;
+        // The config may have set a sub-flag whose parent it implies
+        // (`carve-out` -> carving, `report user` -> path artifacts, ...).
+        apply_implications(&mut args);
+        if config.format.is_none() && !explicit.format {
+            if let Some(inferred) = args
+                .output
+                .as_deref()
+                .and_then(infer_format_from_output_path)
+            {
+                args.format = inferred;
+            }
+        }
+    }
+    Ok(args)
 }
 
 /// Parse the argument list (without the program name). The dump path may
 /// appear anywhere: `bxmap dump.bin --carve jpeg` and
 /// `bxmap --carve jpeg dump.bin` are equivalent.
-fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
+///
+/// Returns the parsed arguments together with the flags the user spelled out,
+/// so the configuration file can fill in the rest without overriding them.
+pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), String> {
     let mut args = Args {
         path: String::new(),
         start: None,
@@ -389,6 +473,7 @@ fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
         threads: 1,
         auto_tune: false,
         max_memory: 0,
+        config: None,
         entropy: false,
         entropy_no_data: false,
         entropy_window: None,
@@ -470,17 +555,7 @@ fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
             "--report" => {
                 explicit.report = true;
                 let value = next(&mut i)?;
-                args.report_mode = match value.as_str() {
-                    "none" => ReportMode::None,
-                    "summary" => ReportMode::Summary,
-                    "user" => ReportMode::User,
-                    "all" => ReportMode::All,
-                    other => {
-                        return Err(format!(
-                            "invalid --report mode '{other}' (expected none, summary, user or all)"
-                        ))
-                    }
-                };
+                args.report_mode = parse_report_mode(&value, "--report")?;
             }
             "--min-files-in-user" => {
                 args.min_files_in_user = next(&mut i)?
@@ -501,16 +576,8 @@ fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
             }
             "--format" => {
                 format_explicit = true;
-                args.format = match next(&mut i)?.as_str() {
-                    "text" => Format::Text,
-                    "json" => Format::Json,
-                    "json-tree" => Format::JsonTree,
-                    "ndjson" => Format::Ndjson,
-                    "csv" => Format::Csv,
-                    "html" => Format::Html,
-                    "markdown" | "md" => Format::Markdown,
-                    other => return Err(format!("invalid format '{other}'")),
-                };
+                explicit.format = true;
+                args.format = parse_format(&next(&mut i)?)?;
             }
             "--encoding" => {
                 explicit.encoding = true;
@@ -535,6 +602,9 @@ fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
             "--auto-tune" => args.auto_tune = true,
             "--max-memory" => {
                 args.max_memory = parse_offset(&next(&mut i)?, "--max-memory")?;
+            }
+            "--config" => {
+                args.config = Some(next(&mut i)?);
             }
             "--entropy" => {
                 explicit.entropy = true;
@@ -635,23 +705,12 @@ fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
                     "secret".to_string()
                 };
                 for part in value.split(',') {
-                    let d = match part.trim() {
-                        "ip" => Detector::Ip,
-                        "url" => Detector::Url,
-                        "domain" => Detector::Domain,
-                        "b64" | "base64" => Detector::Base64,
-                        "secret" | "all" => Detector::Secret,
-                        other => return Err(format!("unknown detector '{other}'")),
-                    };
+                    let d = parse_detector(part.trim())?;
                     push_detector(&mut args.detectors, d)?;
                 }
             }
             "--detect-format" => {
-                args.detect_format = match next(&mut i)?.as_str() {
-                    "flat" => DetectFormat::Flat,
-                    "rich" => DetectFormat::Rich,
-                    other => return Err(format!("invalid detect format '{other}'")),
-                };
+                args.detect_format = parse_detect_format(&next(&mut i)?)?;
             }
             "--detect-strict" => {
                 args.detect_strict = true;
@@ -721,7 +780,7 @@ fn parse_args_from(values: Vec<String>) -> Result<Args, String> {
             ));
         }
     }
-    Ok(args)
+    Ok((args, explicit))
 }
 
 pub fn validate(args: &Args, filter_regex: Option<&Regex>) -> Result<(), String> {
@@ -845,6 +904,7 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         parse_args_from(args.iter().map(|s| s.to_string()).collect())
+            .map(|(args, _)| args)
     }
 
     #[test]

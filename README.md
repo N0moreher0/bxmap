@@ -338,6 +338,9 @@ The CLI adds:
 - `--max-memory <bytes>` to cap the RAM the scanner may use for its own
   buffers (0 = unlimited). When the cap does not fit the requested worker
   count, fewer workers are used and the change is reported on `stderr`.
+- `--config <FILE>` (or a `bxmap.toml` in the working directory) holds the
+  options that repeat for every dump in a case. Precedence: command line
+  flags > config file > `--mode`/`--with` presets > defaults.
 - the input path, file size and effective output format are echoed to `stderr`
   before scanning; `--report summary` also prints the encoding scope.
 - input auto-detection: an `MDMP` magic enables `--tree` + `--map-va` and a

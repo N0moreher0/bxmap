@@ -34,6 +34,8 @@ use yara::scan_yara_rules;
 mod custom_rules;
 use custom_rules::{load_custom_rules, match_custom_rules, CompiledCustomRule};
 
+mod config;
+
 use bxmap::{
     artifacts::{Artifact, ArtifactCollector, ArtifactKind, ArtifactKinds},
     carve::{reassemble_fragments, CarveKind, CarveOptions, CarveReport, Carver, ReassemblyReport},

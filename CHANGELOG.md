@@ -6,6 +6,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `--config <FILE>` (or a `bxmap.toml` in the working directory) holds the
+  options that repeat for every dump in a case. Precedence: command line
+  flags > config file > `--mode`/`--with` presets > defaults. The file is
+  TOML and mirrors the flag names (`min-len`, `encoding`, `detectors`,
+  `format`, `output`, `report`, `carve`, ...); a value of the wrong type is
+  reported with the option name.
 - A synthetic regression corpus (`tests/common/corpus.rs`): a small, fully
   generated dump with a fixed layout -- ASCII, UTF-16LE/BE, UTF-8, IOC
   tokens, a Windows path, an UTF-16LE environment block, a cloud key and a
@@ -50,6 +56,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rejects a signature that is not base64url.
 
 ### Fixed
+- Generic `password=`/`token=` matches that are really something else are
+  filtered out: e-mail addresses, URLs, dates and timestamps (`2024-01-15`,
+  `10:30:00`, ISO-8601) and long runs of digits (ids, counters, phone
+  numbers).
 - UTF-8 strings containing CJK characters are no longer cut at the first
   multi-byte character. The UTF-8 and Shift-JIS branches both advanced the
   shared scan index, so the Shift-JIS branch consumed a byte of the UTF-8

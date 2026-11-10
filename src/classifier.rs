@@ -428,6 +428,26 @@ fn is_public_client_key_context(text: &str, start: usize, end: usize) -> bool {
         .any(|domain| lower.contains(domain))
 }
 
+/// True for values shaped like a date or a time.
+///
+/// `2024-01-15`, `10:30:00` and `2024-01-15T10:30:00Z` show up in
+/// configuration files and log lines often enough to be worth filtering out
+/// of the generic-secret results.
+fn looks_like_date_or_time(value: &str) -> bool {
+    let b = value.as_bytes();
+    let digits = |range: std::ops::Range<usize>| range.all(|i| b[i].is_ascii_digit());
+    // HH:MM:SS
+    if b.len() >= 8 && digits(0..2) && b[2] == b':' && digits(3..5) && b[5] == b':' && digits(6..8) {
+        return true;
+    }
+    // YYYY-MM-DD
+    if b.len() >= 10 && digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10)
+    {
+        return true;
+    }
+    false
+}
+
 /// Decide whether the value after a generic `password=`/`token:` prefix looks
 /// like a credential instead of an identifier, keyword or JavaScript snippet.
 fn generic_secret_plausible(full_match: &str) -> bool {
@@ -481,6 +501,18 @@ fn generic_secret_plausible(full_match: &str) -> bool {
             }
         })
     {
+        return false;
+    }
+    // An email address or a URL is an identifier, not a credential value.
+    if value.contains('@') || value.contains("://") {
+        return false;
+    }
+    // A date or a timestamp: `2024-01-15`, `10:30:00`, `2024-01-15T10:30:00Z`.
+    if looks_like_date_or_time(value) {
+        return false;
+    }
+    // A long run of digits is an id, a counter or a phone number.
+    if value.len() >= 12 && value.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
     // JavaScript / code fragments.
@@ -1960,6 +1992,13 @@ mod tests {
             "Token=b77a5c561934e089",
             "Token=b77a5c561934e08",
             "API_KEY: \"7e40f68c-7938-4c5d-9f95-e61647c213eb\",",
+            // Dates, timestamps, ids and addresses are not credentials.
+            "Password=2024-01-15T10:30:00Z",
+            "password=2024-01-15",
+            "token=10:30:00.123",
+            "secret=123456789012345678",
+            "secret=user@example.com",
+            "password=https://example.com/login",
         ] {
             let found = detect_secrets(text);
             assert!(

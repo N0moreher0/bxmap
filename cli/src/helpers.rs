@@ -336,6 +336,7 @@ pub struct ExplicitFlags {
     pub dedupe: bool,
     pub extract: bool,
     pub report: bool,
+    pub format: bool,
 
     pub detectors: bool,
     pub entropy: bool,
@@ -624,6 +625,7 @@ ESSENTIAL OPTIONS:
     --auto-tune          Choose a safe worker count for this machine
     --max-memory <BYTES> Cap the scanner's own RAM (0 = unlimited); fewer
                            workers are used when the cap requires it
+    --config <FILE>     Read defaults from a TOML file (default: ./bxmap.toml)
     --report <mode>      none|summary|user|all (top artifacts, per-user lists)
     --stats              Per-encoding counts and timing on stderr
 
@@ -718,6 +720,11 @@ OPTIONS:
                            (0 = unlimited, the default). When the cap does not
                            fit the requested worker count, fewer workers are
                            used and the change is reported on stderr.
+    --config <FILE>
+                           Read defaults from a TOML file. Without the flag
+                           bxmap.toml in the current directory is used when it
+                           exists. Command line flags always win over the file,
+                           and the file wins over --mode/--with presets.
     --entropy            Scan and export high-entropy regions
     --entropy-window <N> Bytes per entropy window (default 65536)
     --entropy-threshold <F>

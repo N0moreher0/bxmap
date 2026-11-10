@@ -309,6 +309,7 @@ Ready-to-copy `bxmap-cli` commands grouped by triage target. Replace `<dump.raw>
 | `--mode quick\|triage\|deep` | Preset: quick = defaults; triage = quick + detections; deep = triage + all encodings + entropy + carving. |
 | `--max-strings N` | Result cap (default 200,000; `0` = unlimited). |
 | `--max-memory BYTES` | Cap the scanner's own RAM (0 = unlimited); fewer workers are used when the cap requires it. |
+| `--config FILE` | Read defaults from a TOML file (default: `./bxmap.toml` when it exists). Command line flags win over the file, the file wins over `--mode`/`--with`. |
 | `--detect all` | Scan ip, url, domain, base64, secret. |
 | `--signature all` | Scan magic bytes + private-key candidates. |
 | `--entropy` | Find encrypted/packed regions. |
