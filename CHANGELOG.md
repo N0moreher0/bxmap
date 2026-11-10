@@ -29,6 +29,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   them: a Bitcoin address with a broken Base58Check/Bech32 checksum, or a digit
   run that is not a real card number, is no longer reported under that type.
   Checksum failures do not delete evidence, they only change the label.
+- The non-secret rule set used by `classify()` gets the same anchor prefilter
+  the secret patterns already had: one Aho-Corasick pass decides which rules
+  can possibly match, so a plain string no longer runs 20+ regexes. The
+  outcome is unchanged (regression test compares against running every rule).
 - `validate_jwt` now requires the `alg` header (mandatory in RFC 7519) instead
   of `typ` (optional), accepts an empty signature only for `alg: none`, and
   rejects a signature that is not base64url.

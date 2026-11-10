@@ -803,6 +803,125 @@ pub fn entropy_of(text: &str) -> f64 {
         .sum()
 }
 
+/// Literal anchors for the `RULES` table: every match of the named rule MUST
+/// contain at least one of these substrings (compared ASCII case-insensitively,
+/// which only ever over-selects). A single Aho-Corasick pass over the text then
+/// tells us which rules can possibly match, instead of running all of them on
+/// every extracted string. A rule with no anchor entry is simply always run, so
+/// forgetting an entry costs speed, never correctness.
+const RULE_ANCHORS: &[(&str, &[&str])] = &[
+    ("AWS_KEY", &["AKIA"]),
+    ("AWS_SECRET", &["aws", "secret"]),
+    ("GITHUB_TOKEN", &["gh"]),
+    ("JWT", &["eyJ"]),
+    ("PRIVATE_KEY", &["-----BEGIN"]),
+    ("AZURE_KEY", &["azure"]),
+    ("GCP_KEY", &["AIza"]),
+    // The generic rule matches `password|passwd|secret|token|apikey|api_key`
+    // followed by `=` or `:`; these four literals cover all six alternatives.
+    ("GENERIC_SECRET", &["pass", "secret", "token", "api"]),
+    ("URL", &["://"]),
+    ("IPV4", &["."]),
+    ("DOMAIN", &["."]),
+    ("EMAIL", &["@"]),
+    ("ETH_ADDR", &["0x"]),
+    ("BTC_SEGWIT", &["bc1"]),
+    ("SUSPICIOUS_PATH", &["\\temp", "\\appdata", "\\startup", "\\public"]),
+    ("MUTEX", &["global"]),
+    ("C2", &["c2", "gate.php", "/panel/", "/admin/"]),
+];
+
+/// Minimum byte length of any possible match, per rule (derived from the
+/// regex). Lets us skip rules that cannot match a short string.
+const RULE_MIN_LEN: &[(&str, usize)] = &[
+    ("BTC_ADDR", 26),      // '1'/'3' + 25..34 base58 characters
+    ("XMR_ADDR", 95),      // '4' + 1 + 93 base58 characters
+    ("CREDIT_CARD", 13),   // 13 digits
+    ("BASE64", 16),        // 4 groups of 4
+];
+
+/// Prefilter for the `RULES` table, same idea as [`SecretPrefilter`] but for
+/// the second (non-secret) rule set.
+struct RulePrefilter {
+    ac: AhoCorasick,
+    /// Aho-Corasick pattern id -> bitmask of `RULES` indices it enables.
+    anchor_masks: Vec<u64>,
+    /// Rules without anchors: candidates for every string.
+    always: u64,
+    /// Every rule (used for non-ASCII text, see `rule_candidates`).
+    all: u64,
+    /// (rule index, min byte length) gates.
+    gates: Vec<(usize, usize)>,
+}
+
+fn rule_prefilter() -> &'static RulePrefilter {
+    static PREFILTER: OnceLock<RulePrefilter> = OnceLock::new();
+    PREFILTER.get_or_init(|| {
+        let count = RULES.len();
+        assert!(count <= 64, "rule prefilter uses a u64 bitmask");
+        let all = if count == 64 {
+            u64::MAX
+        } else {
+            (1u64 << count) - 1
+        };
+        let mut anchors: Vec<&str> = Vec::new();
+        let mut anchor_masks: Vec<u64> = Vec::new();
+        let mut anchored = 0u64;
+        let mut gates = Vec::new();
+        for (idx, rule) in RULES.iter().enumerate() {
+            if let Some((_, lits)) = RULE_ANCHORS.iter().find(|(n, _)| n == &rule.typ) {
+                for lit in lits.iter() {
+                    match anchors.iter().position(|a| a.eq_ignore_ascii_case(lit)) {
+                        Some(pos) => anchor_masks[pos] |= 1u64 << idx,
+                        None => {
+                            anchors.push(lit);
+                            anchor_masks.push(1u64 << idx);
+                        }
+                    }
+                }
+                anchored |= 1u64 << idx;
+            }
+            if let Some((_, min)) = RULE_MIN_LEN.iter().find(|(n, _)| n == &rule.typ) {
+                gates.push((idx, *min));
+            }
+        }
+        let ac = AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(&anchors)
+            .expect("rule anchors form a valid automaton");
+        RulePrefilter {
+            ac,
+            anchor_masks,
+            always: all & !anchored,
+            all,
+            gates,
+        }
+    })
+}
+
+/// Bitmask over `RULES` of the rules that can possibly match `text`.
+fn rule_candidates(text: &str) -> u64 {
+    let pf = rule_prefilter();
+    // `(?i)` in the regexes is Unicode-aware (e.g. U+017F folds to 's') while
+    // the automaton only folds ASCII, so for non-ASCII text we keep every rule
+    // as a candidate.
+    let mut mask = if text.is_ascii() {
+        let mut mask = pf.always;
+        for m in pf.ac.find_overlapping_iter(text) {
+            mask |= pf.anchor_masks[m.pattern().as_usize()];
+        }
+        mask
+    } else {
+        pf.all
+    };
+    for &(idx, min) in &pf.gates {
+        if text.len() < min {
+            mask &= !(1u64 << idx);
+        }
+    }
+    mask
+}
+
 /// Rules whose validation is a checksum or issuer check.
 ///
 /// When such a check fails the value is definitely not of that type, so
@@ -819,10 +938,47 @@ fn checksum_ok(rule: &str, value: &str) -> bool {
     validate_finding(rule, value) != ValidationResult::Invalid
 }
 
+/// Run the non-secret rule set over `text` and return `(group, type)` of the
+/// first rule that matches.
+///
+/// With `prefilter` enabled, rules whose literal anchors are absent from the
+/// text (or whose minimum match length exceeds it) are skipped. The prefilter
+/// only ever removes rules that cannot match, so the outcome is identical to
+/// running every rule.
+fn classify_rules(text: &str, prefilter: bool) -> Option<(&'static str, &'static str)> {
+    let e = entropy_of(text);
+    let candidates = if prefilter {
+        rule_candidates(text)
+    } else {
+        u64::MAX
+    };
+    for (idx, (rule, re)) in compiled_rules().iter().enumerate() {
+        if candidates & (1u64 << idx) == 0 {
+            continue;
+        }
+        if let Some(matched) = re.find(text) {
+            if rule.typ == "GENERIC_SECRET" && !generic_secret_plausible(matched.as_str()) {
+                continue;
+            }
+            if rule.min_entropy > 0.0 && e < rule.min_entropy {
+                continue;
+            }
+            if rule.require_digit && !text.bytes().any(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            // A checksum or issuer check that fails means this is not the
+            // type the pattern suggests: keep looking instead of labelling it.
+            if !checksum_ok(rule.typ, matched.as_str()) {
+                continue;
+            }
+            return Some((rule.group, rule.typ));
+        }
+    }
+    None
+}
+
 /// Classify a single extracted string. Returns None if no rule matches.
 pub fn classify(text: &str) -> Option<Classification> {
-    let e = entropy_of(text);
-    // Secret patterns take priority
     let candidates = secret_candidates(text);
     for (idx, (name, re)) in secret_compiled().iter().enumerate() {
         if candidates & (1u64 << idx) == 0 {
@@ -851,29 +1007,8 @@ pub fn classify(text: &str) -> Option<Classification> {
         }
     }
     // existing rules...
-    for (rule, re) in compiled_rules() {
-        if let Some(matched) = re.find(text) {
-            if rule.typ == "GENERIC_SECRET" && !generic_secret_plausible(matched.as_str()) {
-                continue;
-            }
-            if rule.min_entropy > 0.0 && e < rule.min_entropy {
-                continue;
-            }
-            if rule.require_digit && !text.bytes().any(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            // A checksum or issuer check that fails means this is not the
-            // type the pattern suggests: keep looking instead of labelling it.
-            if !checksum_ok(rule.typ, matched.as_str()) {
-                continue;
-            }
-            return Some(Classification {
-                group: rule.group,
-                typ: rule.typ,
-            });
-        }
-    }
-    None
+    let (group, typ) = classify_rules(text, true)?;
+    Some(Classification { group, typ })
 }
 
 /// Default group/type for strings that don't match any rule.
@@ -1573,6 +1708,77 @@ mod tests {
             assert!(
                 SECRET_PATTERNS.iter().any(|(n, _)| n == name),
                 "stale anchor entry {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_rule_anchor_entry_points_at_a_real_rule() {
+        for (name, _) in RULE_ANCHORS {
+            assert!(
+                RULES.iter().any(|r| name == r.typ),
+                "stale anchor entry {name}"
+            );
+        }
+        for (name, _) in RULE_MIN_LEN {
+            assert!(
+                RULES.iter().any(|r| name == r.typ),
+                "stale length gate {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_prefilter_skips_rules_whose_anchors_are_absent() {
+        let mask = rule_candidates("hello world");
+        for (idx, rule) in RULES.iter().enumerate() {
+            let anchored = RULE_ANCHORS.iter().any(|(n, _)| n == &rule.typ);
+            if anchored {
+                assert_eq!(
+                    mask & (1u64 << idx),
+                    0,
+                    "{} should have been skipped",
+                    rule.typ
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rule_prefilter_is_equivalent_to_running_every_regex() {
+        // One representative string per rule plus edge cases: the anchor
+        // prefilter must never change which rule matches.
+        let samples = [
+            "",
+            "hello world this is a plain sentence",
+            "AKIAIOSFODNN7EXAMPLE",
+            "aws_secret_access_key = wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+            "ghp_012345678901234567890123456789012345",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln",
+            "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----",
+            "azure storage key AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ1234567",
+            "PASSWORD=hunter2hunter2",
+            "https://example.com/api?q=1",
+            "192.168.1.10",
+            "example.com",
+            "user@example.com",
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb",
+            "0x52908400098527886E0F7030069857D2E4169EE7",
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            "4532015112830366",
+            "C:\\temp\\evil",
+            "Global\\SomeMutex123",
+            "/admin/index",
+            "0123456789abcdef0123456789abcdef",
+            "\u{17F}ecret=abcdefgh1234",
+        ];
+        for text in samples {
+            assert_eq!(
+                classify_rules(text, true),
+                classify_rules(text, false),
+                "text: {text:?}"
             );
         }
     }
