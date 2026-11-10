@@ -25,6 +25,8 @@ tmp_*.ndjson
 gate.log
 fuzz/*.log
 fuzz/artifacts/
+fuzz/corpus/
+fuzz/target/
 _slice64.bin
 _strings_ascii.txt
 _bxmap_ascii.txt
