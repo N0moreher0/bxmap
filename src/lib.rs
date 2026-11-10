@@ -3496,34 +3496,180 @@ mod tests {
             .any(|s| s.encoding == "utf8" && s.text.contains('\u{fffd}')));
     }
 
+    /// Results as `(offset, encoding, text)`, sorted so equal-offset ties
+    /// (e.g. ascii and utf8 starting on the same byte) compare deterministically.
+    fn parity_key(results: Vec<ExtractedString>) -> Vec<(u64, &'static str, String)> {
+        let mut v: Vec<_> = results
+            .into_iter()
+            .map(|s| (s.offset, s.encoding, s.text))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Binary filler that never forms a printable ASCII run, so the only
+    /// strings the scanner can find are the ones planted by the caller.
+    fn fill_binary_noise(data: &mut [u8]) {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for b in data.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let r = (state >> 24) as u8;
+            *b = if r & 1 == 0 { r | 0x80 } else { (r % 31) + 1 };
+        }
+    }
+
+    /// Copy `bytes` at `offset` and zero `pad` bytes on both sides so the
+    /// planted run cannot merge into the surrounding noise.
+    fn plant(data: &mut [u8], offset: usize, bytes: &[u8], pad: usize) {
+        let end = offset + bytes.len();
+        assert!(
+            end + pad <= data.len(),
+            "planted string must fit in the dump"
+        );
+        let before = offset.saturating_sub(pad);
+        data[before..offset].fill(0);
+        data[offset..end].copy_from_slice(bytes);
+        let after = std::cmp::min(end + pad, data.len());
+        data[end..after].fill(0);
+    }
+
+    fn plant_utf16(data: &mut [u8], offset: usize, s: &str, big_endian: bool) {
+        let mut bytes = Vec::with_capacity(s.len() * 2);
+        for unit in s.encode_utf16() {
+            let [lo, hi] = unit.to_le_bytes();
+            let pair = if big_endian { [hi, lo] } else { [lo, hi] };
+            bytes.extend_from_slice(&pair);
+        }
+        plant(data, offset, &bytes, 2);
+    }
+
+    /// Dump spanning several `PARALLEL_CHUNK_SIZE` regions with strings that
+    /// straddle, end on, and start on region boundaries in ascii, UTF-16LE
+    /// and UTF-16BE.
+    fn build_multi_region_dump(regions: usize) -> Vec<u8> {
+        let region = PARALLEL_CHUNK_SIZE as usize;
+        let mut data = vec![0u8; region * regions];
+        fill_binary_noise(&mut data);
+
+        for k in 0..regions {
+            // Well inside a region: never affected by the region split.
+            plant(
+                &mut data,
+                k * region + region / 2,
+                b"inside_region_marker",
+                1,
+            );
+        }
+        // One behaviour per interior boundary, each far enough apart that the
+        // planted runs cannot overwrite each other.
+        for k in 1..regions {
+            let b = k * region;
+            match k {
+                1 => plant(&mut data, b - 4, b"ascii_straddles_boundary_run", 1),
+                2 => plant_utf16(&mut data, b - 6, "utf16le_straddles_border", false),
+                3 => plant_utf16(&mut data, b - 6, "utf16be_straddles_border", true),
+                4 => plant(&mut data, b - 24, b"ends_exactly_on_border", 1),
+                5 => plant(&mut data, b, b"starts_exactly_on_border", 1),
+                6 => plant_utf16(&mut data, b - 32, "utf16le_ends_on_border", false),
+                7 => plant_utf16(&mut data, b, "utf16be_starts_on_border", true),
+                _ => {}
+            }
+        }
+        data
+    }
+
     #[test]
     fn parallel_matches_sequential_on_multi_region_data() {
-        // Build data spanning several PARALLEL_CHUNK_SIZE-sized regions so
-        // the parallel path actually exercises >1 chunk / boundary
-        // handling, and check it agrees with the sequential scanner.
-        let mut data = Vec::new();
-        for i in 0..3000u32 {
-            data.extend_from_slice(format!("marker_{i:05}_value_", i = i).as_bytes());
-        }
-        let tmp = std::env::temp_dir().join(format!("bxmap_test_{}.bin", std::process::id()));
+        // Same set, same ascending offset order from every code path: the
+        // in-memory scanner, the buffered parallel scan and the streaming
+        // parallel scan (with and without a private rayon pool).
+        let data = build_multi_region_dump(8);
+        assert!(
+            data.len() as u64 > 3 * PARALLEL_CHUNK_SIZE,
+            "test data must span more than one parallel region"
+        );
+        let tmp =
+            std::env::temp_dir().join(format!("bxmap_parallel_parity_{}.bin", std::process::id()));
         std::fs::write(&tmp, &data).unwrap();
+        let path = tmp.to_str().unwrap();
 
-        let sequential = extract_strings(&data, 4, 200_000);
-        let parallel = extract_strings_from_file_parallel(
-            tmp.to_str().unwrap(),
+        let sequential = parity_key(extract_strings(&data, 4, 200_000));
+        assert!(
+            sequential.len() >= 16,
+            "expected planted strings, got {}",
+            sequential.len()
+        );
+        // Every encoding's records must be offset-ascending on their own too.
+        assert!(sequential.windows(2).all(|w| w[0].0 <= w[1].0));
+
+        let buffered = parity_key(
+            extract_strings_from_file_parallel(path, 4, 200_000, NoiseConfig::default()).unwrap(),
+        );
+        assert_eq!(sequential, buffered, "buffered parallel diverged");
+
+        for threads in [1usize, 2, 4] {
+            let mut streamed = Vec::new();
+            extract_strings_from_file_parallel_streaming_with_encodings(
+                path,
+                4,
+                200_000,
+                NoiseConfig::default(),
+                EncodingFilter::all(),
+                threads,
+                |s| streamed.push(s),
+            )
+            .unwrap();
+            assert_eq!(
+                sequential,
+                parity_key(streamed),
+                "streaming parallel diverged with threads={threads}"
+            );
+        }
+
+        // Encoding filters must apply identically on both paths.
+        let seq_utf16 = parity_key(extract_strings_with_encodings(
+            &data,
+            4,
+            200_000,
+            EncodingFilter::utf16(),
+        ));
+        assert!(!seq_utf16.is_empty());
+        let mut par_utf16 = Vec::new();
+        extract_strings_from_file_parallel_streaming_with_encodings(
+            path,
             4,
             200_000,
             NoiseConfig::default(),
+            EncodingFilter::utf16(),
+            2,
+            |s| par_utf16.push(s),
         )
         .unwrap();
+        assert_eq!(seq_utf16, parity_key(par_utf16), "utf16 filter diverged");
+
+        // A cap must cut at the same place (first N by offset) on both paths.
+        let cap = 5;
+        let mut capped = Vec::new();
+        let emitted = extract_strings_from_file_parallel_streaming_with_encodings(
+            path,
+            4,
+            cap,
+            NoiseConfig::default(),
+            EncodingFilter::all(),
+            4,
+            |s| capped.push(s),
+        )
+        .unwrap();
+        assert_eq!(emitted, cap.min(sequential.len()));
+        assert_eq!(
+            sequential[..emitted],
+            parity_key(capped)[..],
+            "max_strings cut diverged"
+        );
 
         std::fs::remove_file(&tmp).ok();
-
-        assert_eq!(sequential.len(), parallel.len());
-        for (a, b) in sequential.iter().zip(parallel.iter()) {
-            assert_eq!(a.offset, b.offset);
-            assert_eq!(a.text, b.text);
-        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ Mục tiêu: biến bxmap thành công cụ trích xuất chuỗi / triage cho m
 
 Ký hiệu: `[ ]` chưa làm · `[~]` đang làm · `[x]` xong. Độ ưu tiên: **P0** làm trước · **P1** quan trọng · **P2** nên có.
 
-Phiên bản hiện tại: `bxmap` **1.0.5**, `bxmap-cli` **1.0.15** (Phase 4.1 noise filter + ACPI filtering shipped). Các mốc ở cuối tài liệu tính từ bản kế tiếp.
+Phiên bản hiện tại: `bxmap` **1.0.7**, `bxmap-cli` **1.0.18** (Phase 4.1 noise filter + ACPI filtering shipped). Các mốc ở cuối tài liệu tính từ bản kế tiếp.
 
 ---
 
@@ -46,7 +46,7 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 
 ### 2.2 Bộ test
 - [x] Unit test cho từng encoding (ASCII, **Latin1, CP1252, UTF-8, Shift-JIS**, UTF-16LE/BE, UTF-32LE/BE), gồm chuỗi nằm **vắt ngang ranh giới chunk** và ngang ranh giới region song song.
-- [ ] Test đảm bảo kết quả song song == kết quả tuần tự (cùng tập, cùng thứ tự theo offset).
+- [x] Test đảm bảo kết quả song song == kết quả tuần tự (cùng tập, cùng thứ tự theo offset). `parallel_matches_sequential_on_multi_region_data` (2026-11-10): dump 8 region (~32 KiB, region 4 KiB trong `cfg(test)`) có nhiễu nhị phân + chuỗi ascii/UTF-16LE/UTF-16BE vắt qua, kết thúc đúng và bắt đầu đúng tại ranh giới region; so khớp in-memory vs buffered parallel vs streaming parallel (`threads` 1/2/4), lọc `EncodingFilter::utf16()` và cắt `max_strings` — tất cả trùng tập + trùng thứ tự offset.
 - [~] Golden test cho output `text`, `json`, `json-tree` (integration smoke tests).
 - [ ] Bộ dump mẫu nhỏ, tổng hợp (không chứa dữ liệu thật) cho test hồi quy.
 
@@ -130,6 +130,7 @@ Nguồn: review toàn repo + `cargo test --workspace --locked` (245 test pass), 
 - [x] Noise filter: chu kỳ 1/2/3-8 + zero-page filter + ACPI field/table signature filter (Latin1/CP1252).
 - [x] `--dedupe`: chuỗi duy nhất kèm số lần xuất hiện + offset đầu tiên. Áp dụng cho `text`/`json`/`json-tree`; với `--detect-format rich` thì gộp theo `(rule, value)`.
 - [~] **Lọc rác nhị phân/bảng ACPI** (MemLabs Lab1): remove `FACP`/`DSDT`/`VBOX` và AML field names. Latin1/CP1252 strings giảm từ ~40k xuống ~26 trên cùng scan prefix. ASCII unaffected (18 MiB/s).
+- [x] **Lọc ký tự lạ sau giải mã (utf8 / shift_jis)** (2026-11-09): `decoded_text_noise` bỏ chuỗi có nhiều U+FFFD, ký tự điều khiển C0/C1, Private Use/noncharacter, hoặc tỷ lệ ký tự đọc được thấp (< 60%). Trước đây utf8 và shift_jis chỉ có lọc lặp. Tắt cùng `--noise-threshold 0` (`NoiseConfig::disabled`); chuỗi ngắn (< 8 ký tự) chỉ bị loại khi chứa ký tự "xấu", không dùng tỷ lệ, để không mất bằng chứng ngắn. latin1/cp1252 đã có lọc riêng (ACPI + entropy) nên giữ nguyên. Còn lại: shift_jis giải ra kanji ngẫu nhiên "hợp lệ" vẫn lọt (chưa có heuristic riêng).
 - [~] **Output gọn:** JSON pretty-print của 1,9 triệu bản ghi nặng 160 MB. Đã có `--format ndjson` (một record/dòng, có `type` + dòng `metadata`), `--compact` (json/json-tree một dòng) và nén gzip tự động khi `-o` kết thúc bằng `.gz`. Còn lại: `.zst`, và tùy chọn bỏ trường không cần.
 - [ ] Giữ mặc định bảo thủ (không làm mất bằng chứng ngắn như `0000`); mọi bộ lọc mới đều opt-in hoặc có cờ tắt.
 

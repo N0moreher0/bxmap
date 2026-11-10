@@ -3,6 +3,15 @@
 All notable changes to `bxmap` / `bxmap-cli` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- Regression test `parallel_matches_sequential_on_multi_region_data`: the
+  buffered and streaming parallel scans (1/2/4 threads) must produce the same
+  set and offset order as the in-memory scanner across region boundaries, with
+  ASCII/UTF-16LE/UTF-16BE runs that straddle, end on and start on a boundary,
+  plus encoding filters and `max_strings` truncation parity.
+
 ## [1.0.18] - 2026-11-10
 
 CLI release aligned with `bxmap` 1.0.7. No CLI code changes.
