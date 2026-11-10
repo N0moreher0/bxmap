@@ -1268,10 +1268,6 @@ impl<'a> StringRunScanner<'a> {
                 }
             }
 
-            let i = offset + k;
-            let g = global_base + k as u64;
-            let b = buffer[i];
-            let printable_b = is_printable(b); // shared by both branches below, avoids looking up the table twice for the same byte
             // Bytes consumed by a multi-byte sequence in one of the variable
             // length encodings. UTF-8 and Shift-JIS can both claim the same
             // byte (a UTF-8 lead byte is often a valid Shift-JIS lead byte
@@ -1279,6 +1275,10 @@ impl<'a> StringRunScanner<'a> {
             // end of the iteration. Applying them separately let one branch
             // eat a byte the other still needed, which cut UTF-8 runs in the
             // middle at the first CJK character.
+            let i = offset + k;
+            let g = global_base + k as u64;
+            let b = buffer[i];
+            let printable_b = is_printable(b); // shared by both branches below, avoids looking up the table twice for the same byte
             let mut extra_skip = 0usize;
 
             // -- ASCII: only needs the current byte itself, no lookahead --
