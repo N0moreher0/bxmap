@@ -1419,6 +1419,16 @@ fn carve_7z(source: &mut Source<'_>) -> io::Result<Verdict> {
     if &header[0..6] != b"7z\xbc\xaf\x27\x1c" {
         return Ok(Verdict::Invalid("bad 7-Zip signature".to_string()));
     }
+    // StartHeaderCRC covers the 20 bytes that follow it (NextHeaderOffset,
+    // NextHeaderSize, NextHeaderCRC). Without it, random data that happens to
+    // start with the 6-byte signature would be reported as a valid archive.
+    let stored_crc = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    let computed_crc = crc32(0xffff_ffff, &header[12..32]) ^ 0xffff_ffff;
+    if stored_crc != computed_crc {
+        return Ok(Verdict::Invalid(format!(
+            "7-Zip start header CRC mismatch (stored {stored_crc:08x}, computed {computed_crc:08x})"
+        )));
+    }
     let next_offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
     let next_size = u64::from_le_bytes(header[20..28].try_into().unwrap());
     let total = match 32u64
@@ -2065,6 +2075,69 @@ mod tests {
         assert_eq!(report.files[0].kind, CarveKind::Rar4);
         assert!(report.files[0].complete);
         assert_eq!(report.files[0].size, rar.len() as u64);
+    }
+
+    /// A minimal structurally valid 7-Zip archive: the 32-byte signature
+    /// header with a correct `StartHeaderCRC` and an empty next header.
+    fn seven_zip_bytes() -> Vec<u8> {
+        let next_header: &[u8] = &[];
+        let mut start_header = Vec::new();
+        start_header.extend_from_slice(&0u64.to_le_bytes()); // next header offset
+        start_header.extend_from_slice(&(next_header.len() as u64).to_le_bytes());
+        start_header
+            .extend_from_slice(&(crc32(0xffff_ffff, next_header) ^ 0xffff_ffff).to_le_bytes());
+
+        let mut out = b"7z\xbc\xaf\x27\x1c".to_vec();
+        out.push(0); // major version
+        out.push(4); // minor version
+        out.extend_from_slice(&(crc32(0xffff_ffff, &start_header) ^ 0xffff_ffff).to_le_bytes());
+        out.extend_from_slice(&start_header);
+        out
+    }
+
+    #[test]
+    fn carves_7z_with_a_valid_start_header_crc() {
+        let archive = seven_zip_bytes();
+        assert_eq!(archive.len(), 32);
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&archive);
+        dump.extend_from_slice(&[0u8; 64]);
+
+        let path = write_dump("seven-zip", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert_eq!(report.files[0].kind, CarveKind::SevenZip);
+        assert!(report.files[0].complete);
+        assert_eq!(report.files[0].size, archive.len() as u64);
+    }
+
+    #[test]
+    fn rejects_7z_with_a_bad_start_header_crc() {
+        // Same signature and sizes, but the CRC no longer matches the 20
+        // bytes it covers: this must be rejected as a false positive instead
+        // of being carved as a valid archive.
+        let mut archive = seven_zip_bytes();
+        archive[8] ^= 0xff; // corrupt the stored StartHeaderCRC
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&archive);
+        dump.extend_from_slice(&[0u8; 64]);
+
+        let path = write_dump("bad-seven-zip", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(report.files.is_empty(), "{report:?}");
+        assert!(report.rejected >= 1, "{report:?}");
     }
 
     #[test]
