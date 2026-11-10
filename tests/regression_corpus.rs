@@ -16,7 +16,8 @@ const MIN_LEN: usize = 6;
 #[test]
 fn every_planted_string_is_found_at_its_offset() {
     let corpus = synthetic_corpus();
-    let found = extract_strings_with_encodings(&corpus.data, MIN_LEN, 100_000, EncodingFilter::all());
+    let found =
+        extract_strings_with_encodings(&corpus.data, MIN_LEN, 100_000, EncodingFilter::all());
     for want in &corpus.expected {
         assert!(
             found.iter().any(|s| s.offset == want.offset
@@ -35,7 +36,8 @@ fn every_planted_string_is_found_at_its_offset() {
 #[test]
 fn the_ascii_view_is_exactly_the_planted_ascii() {
     let corpus = synthetic_corpus();
-    let found = extract_strings_with_encodings(&corpus.data, MIN_LEN, 100_000, EncodingFilter::ascii());
+    let found =
+        extract_strings_with_encodings(&corpus.data, MIN_LEN, 100_000, EncodingFilter::ascii());
     let got: Vec<(u64, String)> = found.iter().map(|s| (s.offset, s.text.clone())).collect();
     let want: Vec<(u64, String)> = corpus
         .expected
