@@ -1204,6 +1204,27 @@ pub fn is_crypto_address(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l'))
 }
 
+/// RAM the scanner needs for its own buffers, in bytes.
+///
+/// Mirrors `bxmap::scan_working_set_bytes` (exposed from bxmap 1.0.8). The
+/// helper is duplicated here on purpose: the packaged CLI is built against
+/// the *published* bxmap release, which does not expose it yet. Keep the two
+/// in sync.
+pub fn scan_working_set_bytes(threads: usize) -> u64 {
+    /// Region one parallel worker reads (16 MiB).
+    const PARALLEL_REGION_SIZE: u64 = 16 * 1024 * 1024;
+    /// Buffer the sequential scanner reads into (32 MiB).
+    const SEQUENTIAL_BUFFER_SIZE: u64 = 32 * 1024 * 1024;
+    /// Upper bound on a single open string run (1 MB).
+    const MAX_RUN_CHARS: u64 = 1_000_000;
+
+    if threads > 1 {
+        threads as u64 * (PARALLEL_REGION_SIZE + MAX_RUN_CHARS)
+    } else {
+        SEQUENTIAL_BUFFER_SIZE + MAX_RUN_CHARS
+    }
+}
+
 /// Clamp the worker count so the scanner's own buffers stay inside a memory
 /// budget.
 ///
@@ -1215,14 +1236,14 @@ pub fn apply_memory_budget(threads: usize, max_memory: u64) -> Result<usize, Str
     if max_memory == 0 {
         return Ok(threads);
     }
-    let minimum = bxmap::scan_working_set_bytes(1);
+    let minimum = scan_working_set_bytes(1);
     if minimum > max_memory {
         return Err(format!(
             "--max-memory {max_memory} bytes is too small: one worker needs about {minimum} bytes"
         ));
     }
     let mut allowed = threads.max(1);
-    while allowed > 1 && bxmap::scan_working_set_bytes(allowed) > max_memory {
+    while allowed > 1 && scan_working_set_bytes(allowed) > max_memory {
         allowed -= 1;
     }
     if allowed < threads {
@@ -1242,7 +1263,8 @@ mod tests {
         apply_memory_budget, contains_crypto_address, contains_jwt_shape,
         contains_meaningful_base64, detected_domain_value, detected_ip_value, detected_url_value,
         hex_encode, important_reason, is_email_address, matches_filter, parse_pid_marker,
-        refang_ioc_text, scan_magic_bytes, xor_printable_score, ExtractedString,
+        refang_ioc_text, scan_magic_bytes, scan_working_set_bytes, xor_printable_score,
+        ExtractedString,
     };
     use regex::Regex;
 
@@ -1251,8 +1273,8 @@ mod tests {
         // 0 means "no budget": nothing changes.
         assert_eq!(apply_memory_budget(8, 0).unwrap(), 8);
 
-        let one = bxmap::scan_working_set_bytes(1);
-        let two = bxmap::scan_working_set_bytes(2);
+        let one = scan_working_set_bytes(1);
+        let two = scan_working_set_bytes(2);
 
         // A budget that fits the requested workers leaves them alone.
         assert_eq!(apply_memory_budget(2, two).unwrap(), 2);

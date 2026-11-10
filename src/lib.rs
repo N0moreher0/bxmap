@@ -3087,6 +3087,17 @@ mod tests {
         assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
     }
 
+    #[test]
+    fn working_set_estimate_grows_with_the_worker_count() {
+        let one = scan_working_set_bytes(1);
+        let four = scan_working_set_bytes(4);
+        // A single worker uses the sequential buffer.
+        assert_eq!(one, SEQUENTIAL_BUFFER_SIZE as u64 + MAX_RUN_CHARS as u64);
+        // Parallel workers use one region each, so the estimate grows.
+        assert!(four > one);
+        assert!(four >= 4 * PARALLEL_REGION_SIZE);
+    }
+
     #[cfg(test)]
     mod prop_tests {
         use super::*;
