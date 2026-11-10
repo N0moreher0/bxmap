@@ -3101,7 +3101,8 @@ mod tests {
         data.push(0);
         let out = extract_strings_with_encodings(&data, 4, 100_000, EncodingFilter::all());
         assert!(
-            out.iter().any(|s| s.encoding == "utf8" && s.text == "中caféabc"),
+            out.iter()
+                .any(|s| s.encoding == "utf8" && s.text == "中caféabc"),
             "{out:?}"
         );
     }
