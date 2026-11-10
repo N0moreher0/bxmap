@@ -48,7 +48,7 @@ Dump đến từ máy nhiễm mã độc, parser phải chịu được input th
 - [x] Unit test cho từng encoding (ASCII, **Latin1, CP1252, UTF-8, Shift-JIS**, UTF-16LE/BE, UTF-32LE/BE), gồm chuỗi nằm **vắt ngang ranh giới chunk** và ngang ranh giới region song song.
 - [x] Test đảm bảo kết quả song song == kết quả tuần tự (cùng tập, cùng thứ tự theo offset). `parallel_matches_sequential_on_multi_region_data` (2026-11-10): dump 8 region (~32 KiB, region 4 KiB trong `cfg(test)`) có nhiễu nhị phân + chuỗi ascii/UTF-16LE/UTF-16BE vắt qua, kết thúc đúng và bắt đầu đúng tại ranh giới region; so khớp in-memory vs buffered parallel vs streaming parallel (`threads` 1/2/4), lọc `EncodingFilter::utf16()` và cắt `max_strings` — tất cả trùng tập + trùng thứ tự offset.
 - [~] Golden test cho output `text`, `json`, `json-tree` (integration smoke tests).
-- [ ] Bộ dump mẫu nhỏ, tổng hợp (không chứa dữ liệu thật) cho test hồi quy.
+- [x] Bộ dump mẫu nhỏ, tổng hợp (không chứa dữ liệu thật) cho test hồi quy. **Xong (2026-11-10):** `tests/common/corpus.rs` sinh corpus tổng hợp (~16 KiB, không có byte nào từ dump thật) với nền nhiễu xác định (byte C1 + control nên không tạo run printable ở bất kỳ encoding nào) + chuỗi cố ý trồi ở ASCII/UTF-16LE/UTF-16BE/UTF-8, IOC, path, env block, cloud key + số thẻ. `tests/regression_corpus.rs` assert: mọi chuỗi cố ý trồi đều được tìm thấy đúng offset, và **view ASCII đúng bằng tập chuỗi ASCII đã trồi** (nền nhiễu không được sinh thêm gì).
 
 **Xong khi:** CI chạy fuzz smoke test mỗi PR và không còn panic đã biết.
 

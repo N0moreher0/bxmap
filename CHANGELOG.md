@@ -6,6 +6,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- A synthetic regression corpus (`tests/common/corpus.rs`): a small, fully
+  generated dump with a fixed layout -- ASCII, UTF-16LE/BE, UTF-8, IOC
+  tokens, a Windows path, an UTF-16LE environment block, a cloud key and a
+  card number -- on a background that cannot form a printable run in any
+  encoding. `tests/regression_corpus.rs` asserts that every planted string is
+  reported at its exact offset and that the background produces nothing.
 - `--max-memory <bytes>` caps the RAM the scanner may use for its own buffers
   (0 = unlimited, the default). When the cap does not fit the requested worker
   count, fewer workers are used and the change is reported on stderr; a cap
