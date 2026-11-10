@@ -18,17 +18,30 @@ fn every_planted_string_is_found_at_its_offset() {
     let corpus = synthetic_corpus();
     let found =
         extract_strings_with_encodings(&corpus.data, MIN_LEN, 100_000, EncodingFilter::all());
-    for want in &corpus.expected {
-        assert!(
-            found.iter().any(|s| s.offset == want.offset
-                && s.encoding == want.encoding
-                && s.text == want.text),
-            "missing {} string {:?} at {:#x}",
-            want.encoding,
-            want.text,
-            want.offset
-        );
-    }
+    let missing: Vec<&common::corpus::Expected> = corpus
+        .expected
+        .iter()
+        .filter(|want| {
+            !found.iter().any(|s| {
+                s.offset == want.offset && s.encoding == want.encoding && s.text == want.text
+            })
+        })
+        .collect();
+    // Only the neighbourhood of a missing string is printed: the corpus also
+    // produces decoded noise in other encodings.
+    let nearby: Vec<&bxmap::ExtractedString> = found
+        .iter()
+        .filter(|s| {
+            missing
+                .iter()
+                .any(|m| s.offset.abs_diff(m.offset) < 64)
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "missing: {missing:?}\nnearby: {nearby:#?}\ntotal found: {}",
+        found.len()
+    );
 }
 
 /// The ASCII view of the corpus is exactly the planted ASCII strings: the

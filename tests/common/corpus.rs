@@ -41,7 +41,14 @@ fn push_noise(data: &mut Vec<u8>, bytes: usize) {
     }
 }
 
-fn push_utf16(data: &mut Vec<u8>, text: &str, big_endian: bool) {
+/// Plant a UTF-16 string and return its offset.
+///
+/// A control byte is planted in front: a UTF-16LE run may legally start on
+/// any byte, so without the separator the last character of the preceding
+/// ASCII string (followed by its NUL) would be swallowed by the UTF-16 run.
+fn push_utf16(data: &mut Vec<u8>, text: &str, big_endian: bool) -> usize {
+    data.push(0x01);
+    let offset = data.len();
     for unit in text.encode_utf16() {
         let [lo, hi] = unit.to_le_bytes();
         if big_endian {
@@ -51,6 +58,7 @@ fn push_utf16(data: &mut Vec<u8>, text: &str, big_endian: bool) {
         }
     }
     data.extend_from_slice(&[0, 0]);
+    offset
 }
 
 /// Build the corpus and the list of strings it must produce.
@@ -71,8 +79,7 @@ pub fn synthetic_corpus() -> Corpus {
     });
 
     // UTF-16LE marker.
-    let offset = data.len();
-    push_utf16(&mut data, "WIDE_LE_MARKER", false);
+    let offset = push_utf16(&mut data, "WIDE_LE_MARKER", false);
     expected.push(Expected {
         offset: offset as u64,
         encoding: "utf16le",
@@ -80,8 +87,7 @@ pub fn synthetic_corpus() -> Corpus {
     });
 
     // UTF-16BE marker.
-    let offset = data.len();
-    push_utf16(&mut data, "WIDE_BE_MARKER", true);
+    let offset = push_utf16(&mut data, "WIDE_BE_MARKER", true);
     expected.push(Expected {
         offset: offset as u64,
         encoding: "utf16be",
@@ -119,8 +125,7 @@ pub fn synthetic_corpus() -> Corpus {
 
     // An environment block in UTF-16LE -- the classic place to find a
     // password in a memory dump.
-    let offset = data.len();
-    push_utf16(&mut data, "PASSWORD=hunter2hunter2", false);
+    let offset = push_utf16(&mut data, "PASSWORD=hunter2hunter2", false);
     expected.push(Expected {
         offset: offset as u64,
         encoding: "utf16le",
