@@ -90,7 +90,7 @@ impl VmwareState {
         let mut pos = group.tags_offset;
         let mut out = Vec::new();
         while out.len() < max {
-            if pos + 2 > len {
+            if pos.checked_add(2).map_or(true, |v| v > len) {
                 break;
             }
             let h = read_exact_at(&mut f, pos, 2)?;
@@ -124,7 +124,7 @@ impl VmwareState {
             }
             let small = (flags & 0x3f) as u64;
             let (data_offset, data_len) = if small >= 62 {
-                if pos + 8 > len {
+                if pos.checked_add(8).map_or(true, |v| v > len) {
                     break;
                 }
                 let b = read_exact_at(&mut f, pos, 8)?;
@@ -302,6 +302,59 @@ mod tests {
                 }
             }
         }
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// A group whose `tags_offset` is `u64::MAX` used to overflow `pos + 2`
+    /// (and `pos + 8`) while walking tags: with overflow checks on that aborts
+    /// the process on a crafted `.vmss`. Found by the `vmware_parse` fuzz target.
+    #[test]
+    fn hostile_tag_offset_does_not_overflow() {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0xbed2_bed2u32.to_le_bytes()); // magic
+        v.extend_from_slice(&[0u8; 4]); // version
+        v.extend_from_slice(&1u32.to_le_bytes()); // one group
+        let mut name = [0u8; 64];
+        name[..6].copy_from_slice(b"memory");
+        v.extend_from_slice(&name);
+        v.extend_from_slice(&u64::MAX.to_le_bytes()); // hostile tags offset
+        v.extend_from_slice(&[0u8; 8]); // rest of the 80-byte entry
+
+        let dir =
+            std::env::temp_dir().join(format!("bxmap_vmware_overflow_{}.vmss", std::process::id()));
+        std::fs::write(&dir, &v).unwrap();
+        let st = VmwareState::open(&dir).unwrap();
+        let g = st.group("memory").unwrap().clone();
+        // Overflow checks are on in test builds, so the old code panicked here.
+        assert!(st.tags(&g, 8).unwrap().is_empty());
+        assert!(st.render_info().contains("memory"));
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn max_data_len_tag_does_not_panic() {
+        // Same idea for the 8-byte length field: data_offset + data_len must
+        // stay inside the file instead of wrapping past the bounds check.
+        let mut v = Vec::new();
+        v.extend_from_slice(&0xbed2_bed2u32.to_le_bytes());
+        v.extend_from_slice(&[0u8; 4]);
+        v.extend_from_slice(&1u32.to_le_bytes());
+        let mut name = [0u8; 64];
+        name[..6].copy_from_slice(b"memory");
+        v.extend_from_slice(&name);
+        v.extend_from_slice(&(v.len() as u64 + 16).to_le_bytes());
+        v.extend_from_slice(&[0u8; 8]);
+        v.push(63); // small = 63 -> 8-byte length + pad follow
+        v.push(0);
+        v.extend_from_slice(&u32::MAX.to_le_bytes()); // data_len
+        v.extend_from_slice(&u32::MAX.to_le_bytes()); // pad
+
+        let dir =
+            std::env::temp_dir().join(format!("bxmap_vmware_datalen_{}.vmss", std::process::id()));
+        std::fs::write(&dir, &v).unwrap();
+        let st = VmwareState::open(&dir).unwrap();
+        let g = st.group("memory").unwrap().clone();
+        assert!(st.tags(&g, 8).unwrap().is_empty());
         let _ = std::fs::remove_file(&dir);
     }
 }

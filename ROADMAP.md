@@ -104,7 +104,7 @@ Nguồn: review toàn repo + `cargo test --workspace --locked` (245 test pass), 
 - `carve_7z`: xác thực `StartHeaderCRC` trên 20 byte start header + 2 test (đúng CRC → carve, sai CRC → reject).
 - `LICENSE` gốc (AGPL) đã xóa; license từng package nằm ở `LICENSE-MIT` + `LICENSE-APACHE` (lib) và `cli/LICENSE-AGPL` (CLI), tóm tắt trong `LICENSING.md`.
 - README: mục MSRV ghi đúng 3 mốc (1.80 khai báo / 1.85 build theo lock / 1.95 full) thay cho "Rust 1.70".
-- `fuzz/`: thêm CI job `fuzz` (7 target × 30 s) và ignore `fuzz/corpus/`, `fuzz/target/`; cập nhật `fuzz/Cargo.lock` theo `bxmap` 1.0.7.
+- `fuzz/`: thêm CI job `fuzz` (7 target × 30 s) và ignore `fuzz/corpus/`, `fuzz/target/`; cập nhật `fuzz/Cargo.lock` theo `bxmap` 1.0.7. Lần chạy đầu **bắt được một panic thật**: `src/vmware.rs` cộng `pos + 2` / `pos + 8` trên `tags_offset` do input khai (`u64::MAX`) → tràn số. Đã sửa bằng `checked_add` + 2 test hồi quy; job upload `fuzz/artifacts/` khi fail để tải được input gây lỗi.
 - CI #158 (HEAD `82301ae`) xanh toàn bộ job, gồm `cargo audit`, `cargo deny` và cả hai job MSRV → các nghi vấn 2.6.3 đã chốt.
 
 **Xong khi:** CI `main` xanh toàn bộ job bắt buộc, và có test hồi quy cho từng lỗi 2.6.1 / 2.6.2 (trừ mục đã hoãn).

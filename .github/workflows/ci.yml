@@ -127,3 +127,10 @@ jobs:
             cargo fuzz run "$target" -- -max_total_time=30 -rss_limit_mb=4096
             echo "::endgroup::"
           done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

@@ -19,6 +19,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   plus encoding filters and `max_strings` truncation parity.
 
 ### Fixed
+- `--vmss`/`.vmsn` tag walking no longer overflows on a hostile group table:
+  a `tags_offset` of `u64::MAX` made `pos + 2` (and `pos + 8`) abort the
+  process with overflow checks on. Both bounds checks now use `checked_add`.
+  Found by the new `fuzz` CI job on its first run; two regression tests cover
+  the hostile offset and a `u32::MAX` data length.
 - `bxmap --carve jpeg dump.bin` no longer fails with `unknown option 'jpeg'`:
   the dump path may now appear anywhere on the command line, a second bare
   token is reported as an extra argument, and a missing path says so instead
