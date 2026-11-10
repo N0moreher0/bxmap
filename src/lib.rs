@@ -59,7 +59,8 @@ pub use classifier::{
     classify, detect_bitlocker_header, detect_encryption_shell, detect_luks_header,
     detect_openssl_encrypted, detect_pgp_container, detect_secrets, detect_secrets_detailed,
     detect_veracrypt_header, entropy_of, extract_pems, validate_base58check, validate_bech32,
-    validate_finding, validate_jwt, validate_luhn, EncryptedContainer, ValidationResult,
+    validate_credit_card, validate_finding, validate_jwt, validate_luhn, EncryptedContainer,
+    ValidationResult,
 };
 pub mod keys;
 pub mod magic;

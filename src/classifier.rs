@@ -62,6 +62,8 @@ pub fn severity_for(rule: &str) -> &'static str {
         | "PAYPAL_CLIENT_SECRET"
         | "TWILIO_AUTH_TOKEN"
         | "GOOGLE_API_KEY"
+        | "CREDIT_CARD"
+        | "BTC_SEGWIT"
         | "URL"
         | "IPV4"
         | "IPV6" => "medium",
@@ -87,6 +89,10 @@ pub fn confidence_for(rule: &str) -> f64 {
         "URL" => 0.85,
         "IPV4" | "IPV6" => 0.90,
         "AWS_SECRET_KEY" | "AZURE_SAS_TOKEN" | "PAYPAL_CLIENT_SECRET" | "TWILIO_AUTH_TOKEN" => 0.75,
+        // Checksum-verified, but a card number in a dump may still be a test
+        // value, so do not claim the same certainty as a cloud credential.
+        "CREDIT_CARD" => 0.90,
+        "BTC_SEGWIT" => 0.90,
         _ => 0.95,
     }
 }
@@ -712,6 +718,24 @@ const RULES: &[Rule] = &[
         min_entropy: 0.0,
         require_digit: false,
     },
+    Rule {
+        group: "CRYPTO",
+        typ: "BTC_SEGWIT",
+        // bech32/bech32m addresses: `bc1` + data part (charset excludes 1, b, i, o)
+        pattern: r"(?i)\bbc1[023456789acdefghjklmnpqrstuvwxyz]{11,71}\b",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
+    // ---- FINANCE ----
+    Rule {
+        group: "FINANCE",
+        typ: "CREDIT_CARD",
+        // 13-19 digits, optionally grouped with spaces or dashes. A plain digit
+        // run of another length is not matched, so long ids/timestamps stay out.
+        pattern: r"\b(?:\d[ -]?){12,18}\d\b",
+        min_entropy: 0.0,
+        require_digit: false,
+    },
     // ---- MALWARE ----
     Rule {
         group: "MALWARE",
@@ -779,6 +803,22 @@ pub fn entropy_of(text: &str) -> f64 {
         .sum()
 }
 
+/// Rules whose validation is a checksum or issuer check.
+///
+/// When such a check fails the value is definitely not of that type, so
+/// classification moves on to the next rule instead of labelling it. Structural
+/// checks (JWT shape, signed URLs) are deliberately *not* listed: they also
+/// reject genuine secrets that were truncated in the dump, so they only lower
+/// the reported confidence.
+const CHECKSUM_RULES: &[&str] = &["BTC_ADDR", "BTC_SEGWIT", "CREDIT_CARD"];
+
+fn checksum_ok(rule: &str, value: &str) -> bool {
+    if !CHECKSUM_RULES.contains(&rule) {
+        return true;
+    }
+    validate_finding(rule, value) != ValidationResult::Invalid
+}
+
 /// Classify a single extracted string. Returns None if no rule matches.
 pub fn classify(text: &str) -> Option<Classification> {
     let e = entropy_of(text);
@@ -790,6 +830,9 @@ pub fn classify(text: &str) -> Option<Classification> {
         }
         if let Some(matched) = re.find(text) {
             if *name == "GENERIC_SECRET" && !generic_secret_plausible(matched.as_str()) {
+                continue;
+            }
+            if !checksum_ok(*name, matched.as_str()) {
                 continue;
             }
             // An `AIza...` key near a Google client domain is a public client key.
@@ -817,6 +860,11 @@ pub fn classify(text: &str) -> Option<Classification> {
                 continue;
             }
             if rule.require_digit && !text.bytes().any(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            // A checksum or issuer check that fails means this is not the
+            // type the pattern suggests: keep looking instead of labelling it.
+            if !checksum_ok(rule.typ, matched.as_str()) {
                 continue;
             }
             return Some(Classification {
@@ -1003,6 +1051,88 @@ pub fn validate_luhn(number: &str) -> ValidationResult {
     }
 }
 
+/// Validate a payment card number.
+///
+/// A random 16-digit string is not a card number: it must also carry a known
+/// issuer prefix. The check is therefore length + issuer + Luhn checksum.
+pub fn validate_credit_card(value: &str) -> ValidationResult {
+    let card_chars = value.chars().all(|c| c.is_ascii_digit() || c == ' ' || c == '-');
+    if value.is_empty() || !card_chars {
+        return ValidationResult::Invalid;
+    }
+    let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
+    if !(13..=19).contains(&digits.len()) {
+        return ValidationResult::Invalid;
+    }
+    if !card_issuer_prefix_ok(&digits) {
+        return ValidationResult::Invalid;
+    }
+    validate_luhn(&digits)
+}
+
+/// Known card issuer prefixes (IIN ranges).
+///
+/// Only used to separate real card numbers from arbitrary digit strings; the
+/// checksum does the rest.
+fn card_issuer_prefix_ok(digits: &str) -> bool {
+    let b = digits.as_bytes();
+    if b.len() < 2 {
+        return false;
+    }
+    let starts2 = |a: u8, c: u8| b.len() >= 2 && b[0] == a && b[1] == c;
+    let num = |from: usize, len: usize| -> Option<u32> {
+        if b.len() < from + len {
+            return None;
+        }
+        digits.get(from..from + len)?.parse::<u32>().ok()
+    };
+
+    // Visa
+    if b[0] == b'4' {
+        return true;
+    }
+    // Mastercard: 51-55 and 2221-2720
+    if matches!(num(0, 2), Some(51..=55)) {
+        return true;
+    }
+    if matches!(num(0, 4), Some(2221..=2720)) {
+        return true;
+    }
+    // American Express: 34, 37
+    if starts2(b'3', b'4') || starts2(b'3', b'7') {
+        return true;
+    }
+    // Discover: 6011 and 65
+    if num(0, 4) == Some(6011) || starts2(b'6', b'5') {
+        return true;
+    }
+    // Discover: 644-649
+    if matches!(num(0, 3), Some(644..=649)) {
+        return true;
+    }
+    // Discover: 622126-622925
+    if matches!(num(0, 6), Some(622126..=622925)) {
+        return true;
+    }
+    // JCB: 3528-3589
+    if matches!(num(0, 4), Some(3528..=3589)) {
+        return true;
+    }
+    // Diners Club: 300-305
+    if matches!(num(0, 3), Some(300..=305)) {
+        return true;
+    }
+    // Diners Club: 36 and 38
+    if starts2(b'3', b'6') || starts2(b'3', b'8') {
+        return true;
+    }
+    // UnionPay: 62
+    if starts2(b'6', b'2') {
+        return true;
+    }
+    false
+}
+
 /// Validate JWT structure (decode header/payload, basic checks)
 /// Returns ValidationResult::Valid if structure is valid and not expired (if exp present)
 pub fn validate_jwt(token: &str) -> ValidationResult {
@@ -1037,8 +1167,22 @@ pub fn validate_jwt(token: &str) -> ValidationResult {
         Err(_) => return ValidationResult::Invalid,
     };
 
-    // Check required header fields
-    if header.get("alg").is_none() || header.get("typ").is_none() {
+    // `alg` is mandatory (RFC 7519), `typ` is optional -- plenty of issuers
+    // omit it, so requiring it would reject real tokens.
+    let Some(alg) = header.get("alg").and_then(|v| v.as_str()) else {
+        return ValidationResult::Invalid;
+    };
+    if alg.is_empty() {
+        return ValidationResult::Invalid;
+    }
+
+    // The signature segment must be base64url. An empty signature is only
+    // allowed for the unsecured `alg: none`.
+    if parts[2].is_empty() {
+        if alg != "none" {
+            return ValidationResult::Invalid;
+        }
+    } else if URL_SAFE_NO_PAD.decode(parts[2]).is_err() {
         return ValidationResult::Invalid;
     }
 
@@ -1133,6 +1277,7 @@ fn validate_slack_token(value: &str) -> ValidationResult {
 pub fn validate_finding(rule: &str, value: &str) -> ValidationResult {
     match rule {
         "BTC_ADDR" => validate_base58check(value),
+        "BTC_SEGWIT" => validate_bech32(value),
         "ETH_ADDR" => ValidationResult::NotApplicable,
         "AWS_ACCESS_KEY" => validate_aws_key(value),
         "AZURE_SAS_TOKEN" => validate_azure_sas(value),
@@ -1148,8 +1293,8 @@ pub fn validate_finding(rule: &str, value: &str) -> ValidationResult {
         | "GITHUB_OAUTH_TOKEN"
         | "GITHUB_APP_TOKEN" => validate_github_token(value),
         "SLACK_BOT_TOKEN" | "SLACK_USER_TOKEN" | "SLACK_WEBHOOK" => validate_slack_token(value),
-        "JWT_TOKEN" => validate_jwt(value),
-        "CREDIT_CARD" => validate_luhn(value),
+        "JWT" | "JWT_TOKEN" => validate_jwt(value),
+        "CREDIT_CARD" => validate_credit_card(value),
         _ => ValidationResult::NotApplicable,
     }
 }
@@ -1677,6 +1822,122 @@ mod tests {
     }
 
     #[test]
+    fn validate_credit_card_checks_length_issuer_and_luhn() {
+        // Real test numbers: Visa, Mastercard, Amex.
+        assert_eq!(
+            validate_credit_card("4532015112830366"),
+            ValidationResult::Valid
+        );
+        assert_eq!(
+            validate_credit_card("4532 0151 1283 0366"),
+            ValidationResult::Valid
+        );
+        assert_eq!(
+            validate_credit_card("5555-5555-5555-4444"),
+            ValidationResult::Valid
+        );
+        assert_eq!(
+            validate_credit_card("378282246310005"),
+            ValidationResult::Valid
+        );
+        // Known issuer, broken checksum.
+        assert_eq!(
+            validate_credit_card("4532015112830367"),
+            ValidationResult::Invalid
+        );
+        // Valid checksum, but the prefix belongs to no known issuer.
+        assert_eq!(
+            validate_credit_card("1234567890123452"),
+            ValidationResult::Invalid
+        );
+        // Wrong length and non-digit content.
+        assert_eq!(
+            validate_credit_card("453201511283036"),
+            ValidationResult::Invalid
+        );
+        assert_eq!(
+            validate_credit_card("45320151128303661234"),
+            ValidationResult::Invalid
+        );
+        assert_eq!(
+            validate_credit_card("not-a-card-number"),
+            ValidationResult::Invalid
+        );
+    }
+
+    #[test]
+    fn credit_card_is_classified_when_checksum_and_issuer_match() {
+        let c = classify("4532015112830366").unwrap();
+        assert_eq!(c.group, "FINANCE");
+        assert_eq!(c.typ, "CREDIT_CARD");
+    }
+
+    #[test]
+    fn digit_runs_are_not_classified_as_cards() {
+        for (text, why) in [
+            ("4532015112830367", "Visa prefix, broken checksum"),
+            ("1234567890123452", "valid checksum, unknown issuer"),
+            ("453201511283036", "too short"),
+            ("202411091233445566", "timestamp-like, no issuer prefix"),
+        ] {
+            assert!(
+                classify(text).map_or(true, |c| c.typ != "CREDIT_CARD"),
+                "{text:?} ({why}) was classified as a credit card"
+            );
+        }
+    }
+
+    #[test]
+    fn segwit_address_is_classified_when_the_bech32_checksum_matches() {
+        let c = classify("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+        assert_eq!(c.group, "CRYPTO");
+        assert_eq!(c.typ, "BTC_SEGWIT");
+    }
+
+    #[test]
+    fn addresses_with_a_broken_checksum_are_not_classified_as_crypto() {
+        for (text, why) in [
+            ("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5", "broken bech32"),
+            ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb", "broken base58check"),
+        ] {
+            let c = classify(text);
+            assert!(
+                c.map_or(true, |c| c.typ != "BTC_SEGWIT" && c.typ != "BTC_ADDR"),
+                "{text:?} ({why}) was classified as a crypto address"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_jwt_requires_alg_but_not_typ() {
+        // `typ` is optional in RFC 7519, so this token is structurally fine.
+        assert_eq!(
+            validate_jwt("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln"),
+            ValidationResult::Valid
+        );
+        // `alg` is mandatory.
+        assert_eq!(
+            validate_jwt("eyJ0eXAiOiJKV1QifQ.eyJzdWIiOiIxIn0.c2ln"),
+            ValidationResult::Invalid
+        );
+        // An unsecured token (`alg: none`) may carry an empty signature.
+        assert_eq!(
+            validate_jwt("eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0."),
+            ValidationResult::Valid
+        );
+        // An empty signature is only allowed for `alg: none`.
+        assert_eq!(
+            validate_jwt("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0."),
+            ValidationResult::Invalid
+        );
+        // A signature that is not base64url is invalid.
+        assert_eq!(
+            validate_jwt("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.si!"),
+            ValidationResult::Invalid
+        );
+    }
+
+    #[test]
     fn validate_jwt_works() {
         let valid_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
         assert_eq!(validate_jwt(valid_jwt), ValidationResult::Valid);
@@ -1699,10 +1960,28 @@ mod tests {
             validate_finding("JWT_TOKEN", "invalid.token"),
             ValidationResult::Invalid
         );
-        // CREDIT_CARD routes to validate_luhn
+        // CREDIT_CARD routes to validate_credit_card (length + issuer + Luhn)
         assert_eq!(
             validate_finding("CREDIT_CARD", "4532015112830366"),
             ValidationResult::Valid
+        );
+        assert_eq!(
+            validate_finding("CREDIT_CARD", "4532015112830367"),
+            ValidationResult::Invalid
+        );
+        // BTC_SEGWIT routes to validate_bech32
+        assert_eq!(
+            validate_finding("BTC_SEGWIT", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
+            ValidationResult::Valid
+        );
+        assert_eq!(
+            validate_finding("BTC_SEGWIT", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5"),
+            ValidationResult::Invalid
+        );
+        // The classify() rule name for a JWT is "JWT"; both spellings work.
+        assert_eq!(
+            validate_finding("JWT", "invalid.token"),
+            ValidationResult::Invalid
         );
         // UNKNOWN_RULE routes to NotApplicable
         assert_eq!(

@@ -3099,7 +3099,7 @@ fn golden_detect_strict_keeps_valid_aws_key() {
 fn golden_detect_non_strict_keeps_invalid_jwt_with_lower_confidence() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.bin");
-    // JWT-shaped (3 base64url parts) but header lacks "typ" claim ->
+    // JWT-shaped (3 base64url parts) but the payload is not JSON ->
     // validate_jwt returns Invalid.
     std::fs::write(
         &path,

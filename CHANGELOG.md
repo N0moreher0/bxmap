@@ -6,6 +6,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `CREDIT_CARD` classification (new `FINANCE` group): a number is only
+  reported as a card when its length, issuer prefix and Luhn checksum all
+  match.
+- `BTC_SEGWIT` classification: bech32/bech32m addresses are recognised and
+  validated with the Bech32 checksum.
+- `validate_credit_card` is exported from the library root.
 - CI `fuzz` job runs every `cargo-fuzz` target for 30 s on each push/PR, as a
   panic/OOM gate for the parsers.
 - `LICENSING.md` explains which license covers which package; the stale
@@ -17,6 +23,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   set and offset order as the in-memory scanner across region boundaries, with
   ASCII/UTF-16LE/UTF-16BE runs that straddle, end on and start on a boundary,
   plus encoding filters and `max_strings` truncation parity.
+
+### Changed
+- String classification now checksums crypto and card values before labelling
+  them: a Bitcoin address with a broken Base58Check/Bech32 checksum, or a digit
+  run that is not a real card number, is no longer reported under that type.
+  Checksum failures do not delete evidence, they only change the label.
+- `validate_jwt` now requires the `alg` header (mandatory in RFC 7519) instead
+  of `typ` (optional), accepts an empty signature only for `alg: none`, and
+  rejects a signature that is not base64url.
 
 ### Fixed
 - `--vmss`/`.vmsn` tag walking no longer overflows on a hostile group table:

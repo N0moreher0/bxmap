@@ -369,6 +369,9 @@ The CLI adds:
   `--format` is given.
 - automatic scan reports and priority triage signals on `stderr`
 - IPv4/IPv6 and common crypto-wallet address hints
+- Payment card numbers are only labelled when the issuer prefix *and* the Luhn
+  checksum match; Bitcoin addresses need a valid Base58Check/Bech32 checksum.
+  A checksum failure means the value is not reported under that type at all.
 
 Results stay clean on `stdout`, so the CLI works both interactively and in
 shell pipelines. The priority signals are practical investigation hints for

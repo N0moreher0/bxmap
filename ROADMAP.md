@@ -147,7 +147,7 @@ Nguồn: review toàn repo + `cargo test --workspace --locked` (245 test pass), 
 - [x] `--entropy-no-data` / giới hạn kích thước `data_hex` để output không phình (`--entropy-no-data`, `--entropy-max-data`, mặc định 4096 byte kèm `data_truncated`).
 
 ### 4.3 IOC / secret
-- [ ] Validate để giảm false positive: checksum Base58Check/Bech32 (ví crypto), Luhn, cấu trúc JWT (decode header/payload), độ dài và prefix theo từng nhà cung cấp.
+- [x] Validate để giảm false positive: checksum Base58Check/Bech32 (ví crypto), Luhn, cấu trúc JWT (decode header/payload), độ dài và prefix theo từng nhà cung cấp. **Đã có (2026-11-10):** `validate_base58check` (BTC), `validate_bech32` (segwit), `validate_luhn`, `validate_credit_card` (mới: 13-19 số + prefix issuer + Luhn), `validate_jwt` (bắt buộc `alg`, `typ` tuỳ chọn, signature phải base64url, kiểm tra `exp`), và prefix+độ dài cho AWS/GitHub/Slack/Azure. `classify()` giờ **bỏ nhãn** khi checksum sai (rule có kiểm tra cấu trúc như JWT/SAS chỉ hạ `confidence` trong `--detect`, không xoá bằng chứng). Thêm rule `CREDIT_CARD` (nhóm `FINANCE`) và `BTC_SEGWIT` + 8 test hồi quy.
 - [x] Output detector giữ cả `text` gốc, `match` và vài byte ngữ cảnh (không chỉ thay bằng token).
 - [ ] Dùng `RegexSet` / aho-corasick làm prefilter để 30+ pattern không làm chậm quét.
 - [ ] Cho phép chọn nhiều loại: `--detect ip,url,secret`.
