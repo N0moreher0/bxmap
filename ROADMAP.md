@@ -106,6 +106,7 @@ Nguồn: review toàn repo + `cargo test --workspace --locked` (245 test pass), 
 - README: mục MSRV ghi đúng 3 mốc (1.80 khai báo / 1.85 build theo lock / 1.95 full) thay cho "Rust 1.70".
 - `fuzz/`: thêm CI job `fuzz` (7 target × 30 s) và ignore `fuzz/corpus/`, `fuzz/target/`; cập nhật `fuzz/Cargo.lock` theo `bxmap` 1.0.7. Lần chạy đầu **bắt được một panic thật**: `src/vmware.rs` cộng `pos + 2` / `pos + 8` trên `tags_offset` do input khai (`u64::MAX`) → tràn số. Đã sửa bằng `checked_add` + 2 test hồi quy; job upload `fuzz/artifacts/` khi fail để tải được input gây lỗi.
 - CI #158 (HEAD `82301ae`) xanh toàn bộ job, gồm `cargo audit`, `cargo deny` và cả hai job MSRV → các nghi vấn 2.6.3 đã chốt.
+- **Bug thật phát hiện khi dựng corpus hồi quy (2026-11-10):** nhánh UTF-8 và nhánh Shift-JIS cùng tăng chỉ số quét chung (`k`), nên nhánh Shift-JIS ăn mất 1 byte của chuỗi UTF-8 → chuỗi UTF-8 có ký tự CJK bị cắt đôi (chỉ còn phần ASCII phía sau). Đã sửa: gom các byte bị "nhảy" vào `extra_skip` và áp dụng một lần (`max`) cuối vòng lặp. Test hồi quy `utf8_run_with_cjk_characters_is_not_cut`.
 
 **Xong khi:** CI `main` xanh toàn bộ job bắt buộc, và có test hồi quy cho từng lỗi 2.6.1 / 2.6.2 (trừ mục đã hoãn).
 

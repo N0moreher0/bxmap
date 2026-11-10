@@ -50,6 +50,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rejects a signature that is not base64url.
 
 ### Fixed
+- UTF-8 strings containing CJK characters are no longer cut at the first
+  multi-byte character. The UTF-8 and Shift-JIS branches both advanced the
+  shared scan index, so the Shift-JIS branch consumed a byte of the UTF-8
+  sequence and the run was flushed half way through. Found while building the
+  synthetic regression corpus.
 - `--vmss`/`.vmsn` tag walking no longer overflows on a hostile group table:
   a `tags_offset` of `u64::MAX` made `pos + 2` (and `pos + 8`) abort the
   process with overflow checks on. Both bounds checks now use `checked_add`.

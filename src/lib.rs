@@ -1272,6 +1272,14 @@ impl<'a> StringRunScanner<'a> {
             let g = global_base + k as u64;
             let b = buffer[i];
             let printable_b = is_printable(b); // shared by both branches below, avoids looking up the table twice for the same byte
+            // Bytes consumed by a multi-byte sequence in one of the variable
+            // length encodings. UTF-8 and Shift-JIS can both claim the same
+            // byte (a UTF-8 lead byte is often a valid Shift-JIS lead byte
+            // too), so the skips are collected here and applied once at the
+            // end of the iteration. Applying them separately let one branch
+            // eat a byte the other still needed, which cut UTF-8 runs in the
+            // middle at the first CJK character.
+            let mut extra_skip = 0usize;
 
             // -- ASCII: only needs the current byte itself, no lookahead --
             if self.encodings.ascii {
@@ -1482,7 +1490,7 @@ impl<'a> StringRunScanner<'a> {
                                 self.flush_utf8();
                             }
                             // Skip the continuation bytes since we consumed them
-                            k += expected_len - 1;
+                            extra_skip = extra_skip.max(expected_len - 1);
                         } else {
                             self.flush_utf8();
                         }
@@ -1529,7 +1537,7 @@ impl<'a> StringRunScanner<'a> {
                         if self.shift_jis_buf.len() >= MAX_RUN_CHARS {
                             self.flush_shift_jis();
                         }
-                        k += 1; // Skip trail byte
+                        extra_skip = extra_skip.max(1); // Skip trail byte
                     } else if is_printable(b) {
                         // Single-byte ASCII-compatible
                         if self.shift_jis_start < 0 {
@@ -1553,7 +1561,7 @@ impl<'a> StringRunScanner<'a> {
                 self.shift_jis_buf.clear();
             }
 
-            k += 1;
+            k += 1 + extra_skip;
         }
         // Emit any pending results that are now far enough behind the current position.
         let current_pos = global_base + process_count as u64;
@@ -3081,6 +3089,22 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_run_with_cjk_characters_is_not_cut() {
+        // The UTF-8 lead byte of a CJK character is also a valid Shift-JIS
+        // lead byte. Both branches used to advance the shared scan index, so
+        // the Shift-JIS branch ate one byte of the UTF-8 sequence and the
+        // run was cut in the middle at the first CJK character.
+        let mut data = b"\x00".to_vec();
+        data.extend_from_slice("中caféabc".as_bytes());
+        data.push(0);
+        let out = extract_strings_with_encodings(&data, 4, 100_000, EncodingFilter::all());
+        assert!(
+            out.iter().any(|s| s.encoding == "utf8" && s.text == "中caféabc"),
+            "{out:?}"
+        );
+    }
 
     #[test]
     fn version_matches_package_metadata() {
