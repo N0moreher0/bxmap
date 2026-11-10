@@ -435,7 +435,7 @@ fn is_public_client_key_context(text: &str, start: usize, end: usize) -> bool {
 /// of the generic-secret results.
 fn looks_like_date_or_time(value: &str) -> bool {
     let b = value.as_bytes();
-    let digits = |range: std::ops::Range<usize>| range.all(|i| b[i].is_ascii_digit());
+    let digits = |mut range: std::ops::Range<usize>| range.all(|i| b[i].is_ascii_digit());
     // HH:MM:SS
     if b.len() >= 8 && digits(0..2) && b[2] == b':' && digits(3..5) && b[5] == b':' && digits(6..8)
     {
