@@ -826,7 +826,10 @@ const RULE_ANCHORS: &[(&str, &[&str])] = &[
     ("EMAIL", &["@"]),
     ("ETH_ADDR", &["0x"]),
     ("BTC_SEGWIT", &["bc1"]),
-    ("SUSPICIOUS_PATH", &["\\temp", "\\appdata", "\\startup", "\\public"]),
+    (
+        "SUSPICIOUS_PATH",
+        &["\\temp", "\\appdata", "\\startup", "\\public"],
+    ),
     ("MUTEX", &["global"]),
     ("C2", &["c2", "gate.php", "/panel/", "/admin/"]),
 ];
@@ -834,10 +837,10 @@ const RULE_ANCHORS: &[(&str, &[&str])] = &[
 /// Minimum byte length of any possible match, per rule (derived from the
 /// regex). Lets us skip rules that cannot match a short string.
 const RULE_MIN_LEN: &[(&str, usize)] = &[
-    ("BTC_ADDR", 26),      // '1'/'3' + 25..34 base58 characters
-    ("XMR_ADDR", 95),      // '4' + 1 + 93 base58 characters
-    ("CREDIT_CARD", 13),   // 13 digits
-    ("BASE64", 16),        // 4 groups of 4
+    ("BTC_ADDR", 26),    // '1'/'3' + 25..34 base58 characters
+    ("XMR_ADDR", 95),    // '4' + 1 + 93 base58 characters
+    ("CREDIT_CARD", 13), // 13 digits
+    ("BASE64", 16),      // 4 groups of 4
 ];
 
 /// Prefilter for the `RULES` table, same idea as [`SecretPrefilter`] but for
@@ -1716,13 +1719,13 @@ mod tests {
     fn every_rule_anchor_entry_points_at_a_real_rule() {
         for (name, _) in RULE_ANCHORS {
             assert!(
-                RULES.iter().any(|r| name == r.typ),
+                RULES.iter().any(|r| *name == r.typ),
                 "stale anchor entry {name}"
             );
         }
         for (name, _) in RULE_MIN_LEN {
             assert!(
-                RULES.iter().any(|r| name == r.typ),
+                RULES.iter().any(|r| *name == r.typ),
                 "stale length gate {name}"
             );
         }
