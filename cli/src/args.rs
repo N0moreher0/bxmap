@@ -903,8 +903,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Args, String> {
-        parse_args_from(args.iter().map(|s| s.to_string()).collect())
-            .map(|(args, _)| args)
+        parse_args_from(args.iter().map(|s| s.to_string()).collect()).map(|(args, _)| args)
     }
 
     #[test]

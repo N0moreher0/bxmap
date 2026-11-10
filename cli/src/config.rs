@@ -27,8 +27,7 @@
 //! ```
 
 use crate::args::{
-    parse_detect_format, parse_detector, parse_encoding_spec, parse_format, parse_report_mode,
-    Args,
+    parse_detect_format, parse_detector, parse_encoding_spec, parse_format, parse_report_mode, Args,
 };
 use crate::helpers::ExplicitFlags;
 use bxmap::artifacts::ArtifactKinds;
@@ -222,10 +221,7 @@ pub fn apply_config(
     Ok(())
 }
 
-fn get_int(
-    table: &toml::map::Map<String, toml::Value>,
-    key: &str,
-) -> Result<Option<i64>, String> {
+fn get_int(table: &toml::map::Map<String, toml::Value>, key: &str) -> Result<Option<i64>, String> {
     match table.get(key) {
         None => Ok(None),
         Some(value) => value
