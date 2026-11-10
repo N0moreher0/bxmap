@@ -31,11 +31,7 @@ fn every_planted_string_is_found_at_its_offset() {
     // produces decoded noise in other encodings.
     let nearby: Vec<&bxmap::ExtractedString> = found
         .iter()
-        .filter(|s| {
-            missing
-                .iter()
-                .any(|m| s.offset.abs_diff(m.offset) < 64)
-        })
+        .filter(|s| missing.iter().any(|m| s.offset.abs_diff(m.offset) < 64))
         .collect();
     assert!(
         missing.is_empty(),
