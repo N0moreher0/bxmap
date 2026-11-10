@@ -871,9 +871,18 @@ Step 4: Run Volatility on same dump to enumerate processes, modules, network con
 
 ## Minimum supported Rust version
 
-Rust 1.70.
+- Declared in the manifests: `bxmap` **1.80**, `bxmap-cli` **1.85**
+  (`rust-version`).
+- Practical minimum when building this workspace with the checked-in
+  `Cargo.lock`: **1.85** — older Cargo cannot parse the `edition2024`
+  manifests the lock resolves to. The `msrv` CI job checks this.
+- Default build (pulls `yara-x`): **1.95** — yara-x 1.23 declares
+  `rust-version = "1.95"`. Checked by the `msrv-full` CI job.
 
 ## License
+
+This repository contains two packages with different licenses — see
+[LICENSING.md](LICENSING.md) for the summary.
 
 The `bxmap` library is dual-licensed under either of
 

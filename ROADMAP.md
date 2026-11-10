@@ -40,7 +40,7 @@ Chi phí thấp, hiệu quả cao nhất. Làm trước khi thêm tính năng.
 Dump đến từ máy nhiễm mã độc, parser phải chịu được input thù địch.
 
 ### 2.1 Fuzzing và hardening
-- [ ] `cargo-fuzz` cho: parser minidump, parser `.vmss` (VmwareState), reader chunk/overlap, magic-byte scanner, entropy scanner, artifact collector, **validator carve** (tất cả 10 validators). (chưa có trong repo: `git ls-files` không có `fuzz/`, chưa có CI fuzz-smoke job)
+- [x] `cargo-fuzz` cho: parser minidump, parser `.vmss` (VmwareState), reader chunk/overlap, magic-byte scanner, entropy scanner, artifact collector, **validator carve** (tất cả 10 validators). **Đã có 7 target** trong `fuzz/fuzz_targets/`: `minidump_parse`, `vmware_parse`, `string_scanner` (chunk/overlap + mọi encoding), `magic_scan`, `entropy_scan`, `classifier_detect` (detector + vỏ mã hoá), `carve_scan` (mọi validator qua `scan_from_reader`; fix `9d6fd53`). **CI job `fuzz` (2026-11-10)** chạy mỗi target 30 s trên push/PR — smoke gate cho panic/OOM, không phải campaign coverage (chạy dài vẫn ở local).
 - [x] **Giới hạn cấp phát (anti-OOM)**: mọi validator carve giờ kiểm tra header-declared size chống đỡ OOM (JPEG segment, PNG chunk, ZIP packed, RAR4/5 data, GZIP extra/name/comment, PDF search window). Header khai báo size quá lớn → reject sớm thay vì skip/alloc.
 - [x] Chạy `clippy -D warnings`, `cargo audit`, `cargo deny` trong CI.
 
@@ -83,14 +83,14 @@ Nguồn: review toàn repo + `cargo test --workspace --locked` (245 test pass), 
 - [x] `minidump.rs`: `region_for_va` dùng `partition_point` nhưng `regions` chưa sắp xếp (`ranges` thì có) → dump không theo thứ tự sẽ tra sai. Sắp xếp theo `base` sau khi parse.
 - [x] `minidump.rs`: `offset_to_va` cộng `start + delta` không kiểm tra tràn → panic ở bản debug với dump giả mạo. Dùng `checked_add`.
 - [x] `.gitignore`: dòng `benches/` gây hiểu nhầm (`benches/extract.rs` đang được track, file mới trong thư mục sẽ bị bỏ qua). Bỏ dòng này.
-- [~] `deny.toml`: còn khóa cũ `vulnerability`, `notice` (cargo-deny bản mới đã gỡ) — nghi là nguyên nhân job `cargo deny` đỏ. **Chưa xác nhận bằng log.**
-- [ ] `carve_7z` chỉ kiểm tra độ dài, **không kiểm tra CRC** `StartHeaderCRC` → có thể báo `Valid` cho dữ liệu rác có đúng magic. (Hoãn: cần xem lại fixture test 7z.)
+- [x] `deny.toml`: còn khóa cũ `vulnerability`, `notice` (cargo-deny bản mới đã gỡ) — nghi là nguyên nhân job `cargo deny` đỏ. **Đã xác nhận:** bỏ 2 khóa đó, job `cargo deny` xanh trong CI #158.
+- [x] `carve_7z` chỉ kiểm tra độ dài, **không kiểm tra CRC** `StartHeaderCRC` → có thể báo `Valid` cho dữ liệu rác có đúng magic. **Đã sửa (2026-11-10):** `carve_7z` tính `crc32` trên 20 byte `NextHeaderOffset|NextHeaderSize|NextHeaderCRC` và so với `StartHeaderCRC`; lệch → `Verdict::Invalid` (không carve). Thêm 2 test: 7z dựng tay có CRC đúng được carve `complete`, CRC sai bị `rejected`.
 
 ### 2.6.3 Nghi vấn — cần log CI để chốt
-- [ ] Job `msrv (lite)` (1.70) và `msrv (full)` (1.80) đều đỏ, fail sau ~15 giây. `Cargo.toml` khai `rust-version = "1.70"` nhưng comment trong file nói rayon 1.12 cần ≥ 1.80 và `Cargo.lock` đang ghim rayon 1.12.0 → khai báo MSRV có thể sai; bản full (yara-x 1.23) có thể cần Rust mới hơn 1.80.
-- [ ] Job `cargo audit` đỏ (chưa rõ advisory nào) và `semver-checks` (optional) đỏ.
-- [ ] Làm rõ giấy phép: thư mục gốc có `LICENSE` là AGPL-3.0 trong khi crate lõi khai `MIT OR Apache-2.0` (CLI mới là AGPL) — nên chuyển bản AGPL về `cli/` hoặc ghi chú rõ trong README.
-- [ ] Hai commit mới nhất trên local (`d0d6fe7`, `034a1b5`) chưa thấy run CI trên GitHub — kiểm tra đã push chưa.
+- [x] Job `msrv (lite)` (1.70) và `msrv (full)` (1.80) đều đỏ, fail sau ~15 giây. `Cargo.toml` khai `rust-version = "1.70"` nhưng comment trong file nói rayon 1.12 cần ≥ 1.80 và `Cargo.lock` đang ghim rayon 1.12.0 → khai báo MSRV có thể sai; bản full (yara-x 1.23) có thể cần Rust mới hơn 1.80. **Đã xử lý:** job `msrv` ghim 1.85 (Cargo đầu tiên đọc được manifest `edition2024` trong lock), `msrv-full` ghim 1.95 (yara-x 1.23); `rust-version` khai 1.80 (lib) / 1.85 (CLI) và README ghi rõ 3 mốc. CI run #158 xanh.
+- [x] Job `cargo audit` đỏ (chưa rõ advisory nào) và `semver-checks` (optional) đỏ. **Đã xử lý:** `cargo audit` xanh trong CI #158; `semver-checks` để `continue-on-error` (rustdoc của yara-x 1.23 lỗi upstream), không chặn workflow.
+- [x] Làm rõ giấy phép: thư mục gốc có `LICENSE` là AGPL-3.0 trong khi crate lõi khai `MIT OR Apache-2.0` (CLI mới là AGPL) — nên chuyển bản AGPL về `cli/` hoặc ghi chú rõ trong README. **Đã sửa (2026-11-10):** xóa `LICENSE` AGPL ở gốc (bản AGPL duy nhất còn ở `cli/LICENSE-AGPL`, nội dung tương đương); thêm [`LICENSING.md`](./LICENSING.md) tóm tắt license từng package; README link sang file đó.
+- [x] Hai commit mới nhất trên local (`d0d6fe7`, `034a1b5`) chưa thấy run CI trên GitHub — kiểm tra đã push chưa. **Đã xử lý:** đã push, CI chạy đủ trên `main`.
 
 ### 2.6.4 Kết quả sửa (2026-11-09)
 - `cli/src/helpers.rs`: thay khối `if let Err(e) ... return Err(e)` bằng `?` → `clippy -D warnings` sạch cả 2 crate.
@@ -98,7 +98,14 @@ Nguồn: review toàn repo + `cargo test --workspace --locked` (245 test pass), 
 - `src/minidump.rs`: sắp xếp `regions` theo `base`; `va_to_offset`/`offset_to_va` dùng `checked_add`. Thêm 2 test hồi quy (region ghi ngược thứ tự, range giả mạo gần `u64::MAX`).
 - `.gitignore`: bỏ dòng `benches/`. `deny.toml`: bỏ khóa `vulnerability`, `notice` (`[~]` vì máy local không có `cargo-deny`, chờ CI xác nhận).
 - Kiểm tra sau khi sửa: `cargo test --workspace --locked` **251 test pass** (lib 116, smoke 2, CLI unit 29, golden 103, doctest 1), `clippy -D warnings` sạch root + cli, `cargo fmt --check` sạch, `--no-default-features --lib` 110 test pass.
-- **Còn mở:** 2.6.2 `carve_7z` kiểm tra CRC (hoãn), toàn bộ 2.6.3 (MSRV, audit, semver, giấy phép, push commit) — cần log CI/`GITHUB_TOKEN` hoặc quyết định của chủ repo. Chưa push, nên CI GitHub chưa chạy lại trên bản sửa.
+- **Còn mở (2026-11-09):** 2.6.2 `carve_7z` kiểm tra CRC (hoãn), toàn bộ 2.6.3 (MSRV, audit, semver, giấy phép, push commit) — cần log CI/`GITHUB_TOKEN` hoặc quyết định của chủ repo. Chưa push, nên CI GitHub chưa chạy lại trên bản sửa.
+
+### 2.6.5 Đóng các mục còn mở (2026-11-10)
+- `carve_7z`: xác thực `StartHeaderCRC` trên 20 byte start header + 2 test (đúng CRC → carve, sai CRC → reject).
+- `LICENSE` gốc (AGPL) đã xóa; license từng package nằm ở `LICENSE-MIT` + `LICENSE-APACHE` (lib) và `cli/LICENSE-AGPL` (CLI), tóm tắt trong `LICENSING.md`.
+- README: mục MSRV ghi đúng 3 mốc (1.80 khai báo / 1.85 build theo lock / 1.95 full) thay cho "Rust 1.70".
+- `fuzz/`: thêm CI job `fuzz` (7 target × 30 s) và ignore `fuzz/corpus/`, `fuzz/target/`; cập nhật `fuzz/Cargo.lock` theo `bxmap` 1.0.7.
+- CI #158 (HEAD `82301ae`) xanh toàn bộ job, gồm `cargo audit`, `cargo deny` và cả hai job MSRV → các nghi vấn 2.6.3 đã chốt.
 
 **Xong khi:** CI `main` xanh toàn bộ job bắt buộc, và có test hồi quy cho từng lỗi 2.6.1 / 2.6.2 (trừ mục đã hoãn).
 

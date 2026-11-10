@@ -6,11 +6,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- CI `fuzz` job runs every `cargo-fuzz` target for 30 s on each push/PR, as a
+  panic/OOM gate for the parsers.
+- `LICENSING.md` explains which license covers which package; the stale
+  AGPL-3.0 `LICENSE` at the repo root is gone so GitHub no longer reports the
+  MIT/Apache library as AGPL. The CLI's AGPL text stays at
+  `cli/LICENSE-AGPL`.
 - Regression test `parallel_matches_sequential_on_multi_region_data`: the
   buffered and streaming parallel scans (1/2/4 threads) must produce the same
   set and offset order as the in-memory scanner across region boundaries, with
   ASCII/UTF-16LE/UTF-16BE runs that straddle, end on and start on a boundary,
   plus encoding filters and `max_strings` truncation parity.
+
+### Fixed
+- `--carve 7z` now verifies `StartHeaderCRC` over the start header before
+  trusting the declared sizes, so random data with the 7-Zip signature is
+  rejected instead of reported as a complete archive.
+- README MSRV section matches the real minimums (1.80 declared, 1.85 with the
+  locked workspace, 1.95 for the default yara-x build) instead of "Rust 1.70".
 
 ## [1.0.18] - 2026-11-10
 
