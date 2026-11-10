@@ -832,7 +832,7 @@ pub fn classify(text: &str) -> Option<Classification> {
             if *name == "GENERIC_SECRET" && !generic_secret_plausible(matched.as_str()) {
                 continue;
             }
-            if !checksum_ok(*name, matched.as_str()) {
+            if !checksum_ok(name, matched.as_str()) {
                 continue;
             }
             // An `AIza...` key near a Google client domain is a public client key.
@@ -1056,7 +1056,9 @@ pub fn validate_luhn(number: &str) -> ValidationResult {
 /// A random 16-digit string is not a card number: it must also carry a known
 /// issuer prefix. The check is therefore length + issuer + Luhn checksum.
 pub fn validate_credit_card(value: &str) -> ValidationResult {
-    let card_chars = value.chars().all(|c| c.is_ascii_digit() || c == ' ' || c == '-');
+    let card_chars = value
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == ' ' || c == '-');
     if value.is_empty() || !card_chars {
         return ValidationResult::Invalid;
     }
@@ -1897,7 +1899,10 @@ mod tests {
     #[test]
     fn addresses_with_a_broken_checksum_are_not_classified_as_crypto() {
         for (text, why) in [
-            ("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5", "broken bech32"),
+            (
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5",
+                "broken bech32",
+            ),
             ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb", "broken base58check"),
         ] {
             let c = classify(text);
