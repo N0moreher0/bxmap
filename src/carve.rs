@@ -1254,30 +1254,36 @@ fn max_signature_len() -> usize {
 const ZIP_EOCD: &[u8] = b"PK\x05\x06";
 /// PDF end-of-file marker.
 const PDF_EOF: &[u8] = b"%%EOF";
+/// PNG IEND chunk: zero length, tag and its fixed CRC. 12 fixed bytes do not
+/// turn up by chance, so unlike a bare `FF D9` this is a usable footer.
+const PNG_IEND: &[u8] = b"\x00\x00\x00\x00IEND\xaeB`\x82";
+/// How far back from an IEND the PNG tail salvage reads at most.
+const PNG_SALVAGE_WINDOW: u64 = 64 * 1024 * 1024;
 /// Longest footer minus one: chunk overlap so a footer split across two
 /// chunks is still seen once.
-const FOOTER_OVERLAP: usize = 4;
+const FOOTER_OVERLAP: usize = 11;
 
 /// Footers the salvage pass understands. Only formats whose footer is long or
 /// can be checked structurally are listed: a bare JPEG `FF D9` or an MP4
-/// `moov` would flood the pass with false positives, and PNG/JPEG bodies are
-/// compressed already, so an entropy boundary says nothing about them.
+/// `moov` would flood the pass with false positives, and JPEG bodies are
+/// compressed already, so an entropy boundary says nothing about them. PNG is
+/// walked back chunk by chunk (CRC-verified) instead of by entropy.
 fn has_footer(kind: CarveKind) -> bool {
-    matches!(kind, CarveKind::Zip | CarveKind::Pdf)
+    matches!(kind, CarveKind::Zip | CarveKind::Pdf | CarveKind::Png)
 }
 
 struct FooterMatcher {
     aho: AhoCorasick,
-    kinds: [CarveKind; 2],
+    kinds: [CarveKind; 3],
 }
 
 fn footer_matcher() -> &'static FooterMatcher {
     static MATCHER: OnceLock<FooterMatcher> = OnceLock::new();
     MATCHER.get_or_init(|| FooterMatcher {
         aho: AhoCorasickBuilder::new()
-            .build([ZIP_EOCD, PDF_EOF])
+            .build([ZIP_EOCD, PDF_EOF, PNG_IEND])
             .expect("footer patterns are valid"),
-        kinds: [CarveKind::Zip, CarveKind::Pdf],
+        kinds: [CarveKind::Zip, CarveKind::Pdf, CarveKind::Png],
     })
 }
 
@@ -1394,6 +1400,7 @@ fn salvage_tail(
     match kind {
         CarveKind::Zip => salvage_zip_tail(file, position, file_len, max_size, prior_end),
         CarveKind::Pdf => salvage_pdf_tail(file, position, file_len, max_size, prior_end),
+        CarveKind::Png => salvage_png_tail(file, position, file_len, max_size, prior_end),
         _ => Ok(None),
     }
 }
@@ -1483,6 +1490,84 @@ fn salvage_pdf_tail(
             "salvage:tail: PDF trailer ending at {position:#x} (startxref + EOF); header and body are missing"
         ),
     }))
+}
+
+/// PNG: the head (signature + IHDR + first IDATs) is gone but the IEND chunk
+/// survived. Walk back from it over IDAT chunks whose length and CRC check out
+/// and keep that run. The result has no signature/IHDR, so it is evidence of
+/// the compressed pixel data rather than a viewable image.
+fn salvage_png_tail(
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+    prior_end: u64,
+) -> io::Result<Option<SalvageTail>> {
+    let end = position + PNG_IEND.len() as u64;
+    if end > file_len {
+        return Ok(None);
+    }
+    let lower = prior_end
+        .max(end.saturating_sub(max_size))
+        .max(end.saturating_sub(PNG_SALVAGE_WINDOW));
+    if position <= lower {
+        return Ok(None);
+    }
+    let Some(buffer) = salvage_read(file, lower, (position - lower) as usize, file_len)? else {
+        return Ok(None);
+    };
+    let mut boundary = buffer.len();
+    let mut chunks = 0usize;
+    while let Some(start) = png_previous_idat(&buffer, boundary) {
+        boundary = start;
+        chunks += 1;
+    }
+    if chunks == 0 {
+        return Ok(None);
+    }
+    let start = lower + boundary as u64;
+    let spike = salvage_spike_before(file, start, prior_end, file_len)?;
+    Ok(Some(SalvageTail {
+        start,
+        end,
+        spike,
+        note: format!(
+            "salvage:tail: PNG IDAT run ({chunks} chunk(s)) + IEND at {position:#x}; signature and IHDR are missing"
+        ),
+    }))
+}
+
+/// The IDAT chunk that ends exactly at `boundary` in `buffer`, as the index
+/// of its length field, when its length and CRC verify.
+fn png_previous_idat(buffer: &[u8], boundary: usize) -> Option<usize> {
+    // Smallest chunk: length(4) + tag(4) + crc(4); the tag then sits at
+    // `boundary - 8`. A chunk needs 4 bytes before its tag for the length.
+    let newest_tag = boundary.checked_sub(8)?;
+    for tag in (4..=newest_tag).rev() {
+        if &buffer[tag..tag + 4] != b"IDAT" {
+            continue;
+        }
+        let length = u32::from_be_bytes([
+            buffer[tag - 4],
+            buffer[tag - 3],
+            buffer[tag - 2],
+            buffer[tag - 1],
+        ]) as usize;
+        if tag + 4 + length + 4 != boundary {
+            continue;
+        }
+        let crc = crc32(0xffff_ffff, &buffer[tag..tag + 4 + length]) ^ 0xffff_ffff;
+        let stored = u32::from_be_bytes([
+            buffer[boundary - 4],
+            buffer[boundary - 3],
+            buffer[boundary - 2],
+            buffer[boundary - 1],
+        ]);
+        if crc == stored {
+            return Some(tag - 4);
+        }
+    }
+    None
 }
 
 /// Adjust a raw needle match to the candidate's true start. TAR has no
@@ -1614,6 +1699,15 @@ impl<'a> Source<'a> {
         self.fill(want)?;
         let end = (self.at + want).min(self.len);
         Ok(&self.buf[self.at..end])
+    }
+
+    /// Move back (or forward) to an absolute offset inside `[origin, end]`,
+    /// dropping the lookahead window. Used to end a salvaged file at the last
+    /// byte that validated.
+    fn rewind_to(&mut self, abs: u64) {
+        self.base = abs.clamp(self.origin, self.end);
+        self.len = 0;
+        self.at = 0;
     }
 
     /// Move forward without reading the skipped bytes.
@@ -1852,6 +1946,8 @@ fn carve_png(source: &mut Source<'_>) -> io::Result<Verdict> {
     source.skip(8)?;
     let mut chunks = 0usize;
     loop {
+        // Start of this chunk: where a salvaged file ends if the chunk is bad.
+        let chunk_start = source.abs();
         let Some(header) = peek_array::<8>(source)? else {
             return Ok(Verdict::Truncated(
                 "dump ended before the PNG IEND chunk".to_string(),
@@ -1862,6 +1958,13 @@ fn carve_png(source: &mut Source<'_>) -> io::Result<Verdict> {
         ]));
         let kind = [header[4], header[5], header[6], header[7]];
         if length > MAX_PNG_CHUNK {
+            // After at least one good chunk (IHDR), a garbage length means the
+            // rest was overwritten: keep the intact chunks instead of dropping all.
+            if chunks > 0 {
+                return Ok(Verdict::Truncated(format!(
+                    "PNG damaged at {chunk_start:#x}: implausible chunk length {length}; kept {chunks} valid chunk(s)"
+                )));
+            }
             return Ok(Verdict::Invalid(format!(
                 "implausible PNG chunk length {length}"
             )));
@@ -1898,6 +2001,15 @@ fn carve_png(source: &mut Source<'_>) -> io::Result<Verdict> {
         let expected = u32::from_be_bytes(crc_bytes);
         let actual = crc ^ 0xffff_ffff;
         if actual != expected {
+            // Partial encryption / overwrite: keep every chunk that verified
+            // (header + earlier IDAT) and cut right before the damaged one.
+            if chunks > 0 {
+                source.rewind_to(chunk_start);
+                return Ok(Verdict::Truncated(format!(
+                    "PNG {} chunk CRC mismatch at {chunk_start:#x}; kept {chunks} valid chunk(s)",
+                    chunk_name(&kind)
+                )));
+            }
             return Ok(Verdict::Invalid(format!(
                 "PNG {} chunk CRC mismatch",
                 chunk_name(&kind)
@@ -4805,10 +4917,11 @@ mod tests {
     }
 
     #[test]
-    fn png_with_bad_crc_is_rejected() {
+    fn png_with_bad_ihdr_crc_is_rejected() {
         let mut png = png_bytes(b"payload");
-        // Corrupt one byte of the IDAT data without touching the CRC.
-        let position = png.len() - 20;
+        // Corrupt one byte of the IHDR data without touching the CRC: no chunk
+        // verified yet, so there is nothing to salvage.
+        let position = 8 + 8 + 2;
         png[position] ^= 0xFF;
         let mut dump = vec![0u8; 32];
         dump.extend_from_slice(&png);
@@ -4824,6 +4937,110 @@ mod tests {
 
         assert!(report.files.is_empty(), "{report:?}");
         assert_eq!(report.rejected, 1);
+    }
+
+    #[test]
+    fn png_with_bad_idat_crc_keeps_the_valid_chunks() {
+        // IHDR + 3 IDAT chunks + IEND; the middle IDAT is overwritten (as partial
+        // encryption would) without fixing its CRC.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(data);
+            let mut crc = crc32(0xffff_ffff, kind);
+            crc = crc32(crc, data) ^ 0xffff_ffff;
+            png.extend_from_slice(&crc.to_be_bytes());
+        };
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(b"IHDR", &ihdr);
+        chunk(b"IDAT", &[1u8; 40]);
+        chunk(b"IDAT", &[2u8; 40]);
+        chunk(b"IDAT", &[3u8; 40]);
+        chunk(b"IEND", &[]);
+        // 8 signature + IHDR(25) + first IDAT(52) = start of the second IDAT.
+        let good_len = 8 + 25 + 52;
+        let damaged = good_len + 8 + 5;
+        png[damaged] ^= 0xFF;
+        let mut dump = vec![0u8; 32];
+        dump.extend_from_slice(&png);
+        let path = write_dump("bad-idat-salvage", &dump);
+
+        let report = Carver::new(CarveOptions {
+            kinds: vec![CarveKind::Png],
+            min_size: 1,
+            ..Default::default()
+        })
+        .scan(path.to_str().unwrap())
+        .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert!(!file.complete);
+        assert_eq!(file.size, good_len as u64);
+        assert_eq!(file.corrupted_offset, Some(32 + good_len as u64));
+        assert!(file.notes.contains("CRC mismatch"), "{}", file.notes);
+        assert_eq!(report.rejected, 0);
+    }
+
+    #[test]
+    fn salvage_recovers_the_idat_run_of_a_png_whose_head_is_gone() {
+        // IHDR + 4 IDAT + IEND; the signature, IHDR and first IDAT are overwritten
+        // (head encryption), so header-first finds nothing. Footer-first walks
+        // back from IEND over the 3 IDAT chunks whose CRC still verifies.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(data);
+            let mut crc = crc32(0xffff_ffff, kind);
+            crc = crc32(crc, data) ^ 0xffff_ffff;
+            png.extend_from_slice(&crc.to_be_bytes());
+        };
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(b"IHDR", &ihdr);
+        for fill in 1..=4u8 {
+            chunk(b"IDAT", &[fill; 40]);
+        }
+        chunk(b"IEND", &[]);
+        let ruined = 8 + 25 + 52; // signature + IHDR + first IDAT
+        for byte in &mut png[..ruined] {
+            *byte = 0xAA;
+        }
+        let mut dump = vec![0u8; 32];
+        dump.extend_from_slice(&png);
+        dump.extend_from_slice(&[0u8; 64]);
+        let path = write_dump("salvage-png", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Png],
+            min_size: 1,
+            ..Default::default()
+        };
+        let plain = Carver::new(options.clone())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        let salvaged = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(plain.files.is_empty(), "{plain:?}");
+        assert_eq!(salvaged.files.len(), 1, "{salvaged:?}");
+        let tail = &salvaged.files[0];
+        assert_eq!(tail.kind, CarveKind::Png);
+        assert!(!tail.complete);
+        assert!(tail.notes.starts_with("salvage:tail"), "{}", tail.notes);
+        assert!(tail.notes.contains("3 chunk(s)"), "{}", tail.notes);
+        assert_eq!(tail.offset, 32 + ruined as u64);
+        assert_eq!(tail.size, (png.len() - ruined) as u64);
     }
 
     #[test]

@@ -5,6 +5,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Footer-first salvage now understands PNG: when the head of a PNG (signature,
+  IHDR, first IDATs) is gone but the `IEND` chunk survived, the carver walks
+  back from it over contiguous IDAT chunks whose length and CRC verify and keeps
+  that run in `partial/` with a note
+  (`salvage:tail: PNG IDAT run (N chunk(s)) + IEND at 0x...; signature and IHDR
+  are missing`). The file is evidence of the compressed pixel data, not a
+  viewable image (the zlib header and IHDR are lost with the head).
+
+### Fixed
+- `--carve png`: a PNG whose chunk CRC (or chunk length) is damaged after the
+  header — e.g. partial encryption or overwrite of the middle/tail — is no
+  longer dropped. The chunks that verified are kept, the file ends right before
+  the damaged chunk and lands in `partial/` with a note
+  (`PNG IDAT chunk CRC mismatch at 0x...; kept N valid chunk(s)`). A bad IHDR is
+  still rejected.
+
 ### Changed
 - `--carve` no longer takes a `salvage` token: the parameter selects file
   types only, never a technique. Every carve runs the full recovery stack —
