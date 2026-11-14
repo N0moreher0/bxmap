@@ -74,15 +74,41 @@ pub fn load_config(path: &Path) -> Result<FileConfig, String> {
     let table = value
         .as_table()
         .ok_or_else(|| format!("config '{}' is not a table", path.display()))?;
+    const KNOWN_KEYS: &[&str] = &[
+        "min-len",
+        "max-strings",
+        "max-str-len",
+        "encoding",
+        "noise-threshold",
+        "threads",
+        "auto-tune",
+        "max-memory",
+        "dedupe",
+        "format",
+        "output",
+        "report",
+        "detectors",
+        "detect-format",
+        "detect-strict",
+        "extract",
+        "carve",
+        "carve-out",
+        "entropy",
+        "signature",
+        "stats",
+    ];
+    if let Some(key) = table.keys().find(|key| !KNOWN_KEYS.contains(&key.as_str())) {
+        return Err(format!("unknown config option '{key}'"));
+    }
     Ok(FileConfig {
-        min_len: get_int(table, "min-len")?.map(|v| v as usize),
-        max_strings: get_int(table, "max-strings")?.map(|v| v as usize),
-        max_str_len: get_int(table, "max-str-len")?.map(|v| v as usize),
+        min_len: get_usize(table, "min-len")?,
+        max_strings: get_usize(table, "max-strings")?,
+        max_str_len: get_usize(table, "max-str-len")?,
         encoding: get_string(table, "encoding")?,
-        noise_threshold: get_int(table, "noise-threshold")?.map(|v| v as usize),
-        threads: get_int(table, "threads")?.map(|v| v as usize),
+        noise_threshold: get_usize(table, "noise-threshold")?,
+        threads: get_usize(table, "threads")?,
         auto_tune: get_bool(table, "auto-tune")?,
-        max_memory: get_int(table, "max-memory")?.map(|v| v as u64),
+        max_memory: get_u64(table, "max-memory")?,
         dedupe: get_bool(table, "dedupe")?,
         format: get_string(table, "format")?,
         output: get_string(table, "output")?,
@@ -125,7 +151,9 @@ pub fn apply_config(
         }
     }
     if let Some(value) = config.max_str_len {
-        args.max_str_len = value;
+        if !explicit.max_str_len {
+            args.max_str_len = value;
+        }
     }
     if let Some(value) = &config.encoding {
         if !explicit.encoding {
@@ -134,31 +162,43 @@ pub fn apply_config(
         }
     }
     if let Some(value) = config.noise_threshold {
-        args.noise_threshold = Some(value);
+        if !explicit.noise_threshold {
+            args.noise_threshold = Some(value);
+        }
     }
     if let Some(value) = config.threads {
         if value == 0 {
             return Err("config option 'threads' must be at least 1".to_string());
         }
-        args.threads = value;
+        if !explicit.threads {
+            args.threads = value;
+        }
     }
-    if let Some(true) = config.auto_tune {
-        args.auto_tune = true;
+    if let Some(value) = config.auto_tune {
+        if !explicit.auto_tune {
+            args.auto_tune = value;
+        }
     }
     if let Some(value) = config.max_memory {
-        args.max_memory = value;
+        if !explicit.max_memory {
+            args.max_memory = value;
+        }
     }
-    if let Some(true) = config.dedupe {
+    if let Some(value) = config.dedupe {
         if !explicit.dedupe {
-            args.dedupe = true;
+            args.dedupe = value;
             explicit.dedupe = true;
         }
     }
     if let Some(value) = &config.format {
-        args.format = parse_format(value)?;
+        if !explicit.format {
+            args.format = parse_format(value)?;
+        }
     }
     if let Some(value) = &config.output {
-        args.output = Some(value.clone());
+        if !explicit.output {
+            args.output = Some(value.clone());
+        }
     }
     if let Some(value) = &config.report {
         if !explicit.report {
@@ -180,10 +220,14 @@ pub fn apply_config(
         }
     }
     if let Some(value) = &config.detect_format {
-        args.detect_format = parse_detect_format(value)?;
+        if !explicit.detect_format {
+            args.detect_format = parse_detect_format(value)?;
+        }
     }
-    if let Some(true) = config.detect_strict {
-        args.detect_strict = true;
+    if let Some(value) = config.detect_strict {
+        if !explicit.detect_strict {
+            args.detect_strict = value;
+        }
     }
     if let Some(value) = &config.extract {
         if !explicit.extract {
@@ -203,9 +247,9 @@ pub fn apply_config(
             explicit.carve_out = true;
         }
     }
-    if let Some(true) = config.entropy {
+    if let Some(value) = config.entropy {
         if !explicit.entropy {
-            args.entropy = true;
+            args.entropy = value;
             explicit.entropy = true;
         }
     }
@@ -215,21 +259,48 @@ pub fn apply_config(
             explicit.signature = true;
         }
     }
-    if let Some(true) = config.stats {
-        args.stats = true;
+    if let Some(value) = config.stats {
+        if !explicit.stats {
+            args.stats = value;
+        }
     }
     Ok(())
 }
 
-fn get_int(table: &toml::map::Map<String, toml::Value>, key: &str) -> Result<Option<i64>, String> {
+fn get_integer(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Result<Option<i64>, String> {
     match table.get(key) {
         None => Ok(None),
         Some(value) => value
             .as_integer()
-            .or_else(|| value.as_float().map(|f| f as i64))
             .map(Some)
             .ok_or_else(|| format!("config option '{key}' must be a number")),
     }
+}
+
+fn get_usize(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Result<Option<usize>, String> {
+    get_integer(table, key)?
+        .map(|v| {
+            usize::try_from(v).map_err(|_| {
+                format!("config option '{key}' must be a non-negative integer in range")
+            })
+        })
+        .transpose()
+}
+
+fn get_u64(table: &toml::map::Map<String, toml::Value>, key: &str) -> Result<Option<u64>, String> {
+    get_integer(table, key)?
+        .map(|v| {
+            u64::try_from(v).map_err(|_| {
+                format!("config option '{key}' must be a non-negative integer in range")
+            })
+        })
+        .transpose()
 }
 
 fn get_bool(

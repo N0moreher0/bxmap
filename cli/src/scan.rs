@@ -632,19 +632,16 @@ pub fn run_buffered(ctx: &ScanContext<'_>) -> Result<(), String> {
                 }
                 first_item = false;
                 let ent = bxmap::classifier::entropy_of(&r.text);
-                let ts_part = if let Some(dump) = DUMP_MAP.get() {
-                    if let Some(va) = dump.offset_to_va(r.offset) {
-                        if let Some(m) = dump.module_for_va(va) {
-                            format!(",\"timestamp\":{}", m.timestamp)
-                        } else {
-                            String::new()
+                let ts_part = with_dump_map(|dump| {
+                    if let Some(dump) = dump {
+                        if let Some(va) = dump.offset_to_va(r.offset) {
+                            if let Some(m) = dump.module_for_va(va) {
+                                return format!(",\"timestamp\":{}", m.timestamp);
+                            }
                         }
-                    } else {
-                        String::new()
                     }
-                } else {
                     String::new()
-                };
+                });
                 let count_part = counts
                     .as_ref()
                     .and_then(|map| map.get(&r.text))

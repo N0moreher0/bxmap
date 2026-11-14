@@ -54,6 +54,14 @@ const MAX_PDF_SEARCH: u64 = 64 * 1024 * 1024;
 
 const READ_BUF: usize = 1 << 16;
 
+/// Window used to look for the structured -> random boundary inside an
+/// incomplete file (see [`entropy_rise`]).
+const SPIKE_WINDOW: usize = 4096;
+/// A window at or above this entropy (bits/byte) looks encrypted or compressed.
+const SPIKE_HIGH: f64 = 7.8;
+/// A window below this entropy is clearly structured data (text, headers, tables).
+const SPIKE_LOW: f64 = 7.0;
+
 /// A format the carver understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CarveKind {
@@ -71,6 +79,33 @@ pub enum CarveKind {
     Mp4,
     Pe,
     Elf,
+    Gif,
+    Ico,
+    Tar,
+    Pcap,
+    Pcapng,
+    Lnk,
+    Wasm,
+    Dex,
+    Kdbx,
+    Pem,
+    Avi,
+    Wav,
+    Webp,
+    Mkv,
+    Webm,
+    Ogg,
+    Opus,
+    Flac,
+    Mp3,
+    Tiff,
+    Vdi,
+    Vmdk,
+    Bz2,
+    Xz,
+    Class,
+    Rtf,
+    Evtx,
 }
 
 impl CarveKind {
@@ -91,11 +126,38 @@ impl CarveKind {
             CarveKind::Mp4 => "mp4",
             CarveKind::Pe => "pe",
             CarveKind::Elf => "elf",
+            CarveKind::Gif => "gif",
+            CarveKind::Ico => "ico",
+            CarveKind::Tar => "tar",
+            CarveKind::Pcap => "pcap",
+            CarveKind::Pcapng => "pcapng",
+            CarveKind::Lnk => "lnk",
+            CarveKind::Wasm => "wasm",
+            CarveKind::Dex => "dex",
+            CarveKind::Kdbx => "kdbx",
+            CarveKind::Pem => "pem",
+            CarveKind::Avi => "avi",
+            CarveKind::Wav => "wav",
+            CarveKind::Webp => "webp",
+            CarveKind::Mkv => "mkv",
+            CarveKind::Webm => "webm",
+            CarveKind::Ogg => "ogg",
+            CarveKind::Opus => "opus",
+            CarveKind::Flac => "flac",
+            CarveKind::Mp3 => "mp3",
+            CarveKind::Tiff => "tif",
+            CarveKind::Vdi => "vdi",
+            CarveKind::Vmdk => "vmdk",
+            CarveKind::Bz2 => "bz2",
+            CarveKind::Xz => "xz",
+            CarveKind::Class => "class",
+            CarveKind::Rtf => "rtf",
+            CarveKind::Evtx => "evtx",
         }
     }
 
     /// Every kind, in the order `--carve all` enables them.
-    pub const ALL: [CarveKind; 14] = [
+    pub const ALL: [CarveKind; 41] = [
         CarveKind::Jpeg,
         CarveKind::Png,
         CarveKind::Zip,
@@ -110,24 +172,80 @@ impl CarveKind {
         CarveKind::Mp4,
         CarveKind::Pe,
         CarveKind::Elf,
+        CarveKind::Gif,
+        CarveKind::Ico,
+        CarveKind::Tar,
+        CarveKind::Pcap,
+        CarveKind::Pcapng,
+        CarveKind::Lnk,
+        CarveKind::Wasm,
+        CarveKind::Dex,
+        CarveKind::Kdbx,
+        CarveKind::Pem,
+        CarveKind::Avi,
+        CarveKind::Wav,
+        CarveKind::Webp,
+        CarveKind::Mkv,
+        CarveKind::Webm,
+        CarveKind::Ogg,
+        CarveKind::Opus,
+        CarveKind::Flac,
+        CarveKind::Mp3,
+        CarveKind::Tiff,
+        CarveKind::Vdi,
+        CarveKind::Vmdk,
+        CarveKind::Bz2,
+        CarveKind::Xz,
+        CarveKind::Class,
+        CarveKind::Rtf,
+        CarveKind::Evtx,
     ];
 
     fn from_id(id: &str) -> Option<Self> {
         match id {
-            "jpeg" => Some(CarveKind::Jpeg),
+            "jpeg" | "jpg" => Some(CarveKind::Jpeg),
             "png" => Some(CarveKind::Png),
-            "zip" => Some(CarveKind::Zip),
+            "zip" | "docx" | "xlsx" | "pptx" | "odt" | "ods" | "jar" | "apk" => {
+                Some(CarveKind::Zip)
+            }
             "rar4" => Some(CarveKind::Rar4),
             "rar5" => Some(CarveKind::Rar5),
             "7z" => Some(CarveKind::SevenZip),
             "pdf" => Some(CarveKind::Pdf),
             "gzip" => Some(CarveKind::Gzip),
             "bmp" => Some(CarveKind::Bmp),
-            "sqlite" => Some(CarveKind::Sqlite),
-            "ole" => Some(CarveKind::Ole),
-            "mp4" => Some(CarveKind::Mp4),
-            "pe" => Some(CarveKind::Pe),
-            "elf" => Some(CarveKind::Elf),
+            "sqlite" | "sqlite3" | "db" => Some(CarveKind::Sqlite),
+            "ole" | "msi" | "msg" | "doc" | "xls" | "ppt" => Some(CarveKind::Ole),
+            "mp4" | "mov" | "m4a" => Some(CarveKind::Mp4),
+            "pe" | "dll" | "sys" => Some(CarveKind::Pe),
+            "elf" | "so" => Some(CarveKind::Elf),
+            "gif" => Some(CarveKind::Gif),
+            "ico" => Some(CarveKind::Ico),
+            "tar" => Some(CarveKind::Tar),
+            "pcap" => Some(CarveKind::Pcap),
+            "pcapng" => Some(CarveKind::Pcapng),
+            "lnk" => Some(CarveKind::Lnk),
+            "wasm" => Some(CarveKind::Wasm),
+            "dex" => Some(CarveKind::Dex),
+            "kdbx" => Some(CarveKind::Kdbx),
+            "pem" => Some(CarveKind::Pem),
+            "avi" => Some(CarveKind::Avi),
+            "wav" => Some(CarveKind::Wav),
+            "webp" => Some(CarveKind::Webp),
+            "mkv" => Some(CarveKind::Mkv),
+            "webm" => Some(CarveKind::Webm),
+            "ogg" => Some(CarveKind::Ogg),
+            "opus" => Some(CarveKind::Opus),
+            "flac" => Some(CarveKind::Flac),
+            "mp3" => Some(CarveKind::Mp3),
+            "tif" | "tiff" => Some(CarveKind::Tiff),
+            "vdi" => Some(CarveKind::Vdi),
+            "vmdk" => Some(CarveKind::Vmdk),
+            "bz2" => Some(CarveKind::Bz2),
+            "xz" => Some(CarveKind::Xz),
+            "class" => Some(CarveKind::Class),
+            "rtf" => Some(CarveKind::Rtf),
+            "evtx" => Some(CarveKind::Evtx),
             _ => None,
         }
     }
@@ -213,7 +331,8 @@ impl Default for CarveOptions {
 /// One recovered file.
 #[derive(Debug, Clone)]
 pub struct CarvedFile {
-    /// Absolute offset of the header in the dump.
+    /// Absolute offset of the header in the dump. For a `salvage:tail` file
+    /// this is where the surviving tail starts: the header itself is missing.
     pub offset: u64,
     pub kind: CarveKind,
     /// Bytes covered by the file (validated length, not a header guess).
@@ -230,6 +349,14 @@ pub struct CarvedFile {
     pub path: Option<PathBuf>,
     /// Later offsets with byte-identical content (deduped by SHA-256).
     pub duplicates: Vec<u64>,
+    /// Absolute offset where structural validation stopped (the end of the
+    /// bytes the validator could walk). `None` for complete files.
+    pub corrupted_offset: Option<u64>,
+    /// Absolute start of the first 4 KiB window whose entropy jumps to
+    /// >= 7.8 bits/byte after structured (< 7.0) data: a hint of where an
+    /// encrypted region begins. Heuristic only (compressed data looks the
+    /// same). `None` for complete files or when no such jump exists.
+    pub entropy_spike_at: Option<u64>,
 }
 
 /// Result of one carving pass.
@@ -314,11 +441,40 @@ enum Verdict {
 #[derive(Debug, Clone)]
 pub struct Carver {
     options: CarveOptions,
+    incomplete_dir: bool,
+    salvage: bool,
 }
 
 impl Carver {
     pub fn new(options: CarveOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            incomplete_dir: false,
+            salvage: false,
+        }
+    }
+
+    /// Write incomplete files (`complete == false`) into a `partial/`
+    /// subdirectory of the output directory instead of beside the complete
+    /// ones, so an analyst can feed that folder to repair tools (Untrunc,
+    /// 7-Zip recovery, manual header splicing) in one go. Off by default,
+    /// which keeps the flat layout.
+    pub fn with_incomplete_dir(mut self, enabled: bool) -> Self {
+        self.incomplete_dir = enabled;
+        self
+    }
+
+    /// Footer-first salvage (`--carve-salvage`): after the normal header-first
+    /// pass, look for healthy *tails* (ZIP central directory + end record,
+    /// PDF `startxref` + `%%EOF`) that no carved file already covers, and walk
+    /// backwards from each one to where the data turns into high-entropy
+    /// bytes (the edge of an encrypted region), a carved neighbour, or
+    /// `max_size`. Each tail is reported as an incomplete file whose notes
+    /// start with `salvage:tail`, and is written under `partial/`. Nothing is
+    /// decrypted or repaired; the tail is only cut out and labelled.
+    pub fn with_salvage(mut self, enabled: bool) -> Self {
+        self.salvage = enabled;
+        self
     }
 
     /// Find and validate files without writing them.
@@ -374,7 +530,7 @@ impl Carver {
 
         let overlap = max_signature_len().saturating_sub(1);
         chunk::for_each_chunk(dump_path, chunk::CHUNK_SIZE, overlap, |window| {
-            for found in matcher().aho.find_iter(window.data) {
+            for found in matcher().aho.find_overlapping_iter(window.data) {
                 if !window.spans_new_bytes(found.end()) {
                     continue;
                 }
@@ -382,7 +538,9 @@ impl Carver {
                 if !self.options.kinds.contains(&kind) {
                     continue;
                 }
-                let offset = window.offset_of(found.start());
+                let Some(offset) = candidate_offset(kind, window.offset_of(found.start())) else {
+                    continue;
+                };
                 report.candidates += 1;
                 // A file already carved from an earlier offset owns these
                 // bytes; an embedded thumbnail must not become a second hit.
@@ -433,6 +591,19 @@ impl Carver {
                     covered_end = covered_end.max(offset + size);
                     continue;
                 }
+                let incomplete = !notes.is_empty();
+                let corrupted_offset = incomplete.then_some(offset + size);
+                let entropy_spike_at = if incomplete {
+                    match entropy_rise(&mut source, offset, size) {
+                        Ok(spike) => spike,
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let path = match out_dir {
                     Some(dir) => {
                         let name = format!(
@@ -440,7 +611,17 @@ impl Carver {
                             kind.as_str(),
                             &sha256[..8.min(sha256.len())]
                         );
-                        let path = dir.join(name);
+                        let target_dir = if incomplete && self.incomplete_dir {
+                            let partial = dir.join("partial");
+                            if let Err(error) = std::fs::create_dir_all(&partial) {
+                                failure = Some(error);
+                                return false;
+                            }
+                            partial
+                        } else {
+                            dir.to_path_buf()
+                        };
+                        let path = target_dir.join(name);
                         if path.exists() {
                             failure = Some(io::Error::new(
                                 io::ErrorKind::AlreadyExists,
@@ -471,6 +652,8 @@ impl Carver {
                     notes,
                     path,
                     duplicates: Vec::new(),
+                    corrupted_offset,
+                    entropy_spike_at,
                 });
                 covered_end = offset + size;
 
@@ -491,7 +674,150 @@ impl Carver {
         if let Some(error) = failure {
             return Err(error);
         }
+        if self.salvage {
+            self.salvage_pass(dump_path, out_dir, file_len, &mut report)?;
+        }
         Ok(report)
+    }
+
+    /// Second pass behind [`Carver::with_salvage`]: find footers that no
+    /// header-first file covers and recover the tail behind each one.
+    fn salvage_pass(
+        &self,
+        dump_path: &str,
+        out_dir: Option<&Path>,
+        file_len: u64,
+        report: &mut CarveReport,
+    ) -> io::Result<()> {
+        // A header pass that already hit a cap must not be extended.
+        if report.truncated || !self.options.kinds.iter().any(|kind| has_footer(*kind)) {
+            return Ok(());
+        }
+        let mut source = File::open(dump_path)?;
+        let mut by_hash: HashMap<String, usize> = HashMap::new();
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        for (index, file) in report.files.iter().enumerate() {
+            by_hash.insert(file.sha256.clone(), index);
+            covered.push((file.offset, file.offset + file.size));
+            for &duplicate in &file.duplicates {
+                covered.push((duplicate, duplicate + file.size));
+            }
+        }
+        let mut failure: Option<io::Error> = None;
+        let mut stop = false;
+
+        chunk::for_each_chunk(dump_path, chunk::CHUNK_SIZE, FOOTER_OVERLAP, |window| {
+            for found in footer_matcher().aho.find_iter(window.data) {
+                if !window.spans_new_bytes(found.end()) {
+                    continue;
+                }
+                let kind = footer_matcher().kinds[found.pattern().as_usize()];
+                if !self.options.kinds.contains(&kind) {
+                    continue;
+                }
+                let position = window.offset_of(found.start());
+                let tail = match salvage_tail(
+                    kind,
+                    &mut source,
+                    position,
+                    file_len,
+                    self.options.max_size,
+                    &covered,
+                ) {
+                    Ok(Some(tail)) => tail,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        failure = Some(error);
+                        return false;
+                    }
+                };
+                let size = tail.end - tail.start;
+                if size < self.options.min_size {
+                    report.rejected += 1;
+                    continue;
+                }
+                let (sha256, entropy) = match digest_region(&mut source, tail.start, size) {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        failure = Some(error);
+                        return false;
+                    }
+                };
+                covered.push((tail.start, tail.end));
+                if let Some(&index) = by_hash.get(&sha256) {
+                    report.duplicates += 1;
+                    report.duplicate_bytes += size;
+                    report.files[index].duplicates.push(tail.start);
+                    continue;
+                }
+                let path = match out_dir {
+                    Some(dir) => {
+                        // A salvaged tail is incomplete by definition, so it
+                        // always goes beside the other partial files.
+                        let partial = dir.join("partial");
+                        if let Err(error) = std::fs::create_dir_all(&partial) {
+                            failure = Some(error);
+                            return false;
+                        }
+                        let name = format!(
+                            "{:08x}-{}-{}.carved",
+                            tail.start,
+                            kind.as_str(),
+                            &sha256[..8.min(sha256.len())]
+                        );
+                        let path = partial.join(name);
+                        if path.exists() {
+                            failure = Some(io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                format!(
+                                    "refusing to overwrite '{}'; use a fresh --carve-out",
+                                    path.display()
+                                ),
+                            ));
+                            return false;
+                        }
+                        if let Err(error) = write_region(&mut source, tail.start, size, &path) {
+                            failure = Some(error);
+                            return false;
+                        }
+                        Some(path)
+                    }
+                    None => None,
+                };
+                by_hash.insert(sha256.clone(), report.files.len());
+                report.bytes_written += size;
+                report.files.push(CarvedFile {
+                    offset: tail.start,
+                    kind,
+                    size,
+                    complete: false,
+                    sha256,
+                    entropy,
+                    notes: tail.note,
+                    path,
+                    duplicates: Vec::new(),
+                    corrupted_offset: Some(tail.start),
+                    entropy_spike_at: tail.spike,
+                });
+
+                if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
+                    report.truncated = true;
+                    stop = true;
+                    return false;
+                }
+                if self.options.max_total != 0 && report.bytes_written >= self.options.max_total {
+                    report.truncated = true;
+                    stop = true;
+                    return false;
+                }
+            }
+            !stop
+        })?;
+
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Collect carve fragments without writing them, optionally mapping each
@@ -509,7 +835,7 @@ impl Carver {
 
         let overlap = max_signature_len().saturating_sub(1);
         chunk::for_each_chunk(dump_path, chunk::CHUNK_SIZE, overlap, |window| {
-            for found in matcher().aho.find_iter(window.data) {
+            for found in matcher().aho.find_overlapping_iter(window.data) {
                 if !window.spans_new_bytes(found.end()) {
                     continue;
                 }
@@ -517,7 +843,9 @@ impl Carver {
                 if !self.options.kinds.contains(&kind) {
                     continue;
                 }
-                let offset = window.offset_of(found.start());
+                let Some(offset) = candidate_offset(kind, window.offset_of(found.start())) else {
+                    continue;
+                };
                 if offset < covered_end {
                     continue;
                 }
@@ -727,6 +1055,163 @@ const EXTRA_SIGNATURES: &[Signature] = &[
         kind: "MP4/QuickTime media",
         carve: Some("mp4"),
     },
+    Signature {
+        bytes: b"GIF87a",
+        kind: "GIF image",
+        carve: Some("gif"),
+    },
+    Signature {
+        bytes: b"GIF89a",
+        kind: "GIF image",
+        carve: Some("gif"),
+    },
+    Signature {
+        bytes: b"\x00\x00\x01\x00",
+        kind: "ICO image",
+        carve: Some("ico"),
+    },
+    // `ustar` only qualifies inside a 512-byte header at offset 257; the
+    // validator enforces that, so a stray occurrence alone never carves.
+    Signature {
+        bytes: b"ustar",
+        kind: "TAR archive",
+        carve: Some("tar"),
+    },
+    Signature {
+        bytes: b"\xd4\xc3\xb2\xa1",
+        kind: "PCAP capture",
+        carve: Some("pcap"),
+    },
+    Signature {
+        bytes: b"\xa1\xb2\xc3\xd4",
+        kind: "PCAP capture",
+        carve: Some("pcap"),
+    },
+    Signature {
+        bytes: b"\x0a\x0d\x0d\x0a",
+        kind: "PCAPNG capture",
+        carve: Some("pcapng"),
+    },
+    Signature {
+        bytes: b"L\x00\x00\x00\x01\x14\x02\x00",
+        kind: "Windows shortcut (LNK)",
+        carve: Some("lnk"),
+    },
+    Signature {
+        bytes: b"\x00asm",
+        kind: "WebAssembly module",
+        carve: Some("wasm"),
+    },
+    Signature {
+        bytes: b"dex\n",
+        kind: "Android DEX file",
+        carve: Some("dex"),
+    },
+    Signature {
+        bytes: b"\x03\xd9\xa2\x9a\x67\xfb\x4b\xb5",
+        kind: "KeePass KDBX database",
+        carve: Some("kdbx"),
+    },
+    Signature {
+        bytes: b"-----BEGIN ",
+        kind: "PEM block",
+        carve: Some("pem"),
+    },
+    Signature {
+        bytes: b"RIFF",
+        kind: "RIFF media (AVI)",
+        carve: Some("avi"),
+    },
+    Signature {
+        bytes: b"RIFF",
+        kind: "RIFF media (WAV)",
+        carve: Some("wav"),
+    },
+    Signature {
+        bytes: b"RIFF",
+        kind: "RIFF media (WEBP)",
+        carve: Some("webp"),
+    },
+    Signature {
+        bytes: b"\x1a\x45\xdf\xa3",
+        kind: "EBML media (MKV)",
+        carve: Some("mkv"),
+    },
+    Signature {
+        bytes: b"\x1a\x45\xdf\xa3",
+        kind: "EBML media (WebM)",
+        carve: Some("webm"),
+    },
+    Signature {
+        bytes: b"OggS",
+        kind: "Ogg media",
+        carve: Some("ogg"),
+    },
+    Signature {
+        bytes: b"OggS",
+        kind: "Opus media",
+        carve: Some("opus"),
+    },
+    Signature {
+        bytes: b"fLaC",
+        kind: "FLAC audio",
+        carve: Some("flac"),
+    },
+    Signature {
+        bytes: b"ID3",
+        kind: "MP3 audio (ID3)",
+        carve: Some("mp3"),
+    },
+    Signature {
+        bytes: b"\xff\xfb",
+        kind: "MP3 audio (frame)",
+        carve: Some("mp3"),
+    },
+    Signature {
+        bytes: b"II*\x00",
+        kind: "TIFF image",
+        carve: Some("tif"),
+    },
+    Signature {
+        bytes: b"MM\x00*",
+        kind: "TIFF image",
+        carve: Some("tif"),
+    },
+    Signature {
+        bytes: b"<<< Oracle VM VirtualBox Disk Image >>>\n",
+        kind: "VirtualBox disk image",
+        carve: Some("vdi"),
+    },
+    Signature {
+        bytes: b"KDMV",
+        kind: "VMDK sparse extent",
+        carve: Some("vmdk"),
+    },
+    Signature {
+        bytes: b"BZh",
+        kind: "BZIP2 stream",
+        carve: Some("bz2"),
+    },
+    Signature {
+        bytes: b"\xfd7zXZ\x00",
+        kind: "XZ stream",
+        carve: Some("xz"),
+    },
+    Signature {
+        bytes: b"\xca\xfe\xba\xbe",
+        kind: "Java class file",
+        carve: Some("class"),
+    },
+    Signature {
+        bytes: b"{\\rtf1",
+        kind: "RTF document",
+        carve: Some("rtf"),
+    },
+    Signature {
+        bytes: b"ElfFile\x00",
+        kind: "Windows event log",
+        carve: Some("evtx"),
+    },
 ];
 
 fn all_signatures() -> impl Iterator<Item = &'static Signature> {
@@ -762,6 +1247,255 @@ fn max_signature_len() -> usize {
         .unwrap_or(1)
 }
 
+// --- salvage (footer-first) --------------------------------------------------
+
+/// ZIP end-of-central-directory signature. Not a header signature, so it
+/// never collides with the header-first matcher.
+const ZIP_EOCD: &[u8] = b"PK\x05\x06";
+/// PDF end-of-file marker.
+const PDF_EOF: &[u8] = b"%%EOF";
+/// Longest footer minus one: chunk overlap so a footer split across two
+/// chunks is still seen once.
+const FOOTER_OVERLAP: usize = 4;
+
+/// Footers the salvage pass understands. Only formats whose footer is long or
+/// can be checked structurally are listed: a bare JPEG `FF D9` or an MP4
+/// `moov` would flood the pass with false positives, and PNG/JPEG bodies are
+/// compressed already, so an entropy boundary says nothing about them.
+fn has_footer(kind: CarveKind) -> bool {
+    matches!(kind, CarveKind::Zip | CarveKind::Pdf)
+}
+
+struct FooterMatcher {
+    aho: AhoCorasick,
+    kinds: [CarveKind; 2],
+}
+
+fn footer_matcher() -> &'static FooterMatcher {
+    static MATCHER: OnceLock<FooterMatcher> = OnceLock::new();
+    MATCHER.get_or_init(|| FooterMatcher {
+        aho: AhoCorasickBuilder::new()
+            .build([ZIP_EOCD, PDF_EOF])
+            .expect("footer patterns are valid"),
+        kinds: [CarveKind::Zip, CarveKind::Pdf],
+    })
+}
+
+/// A surviving tail found behind a footer.
+struct SalvageTail {
+    start: u64,
+    end: u64,
+    /// Start of the 4 KiB window just before the tail whose entropy is
+    /// >= 7.8 bits/byte (where the encrypted region is suspected to end).
+    spike: Option<u64>,
+    note: String,
+}
+
+/// Read exactly `len` bytes at `offset`, or `None` when they do not fit in
+/// the dump.
+fn salvage_read(file: &mut File, offset: u64, len: usize, file_len: u64) -> io::Result<Option<Vec<u8>>> {
+    match offset.checked_add(len as u64) {
+        Some(end) if end <= file_len => {}
+        _ => return Ok(None),
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buffer = vec![0u8; len];
+    file.read_exact(&mut buffer)?;
+    Ok(Some(buffer))
+}
+
+fn window_entropy(bytes: &[u8]) -> f64 {
+    let mut counts = [0u64; 256];
+    for &byte in bytes {
+        counts[byte as usize] += 1;
+    }
+    entropy(&counts, bytes.len() as u64)
+}
+
+/// Printable ASCII or common whitespace: what a trailer, xref table or
+/// central-directory name looks like, and what ciphertext rarely strings
+/// together for long.
+fn is_text_byte(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r' | b'\t') || (0x20..=0x7e).contains(&byte)
+}
+
+/// Walk backwards from `end` in [`SPIKE_WINDOW`] steps while the data stays
+/// below [`SPIKE_HIGH`]. At the first high-entropy window, trim back only over
+/// the text bytes at its tail so the boundary is not 4 KiB-coarse. Returns
+/// the tail start and the start of the window that stopped the walk.
+fn salvage_boundary(
+    file: &mut File,
+    end: u64,
+    lower: u64,
+    file_len: u64,
+) -> io::Result<(u64, Option<u64>)> {
+    let mut cursor = end;
+    while cursor > lower {
+        if cursor - lower < SPIKE_WINDOW as u64 {
+            // Too short for a trustworthy entropy estimate: keep it all.
+            return Ok((lower, None));
+        }
+        let window_start = cursor - SPIKE_WINDOW as u64;
+        let Some(bytes) = salvage_read(file, window_start, SPIKE_WINDOW, file_len)? else {
+            return Ok((cursor, None));
+        };
+        if window_entropy(&bytes) >= SPIKE_HIGH {
+            let text = bytes
+                .iter()
+                .rev()
+                .take_while(|&&byte| is_text_byte(byte))
+                .count() as u64;
+            return Ok((cursor - text, Some(window_start)));
+        }
+        cursor = window_start;
+    }
+    Ok((lower, None))
+}
+
+/// Entropy hint for the window right before `start`, bounded by `lower`.
+fn salvage_spike_before(
+    file: &mut File,
+    start: u64,
+    lower: u64,
+    file_len: u64,
+) -> io::Result<Option<u64>> {
+    if start.saturating_sub(lower) < SPIKE_WINDOW as u64 {
+        return Ok(None);
+    }
+    let window_start = start - SPIKE_WINDOW as u64;
+    Ok(salvage_read(file, window_start, SPIKE_WINDOW, file_len)?
+        .filter(|bytes| window_entropy(bytes) >= SPIKE_HIGH)
+        .map(|_| window_start))
+}
+
+/// Decide whether the footer at `position` is a real, uncovered tail and, if
+/// so, where the tail starts.
+fn salvage_tail(
+    kind: CarveKind,
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+    covered: &[(u64, u64)],
+) -> io::Result<Option<SalvageTail>> {
+    // A footer inside a file the header pass already carved is not a tail.
+    if covered
+        .iter()
+        .any(|&(start, end)| start <= position && position < end)
+    {
+        return Ok(None);
+    }
+    let prior_end = covered
+        .iter()
+        .filter(|&&(start, _)| start < position)
+        .map(|&(_, end)| end)
+        .max()
+        .unwrap_or(0);
+    match kind {
+        CarveKind::Zip => salvage_zip_tail(file, position, file_len, max_size, prior_end),
+        CarveKind::Pdf => salvage_pdf_tail(file, position, file_len, max_size, prior_end),
+        _ => Ok(None),
+    }
+}
+
+/// ZIP: the end record gives the exact central-directory size, so the tail is
+/// `[eocd - cd_size, eocd + 22 + comment)` and must start with `PK\x01\x02`.
+fn salvage_zip_tail(
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+    prior_end: u64,
+) -> io::Result<Option<SalvageTail>> {
+    let Some(eocd) = salvage_read(file, position, 22, file_len)? else {
+        return Ok(None);
+    };
+    let entries = u16::from_le_bytes([eocd[10], eocd[11]]);
+    let cd_size = u64::from(u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]));
+    let comment = u64::from(u16::from_le_bytes([eocd[20], eocd[21]]));
+    let end = position + 22 + comment;
+    // 46 bytes is the smallest central-directory record.
+    if entries == 0 || cd_size < 46 || cd_size > position || end > file_len {
+        return Ok(None);
+    }
+    let start = position - cd_size;
+    if start < prior_end || end - start > max_size {
+        return Ok(None);
+    }
+    match salvage_read(file, start, 4, file_len)? {
+        Some(head) if &head[..] == b"PK\x01\x02" => {}
+        _ => return Ok(None),
+    }
+    let spike = salvage_spike_before(file, start, prior_end, file_len)?;
+    Ok(Some(SalvageTail {
+        start,
+        end,
+        spike,
+        note: format!(
+            "salvage:tail: ZIP central directory ({entries} entries) + end record at {position:#x}; local headers and data are missing"
+        ),
+    }))
+}
+
+/// PDF: require `startxref <digits>` right before `%%EOF`, then walk back by
+/// entropy. Window-granular, refined over trailing text bytes.
+fn salvage_pdf_tail(
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+    prior_end: u64,
+) -> io::Result<Option<SalvageTail>> {
+    let lookback = position.min(64) as usize;
+    let Some(before) = salvage_read(file, position - lookback as u64, lookback, file_len)? else {
+        return Ok(None);
+    };
+    let Some(at) = before.windows(9).rposition(|chunk| chunk == b"startxref") else {
+        return Ok(None);
+    };
+    let rest = &before[at + 9..];
+    let digits_only = rest
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || byte.is_ascii_whitespace());
+    if !digits_only || !rest.iter().any(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let mut end = position + PDF_EOF.len() as u64;
+    let extra = (file_len - end).min(2) as usize;
+    if extra > 0 {
+        if let Some(bytes) = salvage_read(file, end, extra, file_len)? {
+            for &byte in &bytes {
+                if byte == b'\r' || byte == b'\n' {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    let lower = prior_end.max(end.saturating_sub(max_size));
+    let (start, spike) = salvage_boundary(file, end, lower, file_len)?;
+    Ok(Some(SalvageTail {
+        start,
+        end,
+        spike,
+        note: format!(
+            "salvage:tail: PDF trailer ending at {position:#x} (startxref + EOF); header and body are missing"
+        ),
+    }))
+}
+
+/// Adjust a raw needle match to the candidate's true start. TAR has no
+/// head magic; the `ustar` needle sits at offset 257 of the file, so a match
+/// there means the archive starts 257 bytes earlier.
+fn candidate_offset(kind: CarveKind, needle_offset: u64) -> Option<u64> {
+    match kind {
+        // 257 == name(100) + mode(8) + uid(8) + gid(8) + size(12) + mtime(12) + chksum(8) + typeflag(1) + linkname(100).
+        CarveKind::Tar => needle_offset.checked_sub(257),
+        _ => Some(needle_offset),
+    }
+}
+
 // --- validation --------------------------------------------------------------
 
 fn validate(kind: CarveKind, file: &mut File, offset: u64, end: u64) -> io::Result<(Verdict, u64)> {
@@ -781,6 +1515,33 @@ fn validate(kind: CarveKind, file: &mut File, offset: u64, end: u64) -> io::Resu
         CarveKind::Mp4 => carve_mp4(&mut source)?,
         CarveKind::Pe => carve_pe(&mut source)?,
         CarveKind::Elf => carve_elf(&mut source)?,
+        CarveKind::Gif => carve_gif(&mut source)?,
+        CarveKind::Ico => carve_ico(&mut source)?,
+        CarveKind::Tar => carve_tar(&mut source)?,
+        CarveKind::Pcap => carve_pcap(&mut source)?,
+        CarveKind::Pcapng => carve_pcapng(&mut source)?,
+        CarveKind::Lnk => carve_lnk(&mut source)?,
+        CarveKind::Wasm => carve_wasm(&mut source)?,
+        CarveKind::Dex => carve_dex(&mut source)?,
+        CarveKind::Kdbx => carve_kdbx(&mut source)?,
+        CarveKind::Pem => carve_pem(&mut source)?,
+        CarveKind::Avi => carve_riff(&mut source, b"AVI ")?,
+        CarveKind::Wav => carve_riff(&mut source, b"WAVE")?,
+        CarveKind::Webp => carve_riff(&mut source, b"WEBP")?,
+        CarveKind::Mkv => carve_ebml(&mut source, b"matroska")?,
+        CarveKind::Webm => carve_ebml(&mut source, b"webm")?,
+        CarveKind::Ogg => carve_ogg(&mut source, false)?,
+        CarveKind::Opus => carve_ogg(&mut source, true)?,
+        CarveKind::Flac => carve_flac(&mut source)?,
+        CarveKind::Mp3 => carve_mp3(&mut source)?,
+        CarveKind::Tiff => carve_tiff(&mut source)?,
+        CarveKind::Vdi => carve_vdi(&mut source)?,
+        CarveKind::Vmdk => carve_vmdk(&mut source)?,
+        CarveKind::Bz2 => carve_bz2(&mut source)?,
+        CarveKind::Xz => carve_xz(&mut source)?,
+        CarveKind::Class => carve_class(&mut source)?,
+        CarveKind::Rtf => carve_rtf(&mut source)?,
+        CarveKind::Evtx => carve_evtx(&mut source)?,
     };
     Ok((verdict, source.produced()))
 }
@@ -1847,6 +2608,44 @@ fn write_region(file: &mut File, offset: u64, size: u64, path: &Path) -> io::Res
     out.flush()
 }
 
+/// Find where a file turns from structured data into random-looking bytes.
+///
+/// Splits `[offset, offset + size)` into [`SPIKE_WINDOW`]-byte windows and
+/// returns the absolute start of the first window at or above [`SPIKE_HIGH`]
+/// that comes after at least one window below [`SPIKE_LOW`]. Data that is
+/// random from the first byte (a stored ZIP payload, a JPEG scan) never has a
+/// structured window before it, so it yields `None` instead of a false
+/// boundary. A trailing partial window is ignored.
+fn entropy_rise(file: &mut File, offset: u64, size: u64) -> io::Result<Option<u64>> {
+    let mut counts = [0u64; 256];
+    let mut filled = 0usize;
+    let mut window_start = offset;
+    let mut seen_structured = false;
+    let mut found: Option<u64> = None;
+    stream_region(file, offset, size, |chunk| {
+        for &byte in chunk {
+            if found.is_some() {
+                return Ok(());
+            }
+            counts[byte as usize] += 1;
+            filled += 1;
+            if filled == SPIKE_WINDOW {
+                let bits = entropy(&counts, SPIKE_WINDOW as u64);
+                if bits < SPIKE_LOW {
+                    seen_structured = true;
+                } else if bits >= SPIKE_HIGH && seen_structured {
+                    found = Some(window_start);
+                }
+                counts = [0u64; 256];
+                filled = 0;
+                window_start += SPIKE_WINDOW as u64;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1893,6 +2692,1522 @@ fn crc32(state: u32, data: &[u8]) -> u32 {
         crc = table[((crc ^ u32::from(byte)) & 0xff) as usize] ^ (crc >> 8);
     }
     crc
+}
+
+// --- new format validators ---------------------------------------------------
+
+const MAX_GIF_BLOCKS: u64 = 1_000_000;
+const MAX_EBML_ELEMENTS: u64 = 4_000_000;
+
+
+/// Element ID reader for EBML: like [`ebml_vint`] but keeps the length bits
+/// as part of the value, as the EBML spec requires. IDs are at most 4 bytes.
+fn ebml_element_id(source: &mut Source<'_>) -> io::Result<Option<(u64, usize)>> {
+    let Some(first) = peek_u8(source)? else { return Ok(None) };
+    let mut length = 1usize;
+    let mut mask = 0x80u8;
+    while mask != 0 && first & mask == 0 {
+        length += 1;
+        mask >>= 1;
+    }
+    if length > 4 {
+        return Ok(None);
+    }
+    let Some(bytes) = take_bytes(source, length)? else { return Ok(None) };
+    let mut value: u64 = 0;
+    for &byte in &bytes {
+        value = (value << 8) | u64::from(byte);
+    }
+    Ok(Some((value, length)))
+}
+
+fn carve_ebml(source: &mut Source<'_>, expected_doctype: &[u8]) -> io::Result<Verdict> {
+    if peek_array::<4>(source)? != Some([0x1a, 0x45, 0xdf, 0xa3]) {
+        return Ok(Verdict::Invalid("missing EBML magic".to_string()));
+    }
+    let window = window_len(source);
+    let mut end_stack: Vec<u64> = Vec::new();
+    let mut doctype: Option<Vec<u8>> = None;
+    for _ in 0..MAX_EBML_ELEMENTS {
+        if source.abs() >= source.end {
+            break;
+        }
+        let Some((id, _)) = ebml_element_id(source)? else {
+            return Ok(Verdict::Truncated("EBML element id desyncs from the stream".to_string()));
+        };
+        let Some((size, slen)) = ebml_vint(source)? else {
+            return Ok(Verdict::Truncated("EBML element size desyncs from the stream".to_string()));
+        };
+        let unknown_size = size == (1u64 << (7 * slen as u64)) - 1;
+        let element_end = if unknown_size {
+            source.end
+        } else {
+            match source.abs().checked_add(size) {
+                Some(end) if end <= source.end => end,
+                _ => return Ok(Verdict::Truncated("EBML element extends past the candidate".to_string())),
+            }
+        };
+        if id == 0x42_82 {
+            let bytes = match take_bytes(source, size as usize)? {
+                Some(bytes) if (size as usize) <= 64 => bytes,
+                _ => Vec::new(),
+            };
+            doctype = Some(bytes);
+        } else {
+            source.skip(element_end - source.abs())?;
+        }
+        end_stack.push(element_end);
+        while let Some(&top) = end_stack.last() {
+            if top == source.abs() {
+                end_stack.pop();
+            } else {
+                break;
+            }
+        }
+    }
+    let _ = window;
+    match doctype {
+        Some(found) if found == expected_doctype => Ok(Verdict::Valid),
+        Some(found) => Ok(Verdict::Invalid(format!(
+            "EBML DocType '{}' does not match this kind",
+            String::from_utf8_lossy(&found)
+        ))),
+        None => Ok(Verdict::Invalid("EBML DocType element not found".to_string())),
+    }
+}
+
+fn carve_ogg(source: &mut Source<'_>, expect_opus: bool) -> io::Result<Verdict> {
+    if peek_array::<4>(source)? != Some(*b"OggS") {
+        return Ok(Verdict::Invalid("missing OggS page header".to_string()));
+    }
+    let mut serials: Vec<u32> = Vec::new();
+    let mut pages: u64 = 0;
+    let mut first = true;
+    let mut opus_head = false;
+    while source.abs() < source.end {
+        pages += 1;
+        if pages > MAX_OGG_PAGES {
+            return Ok(Verdict::Truncated("OGG page count exceeded the limit".to_string()));
+        }
+        // Dump padding (all zero bytes) follows the last page; treat it as
+        // the end of the stream.
+        if let Some(next) = peek_array::<4>(source)? {
+            if next.iter().all(|&byte| byte == 0) {
+                break;
+            }
+        }
+        let Some(header) = peek_array::<27>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside an OGG page header".to_string()));
+        };
+        if &header[..4] != b"OggS" || header[4] != 0 {
+            return Ok(Verdict::Invalid("OGG page magic/version mismatch".to_string()));
+        }
+        let flags = header[5];
+        if flags & 0x80 != 0 {
+            return Ok(Verdict::Invalid("OGG continuation flag is not supported".to_string()));
+        }
+        if first && flags & 0x02 == 0 {
+            return Ok(Verdict::Invalid("OGG stream does not start with a BOS page".to_string()));
+        }
+        let serial = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
+        if !serials.contains(&serial) {
+            if serials.len() >= 64 {
+                return Ok(Verdict::Invalid("OGG serial count exceeded the limit".to_string()));
+            }
+            serials.push(serial);
+        }
+        source.skip(27)?;
+        let segment_count = usize::from(header[26]);
+        let table = match take_bytes(source, segment_count)? {
+            Some(table) => table,
+            None => return Ok(Verdict::Truncated("dump ended inside an OGG segment table".to_string())),
+        };
+        let payload: u64 = table.iter().map(|&size| u64::from(size)).sum();
+        if !room_left(source, payload) {
+            return Ok(Verdict::Truncated("dump ended inside an OGG page payload".to_string()));
+        }
+        let page = take_bytes(source, payload as usize)?.unwrap_or_default();
+        if first && page.windows(8).any(|w| w == b"OpusHead") {
+            opus_head = true;
+        }
+        first = false;
+    }
+    if expect_opus && !opus_head {
+        return Ok(Verdict::Invalid("OGG stream has no OpusHead packet on its first page".to_string()));
+    }
+    Ok(Verdict::Valid)
+}
+
+fn carve_flac(source: &mut Source<'_>) -> io::Result<Verdict> {
+    if peek_array::<4>(source)? != Some(*b"fLaC") {
+        return Ok(Verdict::Invalid("missing fLaC signature".to_string()));
+    }
+    source.skip(4)?;
+    let Some(streaminfo) = peek_array::<4>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside a FLAC STREAMINFO header".to_string()));
+    };
+    let streaminfo_type = streaminfo[0] & 0x7f;
+    let streaminfo_last = streaminfo[0] & 0x80 != 0;
+    let streaminfo_len = u32::from_be_bytes([0, streaminfo[1], streaminfo[2], streaminfo[3]]);
+    if streaminfo_type != 0 || streaminfo_len != 34 {
+        return Ok(Verdict::Invalid("FLAC STREAMINFO block is missing or mis-sized".to_string()));
+    }
+    source.skip(4 + 34)?;
+    if streaminfo_last {
+        return Ok(Verdict::Valid);
+    }
+    for _ in 0..4096u64 {
+        let Some(block) = peek_array::<4>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside a FLAC metadata block".to_string()));
+        };
+        let last = block[0] & 0x80 != 0;
+        let block_len = u32::from_be_bytes([0, block[1], block[2], block[3]]);
+        if !room_left(source, 4 + u64::from(block_len)) {
+            return Ok(Verdict::Truncated(format!(
+                "dump ended inside a FLAC metadata block of {block_len} bytes"
+            )));
+        }
+        source.skip(4 + u64::from(block_len))?;
+        if last {
+            return Ok(Verdict::Valid);
+        }
+    }
+    Ok(Verdict::Truncated("FLAC metadata block count exceeded the limit".to_string()))
+}
+
+fn carve_riff(source: &mut Source<'_>, expected_form: &[u8; 4]) -> io::Result<Verdict> {
+    if peek_array::<4>(source)? != Some(*b"RIFF") {
+        return Ok(Verdict::Invalid("missing RIFF signature".to_string()));
+    }
+    let Some(header) = peek_array::<12>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the RIFF header".to_string()));
+    };
+    let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    if &header[8..12] != expected_form {
+        return Ok(Verdict::Invalid("RIFF form type does not match this kind".to_string()));
+    }
+    let riff_end = source.origin + 8 + u64::from(size);
+    if riff_end > source.end {
+        return Ok(Verdict::Truncated(format!(
+            "RIFF declares {size} bytes but the candidate window is smaller"
+        )));
+    }
+    source.skip(12)?;
+    for _ in 0..MAX_RIFF_CHUNKS {
+        if source.abs() >= riff_end {
+            break;
+        }
+        let Some(chunk) = peek_array::<8>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside a RIFF chunk header".to_string()));
+        };
+        let chunk_size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        let padded = u64::from(chunk_size) + (u64::from(chunk_size) & 1);
+        source.skip(8)?;
+        if source.abs().checked_add(padded).is_none_or(|end| end > riff_end) {
+            return Ok(Verdict::Truncated(format!(
+                "dump ended inside a RIFF chunk of {chunk_size} bytes"
+            )));
+        }
+        source.skip(padded)?;
+    }
+    let marker: &[u8] = match expected_form {
+        b"AVI " => b"movi",
+        b"WAVE" => b"data",
+        b"WEBP" => b"VP8",
+        _ => b"",
+    };
+    let found = if marker.is_empty() {
+        true
+    } else {
+        find_bytes(source, marker)?.is_some()
+    };
+    source.skip(riff_end - source.abs())?;
+    if found {
+        Ok(Verdict::Valid)
+    } else {
+        Ok(Verdict::Invalid(
+            "RIFF is missing the expected data chunk for this kind".to_string(),
+        ))
+    }
+}
+
+const MAX_RIFF_CHUNKS: u64 = 1_000_000;
+
+const MAX_TIFF_IFDS: u64 = 256;
+const MAX_OGG_PAGES: u64 = 10_000_000;
+const MAX_CLASS_POOL: u64 = 1_000_000;
+const MAX_RTF_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Adler-32 (as used by zlib), used to verify DEX headers.
+fn adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65_521;
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &byte in data {
+        a = (a + u32::from(byte)) % MOD;
+        b = (b + a) % MOD;
+    }
+    (b << 16) | a
+}
+
+/// Parse an octal (optionally NUL/space terminated) tar checksum/size field.
+fn parse_octal(bytes: &[u8]) -> Option<u64> {
+    let text: String = bytes
+        .iter()
+        .take_while(|&&b| b != 0 && b != b' ')
+        .filter_map(|&b| char::from(b).is_ascii_digit().then_some(char::from(b)))
+        .filter(|&b| ('0'..='7').contains(&b))
+        .collect();
+    if text.is_empty() {
+        return Some(0);
+    }
+    u64::from_str_radix(&text, 8).ok()
+}
+
+/// Read an EBML variable-length integer (the length is encoded in the leading
+/// one-bits). Returns `(value, length)`.
+fn ebml_vint(source: &mut Source<'_>) -> io::Result<Option<(u64, usize)>> {
+    let Some(first) = peek_u8(source)? else {
+        return Ok(None);
+    };
+    let mut length = 1usize;
+    let mut mask = 0x80u8;
+    while mask != 0 && first & mask == 0 {
+        length += 1;
+        mask >>= 1;
+    }
+    if length > 8 {
+        return Ok(None);
+    }
+    let Some(bytes) = take_bytes(source, length)? else {
+        return Ok(None);
+    };
+    let mut value: u64 = u64::from(bytes[0] & (0xff >> length));
+    for &byte in &bytes[1..] {
+        value = (value << 8) | u64::from(byte);
+    }
+    Ok(Some((value, length)))
+}
+
+/// Code-window length in bytes (`end - origin`).
+fn window_len(source: &Source<'_>) -> u64 {
+    source.end - source.origin
+}
+
+/// Check that `amount` more bytes fit in the candidate window.
+fn room_left(source: &Source<'_>, amount: u64) -> bool {
+    source.end - source.abs() >= amount
+}
+
+fn carve_gif(source: &mut Source<'_>) -> io::Result<Verdict> {
+    if peek_array::<6>(source)? != Some(*b"GIF87a") && peek_array::<6>(source)? != Some(*b"GIF89a") {
+        return Ok(Verdict::Invalid("missing GIF87a/GIF89a signature".to_string()));
+    }
+    source.skip(6)?;
+    let Some(lsd) = peek_array::<7>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the GIF logical screen descriptor".to_string()));
+    };
+    let packed = lsd[4];
+    source.skip(7)?;
+    if packed & 0x80 != 0 {
+        let gct = 3u64 << (u32::from(packed & 0x07));
+        if !room_left(source, gct) {
+            return Ok(Verdict::Truncated("dump ended inside the GIF global color table".to_string()));
+        }
+        source.skip(gct)?;
+    }
+    for _ in 0..MAX_GIF_BLOCKS {
+        let Some(marker) = peek_u8(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside a GIF block".to_string()));
+        };
+        match marker {
+            0x3b => {
+                source.skip(1)?;
+                return Ok(Verdict::Valid);
+            }
+            0x21 => {
+                source.skip(1)?;
+                let Some(_label) = peek_u8(source)? else {
+                    return Ok(Verdict::Truncated("dump ended inside a GIF extension block".to_string()));
+                };
+                source.skip(1)?;
+                if let Some(v) = gif_subblocks(source)? {
+                    return Ok(v);
+                }
+            }
+            0x2c => {
+                source.skip(1)?;
+                let Some(desc) = peek_array::<9>(source)? else {
+                    return Ok(Verdict::Truncated("dump ended inside a GIF image descriptor".to_string()));
+                };
+                let image_packed = desc[8];
+                source.skip(9)?;
+                if image_packed & 0x80 != 0 {
+                    let lct = 3u64 << (u32::from(image_packed & 0x07));
+                    if !room_left(source, lct) {
+                        return Ok(Verdict::Truncated("dump ended inside a GIF local color table".to_string()));
+                    }
+                    source.skip(lct)?;
+                }
+                let Some(_) = peek_u8(source)? else {
+                    return Ok(Verdict::Truncated("dump ended at the GIF LZW minimum code size".to_string()));
+                };
+                source.skip(1)?;
+                if let Some(v) = gif_subblocks(source)? {
+                    return Ok(v);
+                }
+            }
+            _ => return Ok(Verdict::Invalid(format!("unexpected GIF block marker 0x{marker:02x}"))),
+        }
+    }
+    Ok(Verdict::Truncated("GIF block count exceeded the limit".to_string()))
+}
+
+/// Walk GIF data sub-blocks up to the zero terminator.
+fn gif_subblocks(source: &mut Source<'_>) -> io::Result<Option<Verdict>> {
+    loop {
+        let Some(size) = peek_u8(source)? else {
+            return Ok(Some(Verdict::Truncated("dump ended inside a GIF data sub-block".to_string())));
+        };
+        if size == 0 {
+            source.skip(1)?;
+            return Ok(None);
+        }
+        if !room_left(source, 1 + u64::from(size)) {
+            return Ok(Some(Verdict::Truncated("dump ended inside a GIF data sub-block".to_string())));
+        }
+        source.skip(1 + u64::from(size))?;
+    }
+}
+
+fn carve_ico(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let window = window_len(source);
+    let Some(header) = peek_array::<6>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the ICO header".to_string()));
+    };
+    let reserved = u16::from_le_bytes([header[0], header[1]]);
+    let kind = u16::from_le_bytes([header[2], header[3]]);
+    let count = u16::from_le_bytes([header[4], header[5]]);
+    if reserved != 0 || !matches!(kind, 1 | 2) || count == 0 || count > 256 {
+        return Ok(Verdict::Invalid("implausible ICO reserved/kind/count fields".to_string()));
+    }
+    source.skip(6)?;
+    let mut data_end: u64 = 6 + u64::from(count) * 16;
+    for _ in 0..count {
+        let Some(entry) = peek_array::<16>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside an ICO directory entry".to_string()));
+        };
+        source.skip(16)?;
+        let size = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+        let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]);
+        let end = u64::from(offset) + u64::from(size);
+        if size == 0 || u64::from(offset) < 6 + u64::from(count) * 16 || end > window {
+            return Ok(Verdict::Invalid(
+                "ICO directory entry points outside the file".to_string(),
+            ));
+        }
+        data_end = data_end.max(end);
+    }
+    source.skip(data_end - source.produced())?;
+    Ok(Verdict::Valid)
+}
+
+fn carve_tar(source: &mut Source<'_>) -> io::Result<Verdict> {
+    const BLOCK: usize = 512;
+    let first = match peek_array::<BLOCK>(source)? {
+        Some(header) => header,
+        None => return Ok(Verdict::Truncated("dump ended inside the TAR header block".to_string())),
+    };
+    if &first[257..262] != b"ustar" {
+        return Ok(Verdict::Invalid("ustar marker is missing from the TAR header".to_string()));
+    }
+    let stored = parse_octal(&first[148..156]);
+    let computed = {
+        let mut sum: u64 = 0;
+        for (index, &byte) in first.iter().enumerate() {
+            let byte = if (148..156).contains(&index) { b' ' } else { byte };
+            sum += u64::from(byte);
+        }
+        sum
+    };
+    match stored {
+        Some(value) if value == computed => {}
+        _ => {
+            return Ok(Verdict::Invalid(
+                "TAR header checksum does not match".to_string(),
+            ))
+        }
+    }
+    source.skip(BLOCK as u64)?;
+    for _ in 0..1_000_000u64 {
+        let Some(header) = peek_array::<BLOCK>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside a TAR file".to_string()));
+        };
+        if header.iter().all(|&byte| byte == 0) {
+            source.skip(BLOCK as u64)?;
+            // A second zero block finishes the archive; keep it when present.
+            if let Some(next) = peek_array::<BLOCK>(source)? {
+                if next.iter().all(|&byte| byte == 0) {
+                    source.skip(BLOCK as u64)?;
+                }
+            }
+            return Ok(Verdict::Valid);
+        }
+        if &header[257..262] != b"ustar" {
+            return Ok(Verdict::Invalid("TAR file boundary does not line up with a header block".to_string()));
+        }
+        let size_field = &header[124..136];
+        let size: u64 = if size_field[0] & 0x80 != 0 {
+            // GNU base-256 encoding for >8 GiB entries; read big endian.
+            let mut value: u64 = u64::from(size_field[0] & 0x7f);
+            for &byte in &size_field[1..] {
+                value = (value << 8) | u64::from(byte);
+            }
+            value
+        } else {
+            match parse_octal(size_field) {
+                Some(value) => value,
+                None => {
+                    return Ok(Verdict::Invalid(
+                        "TAR entry size field is not octal".to_string(),
+                    ))
+                }
+            }
+        };
+        let padded = (size + 511) & !511;
+        if !room_left(source, BLOCK as u64 + padded) {
+            return Ok(Verdict::Truncated(format!(
+                "dump ended inside a TAR entry of {size} bytes"
+            )));
+        }
+        source.skip(BLOCK as u64 + padded)?;
+        if u64::from(header[156]) == u64::from(b'L') {
+            // Long-name entry: the real name lives in the data blocks, the
+            // next header is the real file entry; handled by this loop.
+        }
+    }
+    Ok(Verdict::Truncated("TAR entry count exceeded the limit".to_string()))
+}
+
+fn carve_pcap(source: &mut Source<'_>) -> io::Result<Verdict> {
+    if !room_left(source, 24) {
+        return Ok(Verdict::Truncated("dump ended inside the PCAP global header".to_string()));
+    }
+    let magic = peek_array::<4>(source)?.unwrap();
+    let little_endian = match &magic {
+        [0xd4, 0xc3, 0xb2, 0xa1] => true,
+        [0xa1, 0xb2, 0xc3, 0xd4] => false,
+        _ => return Ok(Verdict::Invalid("missing PCAP magic number".to_string())),
+    };
+    let read16 = |bytes: &[u8]| -> u16 {
+        if little_endian {
+            u16::from_le_bytes([bytes[0], bytes[1]])
+        } else {
+            u16::from_be_bytes([bytes[0], bytes[1]])
+        }
+    };
+    let read32 = |bytes: &[u8]| -> u32 {
+        if little_endian {
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+    };
+    let header = peek_array::<24>(source)?.unwrap();
+    let version_major = read16(&header[4..6]);
+    let version_minor = read16(&header[6..8]);
+    if version_major != 2 || version_minor > 99 {
+        return Ok(Verdict::Invalid(format!(
+            "implausible PCAP version {version_major}.{version_minor}"
+        )));
+    }
+    let snaplen = read32(&header[16..20]);
+    if !(64..=64 * 1024 * 1024).contains(&snaplen) {
+        return Ok(Verdict::Invalid(format!("implausible PCAP snaplen {snaplen}")));
+    }
+    source.skip(24)?;
+    for _ in 0..1_000_000u64 {
+        if source.abs() >= source.end {
+            break;
+        }
+        let Some(record) = peek_array::<16>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside a PCAP packet record".to_string()));
+        };
+        let incl_len = read32(&record[8..12]);
+        let orig_len = read32(&record[12..16]);
+        if incl_len > snaplen || orig_len > snaplen.max(0x7fff_ffff) {
+            return Ok(Verdict::Invalid(
+                "PCAP packet record exceeds the snaplen".to_string(),
+            ));
+        }
+        if !room_left(source, 16 + u64::from(incl_len)) {
+            return Ok(Verdict::Truncated("dump ended inside a PCAP packet".to_string()));
+        }
+        source.skip(16 + u64::from(incl_len))?;
+    }
+    Ok(Verdict::Valid)
+}
+
+fn carve_pcapng(source: &mut Source<'_>) -> io::Result<Verdict> {
+    if peek_array::<4>(source)? != Some([0x0a, 0x0d, 0x0d, 0x0a]) {
+        return Ok(Verdict::Invalid("missing PCAPNG section magic".to_string()));
+    }
+    let bom = match peek_array::<12>(source)? {
+        Some(bom) => bom,
+        None => {
+            return Ok(Verdict::Truncated(
+                "dump ended inside the PCAPNG section header".to_string(),
+            ))
+        }
+    };
+    let little_endian = match &bom[8..12] {
+        [0x4d, 0x3c, 0x2b, 0x1a] => true,
+        [0x1a, 0x2b, 0x3c, 0x4d] => false,
+        _ => return Ok(Verdict::Invalid("PCAPNG byte-order magic is wrong".to_string())),
+    };
+    let read32 = |bytes: &[u8]| -> u32 {
+        if little_endian {
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+    };
+    let section_len = read32(&bom[4..8]);
+    if section_len < 28 || u64::from(section_len) > window_len(source) {
+        return Ok(Verdict::Invalid("PCAPNG section length is implausible".to_string()));
+    }
+    source.skip(u64::from(section_len))?;
+    for _ in 0..1_000_000u64 {
+        if source.abs() >= source.end {
+            break;
+        }
+        let block = match peek_array::<8>(source)? {
+            Some(block) => block,
+            None => {
+                return Ok(Verdict::Truncated(
+                    "dump ended inside a PCAPNG block header".to_string(),
+                ))
+            }
+        };
+        // Dump padding (all zero bytes) marks the end of the capture, like
+        // TAR's zero blocks.
+        if block.iter().all(|&byte| byte == 0) {
+            return Ok(Verdict::Valid);
+        }
+        let block_len = read32(&block[4..8]);
+        if block_len < 12 || u64::from(block_len) > source.end - source.abs() {
+            return Ok(Verdict::Truncated("PCAPNG block length is implausible".to_string()));
+        }
+        source.skip(u64::from(block_len) - 4)?;
+        let trailing = match peek_array::<4>(source)? {
+            Some(trailing) => trailing,
+            None => {
+                return Ok(Verdict::Truncated(
+                    "dump ended inside a PCAPNG block trailer".to_string(),
+                ))
+            }
+        };
+        if read32(&trailing) != block_len {
+            return Ok(Verdict::Invalid(
+                "PCAPNG block trailer does not repeat its length".to_string(),
+            ));
+        }
+        source.skip(4)?;
+    }
+    Ok(Verdict::Valid)
+}
+
+fn carve_wasm(source: &mut Source<'_>) -> io::Result<Verdict> {
+    if peek_array::<4>(source)? != Some(*b"\0asm") {
+        return Ok(Verdict::Invalid("missing WebAssembly magic".to_string()));
+    }
+    source.skip(4)?;
+    let Some(version) = peek_array::<4>(source)? else {
+        return Ok(Verdict::Truncated(
+            "dump ended inside the WebAssembly version field".to_string(),
+        ));
+    };
+    if version != 1u32.to_le_bytes() && version != 2u32.to_le_bytes() {
+        return Ok(Verdict::Invalid("unsupported WebAssembly binary version".to_string()));
+    }
+    source.skip(4)?;
+    for _ in 0..4096u64 {
+        if source.abs() >= source.end {
+            break;
+        }
+        let Some(id) = peek_u8(source)? else {
+            return Ok(Verdict::Truncated(
+                "dump ended inside a WebAssembly section".to_string(),
+            ));
+        };
+        if id > 12 {
+            return Ok(Verdict::Invalid(format!(
+                "WebAssembly section id {id} is not defined"
+            )));
+        }
+        source.skip(1)?;
+        let Some(size) = read_vint(source)? else {
+            return Ok(Verdict::Truncated(
+                "WebAssembly section size desyncs".to_string(),
+            ));
+        };
+        if !room_left(source, size) {
+            return Ok(Verdict::Truncated(
+                "dump ended inside a WebAssembly section".to_string(),
+            ));
+        }
+        source.skip(size)?;
+    }
+    Ok(Verdict::Valid)
+}
+
+fn carve_lnk(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let Some(header) = peek_array::<0x4c>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the LNK header".to_string()));
+    };
+    let clsid = [
+        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x46,
+    ];
+    if &header[..4] != b"L\0\0\0"
+        || header[4..20] != clsid
+    {
+        return Ok(Verdict::Invalid("implausible LNK header (magic/CLSID)".to_string()));
+    }
+    let flags = u32::from_le_bytes([header[0x14], header[0x15], header[0x16], header[0x17]]);
+    let is_unicode = flags & 0x0000_0080 != 0;
+    source.skip(0x4c)?;
+    if flags & 0x0000_0001 != 0 {
+        let Some(size) = peek_array::<2>(source)? else {
+            return Ok(Verdict::Truncated("LNK LinkTargetIDListSize is missing".to_string()));
+        };
+        let idlist = u16::from_le_bytes(size);
+        source.skip(2)?;
+        if !room_left(source, u64::from(idlist)) {
+            return Ok(Verdict::Truncated(
+                "dump ended inside the LNK LinkTargetIDList".to_string(),
+            ));
+        }
+        source.skip(u64::from(idlist))?;
+    }
+    if flags & 0x0000_0002 != 0 {
+        let Some(size) = peek_array::<4>(source)? else {
+            return Ok(Verdict::Truncated("LNK LinkInfoSize is missing".to_string()));
+        };
+        let link_info = u32::from_le_bytes(size);
+        if !room_left(source, u64::from(link_info)) {
+            return Ok(Verdict::Truncated(
+                "dump ended inside the LNK LinkInfo block".to_string(),
+            ));
+        }
+        source.skip(u64::from(link_info))?;
+    }
+    let string_flags = [
+        0x0000_0004_u32,
+        0x0000_0008,
+        0x0000_0010,
+        0x0000_0020,
+        0x0000_0040,
+        0x0000_0200,
+        0x0000_0800,
+        0x0000_1000,
+        0x0000_4000,
+        0x0100_0000,
+    ];
+    for &bit in &string_flags {
+        if flags & bit == 0 {
+            continue;
+        }
+        let count_bytes = if is_unicode { 2 } else { 1 };
+        let prefix = match peek_array::<2>(source)? {
+            Some(prefix) => prefix,
+            None => {
+                return Ok(Verdict::Truncated(
+                    "dump ended inside an LNK StringData header".to_string(),
+                ))
+            }
+        };
+        let count = if is_unicode {
+            usize::from(u16::from_le_bytes(prefix))
+        } else {
+            usize::from(prefix[0])
+        };
+        let take_len = count * if is_unicode { 2 } else { 1 };
+        source.skip(count_bytes as u64)?;
+        if !room_left(source, take_len as u64) {
+            return Ok(Verdict::Truncated(
+                "dump ended inside an LNK StringData section".to_string(),
+            ));
+        }
+        source.skip(take_len as u64)?;
+    }
+    let handled = 0x0000_0001
+        | 0x0000_0002
+        | 0x0000_0004
+        | 0x0000_0008
+        | 0x0000_0010
+        | 0x0000_0020
+        | 0x0000_0040
+        | 0x0000_0080
+        | 0x0000_0200
+        | 0x0000_0800
+        | 0x0000_1000
+        | 0x0000_4000
+        | 0x0100_0000;
+    let unknown = flags & !handled;
+    if unknown != 0 {
+        return Ok(Verdict::Truncated(format!(
+            "LNK has string flags 0x{unknown:08x} this validator does not parse"
+        )));
+    }
+    Ok(Verdict::Valid)
+}
+
+fn carve_pem(source: &mut Source<'_>) -> io::Result<Verdict> {
+    if peek_array::<11>(source)? != Some(*b"-----BEGIN ") {
+        return Ok(Verdict::Invalid("missing PEM BEGIN line".to_string()));
+    }
+    source.skip(11)?;
+    let mut label: Vec<u8> = Vec::new();
+    loop {
+        let Some(byte) = peek_u8(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside the PEM label".to_string()));
+        };
+        if byte == b'-' {
+            break;
+        }
+        if !(byte.is_ascii_alphanumeric() || byte == b' ') || label.len() >= 64 {
+            return Ok(Verdict::Invalid(
+                "PEM label contains unexpected bytes".to_string(),
+            ));
+        }
+        label.push(byte);
+        source.skip(1)?;
+    }
+    if label.is_empty() {
+        return Ok(Verdict::Invalid("PEM label is empty".to_string()));
+    }
+    if peek_array::<5>(source)? != Some(*b"-----") {
+        return Ok(Verdict::Invalid(
+            "PEM BEGIN line does not end with -----".to_string(),
+        ));
+    }
+    source.skip(5)?;
+    if peek_u8(source)? == Some(b'\r') {
+        source.skip(1)?;
+    }
+    if peek_u8(source)? == Some(b'\n') {
+        source.skip(1)?;
+    }
+    let end_marker = [b"-----END ".as_slice(), label.as_slice(), b"-----"].concat();
+    for _ in 0..20_000u64 {
+        let line_start = source.abs();
+        let line_end = match find_byte(source, b'\n')? {
+            Some(end) => end,
+            None => {
+                return Ok(Verdict::Truncated(
+                    "dump ended inside the PEM payload".to_string(),
+                ))
+            }
+        };
+        if line_start == line_end {
+            continue;
+        }
+        let len = line_end - line_start;
+        let Some(line) = take_bytes(source, len as usize)? else {
+            return Ok(Verdict::Truncated(
+                "dump ended inside the PEM payload".to_string(),
+            ));
+        };
+        if line.starts_with(b"-----END ") {
+            if line != end_marker {
+                return Ok(Verdict::Invalid(
+                    "PEM END label does not match the BEGIN label".to_string(),
+                ));
+            }
+            return Ok(Verdict::Valid);
+        }
+        let trimmed: Vec<u8> = line.iter().copied().filter(|&b| b != b'\r').collect();
+        if trimmed.is_empty()
+            || !trimmed
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        {
+            return Ok(Verdict::Invalid(
+                "PEM payload line is not base64".to_string(),
+            ));
+        }
+    }
+    Ok(Verdict::Truncated(
+        "PEM block line count exceeded the limit".to_string(),
+    ))
+}
+
+fn carve_kdbx(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let Some(magic) = peek_array::<12>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the KDBX signature".to_string()));
+    };
+    if magic[..4] != [0x03, 0xd9, 0xa2, 0x9a]
+        || !matches!(&magic[4..8], [0x67, 0xfb, 0x4b, 0xb5] | [0x66, 0xfb, 0x4b, 0xb5] | [0x65, 0xfb, 0x4b, 0xb5])
+    {
+        return Ok(Verdict::Invalid("implausible KDBX signature".to_string()));
+    }
+    let version = u32::from_le_bytes([magic[8], magic[9], magic[10], magic[11]]);
+    let major = version >> 16;
+    if !(3..=4).contains(&major) {
+        return Ok(Verdict::Invalid(format!(
+            "unsupported KDBX major version {major}"
+        )));
+    }
+    source.skip(12)?;
+    for _ in 0..512u64 {
+        let Some(id) = peek_u8(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside a KDBX header field".to_string()));
+        };
+        source.skip(1)?;
+        if id == 0 {
+            break;
+        }
+        let Some(size_bytes) = peek_array::<4>(source)? else {
+            return Ok(Verdict::Truncated(
+                "dump ended inside a KDBX header field size".to_string(),
+            ));
+        };
+        let size = u32::from_le_bytes(size_bytes);
+        if !room_left(source, 4 + u64::from(size)) {
+            return Ok(Verdict::Truncated(
+                "dump ended inside a KDBX header field".to_string(),
+            ));
+        }
+        source.skip(4 + u64::from(size))?;
+    }
+    if !room_left(source, 64) {
+        return Ok(Verdict::Truncated(
+            "dump ended inside the KDBX header hashes".to_string(),
+        ));
+    }
+    source.skip(64)?;
+    for _ in 0..1_000_000u64 {
+        let Some(block) = peek_array::<12>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside a KDBX block header".to_string()));
+        };
+        let id = u64::from_le_bytes(block[..8].try_into().unwrap());
+        let size = i32::from_le_bytes(block[8..12].try_into().unwrap());
+        source.skip(12)?;
+        if size < 0 {
+            return Ok(Verdict::Invalid("KDBX block size is negative".to_string()));
+        }
+        if !room_left(source, 32 + u64::from(size as u32)) {
+            return Ok(Verdict::Truncated(
+                "dump ended inside a KDBX block payload".to_string(),
+            ));
+        }
+        source.skip(32 + u64::from(size as u32))?;
+        if id == 0 && size == 0 {
+            return Ok(Verdict::Valid);
+        }
+    }
+    Ok(Verdict::Truncated(
+        "KDBX block count exceeded the limit".to_string(),
+    ))
+}
+
+fn carve_dex(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let window = window_len(source);
+    let Some(header) = peek_array::<0x70>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the DEX header".to_string()));
+    };
+    if &header[..4] != b"dex\n"
+        || !matches!(
+            &header[4..8],
+            b"035\x00" | b"036\x00" | b"037\x00" | b"038\x00" | b"039\x00" | b"040\x00"
+        )
+    {
+        return Ok(Verdict::Invalid("implausible DEX magic/version".to_string()));
+    }
+    let read_u32 = |bytes: &[u8]| -> u32 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    };
+    let header_size = read_u32(&header[36..40]);
+    let endian_tag = read_u32(&header[40..44]);
+    let file_size = u64::from(read_u32(&header[32..36]));
+    let map_off = u64::from(read_u32(&header[52..56]));
+    let string_ids_size = u64::from(read_u32(&header[56..60]));
+    let string_ids_off = u64::from(read_u32(&header[60..64]));
+    let type_ids_size = u64::from(read_u32(&header[64..68]));
+    let type_ids_off = u64::from(read_u32(&header[68..72]));
+    if header_size != 0x70 || endian_tag != 0x1234_5678 {
+        return Ok(Verdict::Invalid("DEX header size/endian tag mismatch".to_string()));
+    }
+    if file_size < 0x70 || file_size > window {
+        return Ok(Verdict::Truncated(format!(
+            "DEX declares {file_size} bytes but the candidate window is smaller"
+        )));
+    }
+    if map_off >= file_size || string_ids_off >= file_size || type_ids_off >= file_size
+        || string_ids_size * 4 > file_size
+        || type_ids_size * 4 > file_size
+    {
+        return Ok(Verdict::Invalid("DEX offsets point outside the file".to_string()));
+    }
+    // Verify integrity: Adler-32 of everything past the checksum field.
+    let checksum = read_u32(&header[8..12]);
+    source.skip(12)?;
+    let checksum_read = {
+        let amount = (file_size - 12) as usize;
+        let mut buffer = vec![0u8; amount];
+        source.file.seek(std::io::SeekFrom::Start(source.origin + 12))?;
+        std::io::Read::read_exact(&mut source.file, &mut buffer)?;
+        adler32(&buffer)
+    };
+    if checksum_read != checksum {
+        return Ok(Verdict::Invalid(
+            "DEX Adler-32 checksum does not match".to_string(),
+        ));
+    }
+    source.skip(file_size - source.produced())?;
+    Ok(Verdict::Valid)
+}
+
+fn carve_tiff(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let Some(magic) = peek_array::<4>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the TIFF magic".to_string()));
+    };
+    let little_endian = match &magic {
+        [b'I', b'I', 0x2a, 0x00] => true,
+        [b'M', b'M', 0x00, 0x2a] => false,
+        _ => return Ok(Verdict::Invalid("missing TIFF magic".to_string())),
+    };
+    let read16 = |bytes: &[u8]| -> u16 {
+        if little_endian {
+            u16::from_le_bytes([bytes[0], bytes[1]])
+        } else {
+            u16::from_be_bytes([bytes[0], bytes[1]])
+        }
+    };
+    let read32 = |bytes: &[u8]| -> u32 {
+        if little_endian {
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+    };
+    source.skip(4)?;
+    let ifd0 = match peek_array::<4>(source)? {
+        Some(offset) => read32(&offset) as u64,
+        None => return Ok(Verdict::Truncated("TIFF IFD0 offset is missing".to_string())),
+    };
+    let window = window_len(source);
+    if ifd0 >= window {
+        return Ok(Verdict::Invalid("TIFF IFD0 offset points outside the file".to_string()));
+    }
+    source.skip(4)?;
+    let type_size: u64 = 8; // upper bound used only for inline-value decisions
+    let _ = type_size;
+    let mut ifd = ifd0;
+    for _ in 0..MAX_TIFF_IFDS {
+        if ifd >= window {
+            return Ok(Verdict::Invalid("TIFF IFD offset points outside the file".to_string()));
+        }
+        source.skip(ifd - source.abs())?;
+        let Some(count_bytes) = peek_array::<2>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside a TIFF IFD".to_string()));
+        };
+        let count = read16(&count_bytes);
+        if count == 0 || count > 4096 {
+            return Ok(Verdict::Invalid(format!("TIFF IFD entry count {count} is implausible")));
+        }
+        source.skip(2)?;
+        for _ in 0..count {
+            let Some(entry) = peek_array::<12>(source)? else {
+                return Ok(Verdict::Truncated("dump ended inside a TIFF IFD entry".to_string()));
+            };
+            let tag = read16(&entry[0..2]);
+            let entry_type = read16(&entry[2..4]);
+            let _ = tag;
+            let type_len: u64 = match entry_type {
+                1 | 2 | 6 | 7 => 1,
+                3 | 8 => 2,
+                4 | 9 | 11 => 4,
+                5 | 10 | 12 => 8,
+                16 | 17 | 18 => 8,
+                _ => {
+                    return Ok(Verdict::Invalid(format!(
+                        "TIFF field type {entry_type} is not defined"
+                    )))
+                }
+            };
+            let value_count = read32(&entry[4..8]) as u64;
+            if value_count > 1_000_000_000 {
+                return Ok(Verdict::Invalid("TIFF field count is implausible".to_string()));
+            }
+            let total = type_len * value_count;
+            if total > 4 {
+                let offset = read32(&entry[8..12]) as u64;
+                if offset.checked_add(total).is_none_or(|end| end > window) {
+                    return Ok(Verdict::Truncated(
+                        "TIFF field data extends past the candidate".to_string(),
+                    ));
+                }
+            }
+            source.skip(12)?;
+        }
+        let Some(next) = peek_array::<4>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside a TIFF IFD trailer".to_string()));
+        };
+        let next_ifd = read32(&next) as u64;
+        source.skip(4)?;
+        if next_ifd == 0 {
+            return Ok(Verdict::Valid);
+        }
+        ifd = next_ifd;
+    }
+    Ok(Verdict::Truncated("TIFF IFD count exceeded the limit".to_string()))
+}
+
+fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let window = window_len(source);
+    let mut frames_start = 0u64;
+    if peek_array::<3>(source)? == Some(*b"ID3") {
+        // ID3v2 header: "ID3", ver(2), flags(1), syncsafe size(4).
+        let Some(header) = peek_array::<10>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside the ID3v2 header".to_string()));
+        };
+        let id3_len = ((u32::from(header[6]) & 0x7f) << 21)
+            | ((u32::from(header[7]) & 0x7f) << 14)
+            | ((u32::from(header[8]) & 0x7f) << 7)
+            | (u32::from(header[9]) & 0x7f);
+        if u64::from(id3_len) + 10 > window {
+            return Ok(Verdict::Truncated(
+                "dump ended inside the ID3v2 tag".to_string(),
+            ));
+        }
+        source.skip(10 + u64::from(id3_len))?;
+        frames_start = source.abs();
+    }
+    let mpeg_bitrate = |version: u8, index: usize| -> Option<u32> {
+        // Layer III tables, kbps.
+        const MPEG1: [u32; 16] = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+        const MPEG2: [u32; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
+        if index >= 16 {
+            return None;
+        }
+        match version {
+            3 => Some(MPEG1[index]),
+            2 | 0 => Some(MPEG2[index]),
+            _ => None, // reserved
+        }
+    };
+    let mpeg_samplerate = |version: u8, index: usize| -> Option<u32> {
+        const MPEG1: [u32; 4] = [44100, 48000, 32000, 0];
+        const MPEG2: [u32; 4] = [22050, 24000, 16000, 0];
+        const MPEG25: [u32; 4] = [11025, 12000, 8000, 0];
+        if index >= 4 {
+            return None;
+        }
+        match version {
+            3 => Some(MPEG1[index]),
+            2 => Some(MPEG2[index]),
+            0 => Some(MPEG25[index]),
+            _ => None,
+        }
+    };
+    let mut frames = 0u64;
+    loop {
+        if source.abs() >= source.end {
+            break;
+        }
+        let Some(header) = peek_array::<4>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside an MP3 frame header".to_string()));
+        };
+        if header[0] != 0xff || header[1] & 0xe0 != 0xe0 {
+            if frames == 0 {
+                return Ok(Verdict::Invalid(
+                    "MP3 stream does not start with an MPEG frame sync".to_string(),
+                ));
+            }
+            break;
+        }
+        let version = (header[1] >> 3) & 0x03;
+        let layer = (header[1] >> 1) & 0x03;
+        let bitrate_index = ((header[2] >> 4) & 0x0f) as usize;
+        let samplerate_index = ((header[2] >> 2) & 0x03) as usize;
+        let padding = (header[2] >> 1) & 0x01;
+        if version == 1 || layer != 1 {
+            if frames == 0 {
+                return Ok(Verdict::Invalid(
+                    "MP3 frame is not MPEG Layer III or uses a reserved version".to_string(),
+                ));
+            }
+            break;
+        }
+        let bitrate = match mpeg_bitrate(version, bitrate_index) {
+            Some(value) if value > 0 => value,
+            _ => {
+                if frames == 0 {
+                    return Ok(Verdict::Invalid("MP3 frame has an invalid bitrate index".to_string()));
+                }
+                break;
+            }
+        };
+        let samplerate = match mpeg_samplerate(version, samplerate_index) {
+            Some(value) if value > 0 => value,
+            _ => {
+                if frames == 0 {
+                    return Ok(Verdict::Invalid("MP3 frame has an invalid sample rate index".to_string()));
+                }
+                break;
+            }
+        };
+        let coefficient: u64 = if version == 3 { 144 } else { 72 };
+        let frame_len = coefficient * u64::from(bitrate) * 1000 / u64::from(samplerate)
+            + u64::from(padding);
+        if frame_len < 4 || !room_left(source, frame_len) {
+            return Ok(Verdict::Truncated(
+                "dump ended inside an MP3 frame".to_string(),
+            ));
+        }
+        source.skip(frame_len)?;
+        frames += 1;
+        if frames > 10_000_000 {
+            return Ok(Verdict::Truncated("MP3 frame count exceeded the limit".to_string()));
+        }
+    }
+    let _ = frames_start;
+    if frames == 0 {
+        return Ok(Verdict::Invalid("no MPEG audio frames found".to_string()));
+    }
+    Ok(Verdict::Valid)
+}
+
+fn carve_bz2(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let Some(header) = peek_array::<10>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the BZIP2 header".to_string()));
+    };
+    if &header[..3] != b"BZh" || !(b'1'..=b'9').contains(&header[3]) {
+        return Ok(Verdict::Invalid("implausible BZIP2 magic/level".to_string()));
+    }
+    if &header[4..10] != b"1AY&SY" {
+        return Ok(Verdict::Invalid(
+            "BZIP2 block magic is missing after the stream header".to_string(),
+        ));
+    }
+    // The body is a Huffman/arithmetic bit stream with no terminal marker we
+    // can trust; carve to the end of the candidate window and label the
+    // result incomplete.
+    source.skip(window_len(source))?;
+    Ok(Verdict::Truncated(
+        "bz2 stream body not decoded; extent ends at the candidate window".to_string(),
+    ))
+}
+
+fn carve_xz(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let Some(header) = peek_array::<12>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the XZ header".to_string()));
+    };
+    if &header[..6] != b"\xfd7zXZ\x00" {
+        return Ok(Verdict::Invalid("missing XZ magic".to_string()));
+    }
+    if header[6] != 0x00 || header[7] > 0x3f {
+        return Ok(Verdict::Invalid(
+            "XZ stream flags are implausible".to_string(),
+        ));
+    }
+    let expected_crc = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    if crc32(0, &header[..8]) != expected_crc {
+        return Ok(Verdict::Invalid("XZ header CRC-32 does not match".to_string()));
+    }
+    source.skip(window_len(source))?;
+    Ok(Verdict::Truncated(
+        "XZ stream body not decoded; extent ends at the candidate window".to_string(),
+    ))
+}
+
+fn carve_class(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let Some(magic) = peek_array::<8>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the CLASS magic".to_string()));
+    };
+    if &magic[..4] != b"\xca\xfe\xba\xbe" {
+        return Ok(Verdict::Invalid("missing CLASS magic".to_string()));
+    }
+    let minor = u16::from_be_bytes([magic[4], magic[5]]);
+    let major = u16::from_be_bytes([magic[6], magic[7]]);
+    let _ = minor;
+    if !(45..=70).contains(&major) {
+        return Ok(Verdict::Invalid(format!("implausible CLASS major version {major}")));
+    }
+    source.skip(8)?;
+    let Some(cp_count_bytes) = peek_array::<2>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the CLASS constant pool".to_string()));
+    };
+    let cp_count = u64::from(u16::from_be_bytes(cp_count_bytes));
+    if cp_count == 0 || cp_count > MAX_CLASS_POOL {
+        return Ok(Verdict::Invalid(format!("CLASS constant pool count {cp_count} is implausible")));
+    }
+    source.skip(2)?;
+    let mut index = 1u64;
+    while index < cp_count {
+        let Some(tag) = peek_u8(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside the CLASS constant pool".to_string()));
+        };
+        source.skip(1)?;
+        let read_cp_value = |source: &mut Source<'_>, amount: u64| -> io::Result<Option<()>> {
+            if !room_left(source, amount) {
+                return Ok(None);
+            }
+            source.skip(amount)?;
+            Ok(Some(()))
+        };
+        match tag {
+            1 => {
+                let Some(len_bytes) = peek_array::<2>(source)? else {
+                    return Ok(Verdict::Truncated("dump ended inside a CLASS UTF-8 entry".to_string()));
+                };
+                let len = u64::from(u16::from_be_bytes(len_bytes));
+                source.skip(2)?;
+                if read_cp_value(source, len)?.is_none() {
+                    return Ok(Verdict::Truncated("dump ended inside a CLASS UTF-8 entry".to_string()));
+                }
+            }
+            3 | 4 => {
+                if read_cp_value(source, 4)?.is_none() {
+                    return Ok(Verdict::Truncated("dump ended inside a CLASS integer entry".to_string()));
+                }
+            }
+            5 | 6 => {
+                if read_cp_value(source, 8)?.is_none() {
+                    return Ok(Verdict::Truncated("dump ended inside a CLASS long entry".to_string()));
+                }
+                index += 1;
+            }
+            7 | 8 | 16 | 19 | 20 => {
+                if read_cp_value(source, 2)?.is_none() {
+                    return Ok(Verdict::Truncated("dump ended inside a CLASS reference entry".to_string()));
+                }
+            }
+            9 | 10 | 11 | 12 | 17 | 18 => {
+                if read_cp_value(source, 4)?.is_none() {
+                    return Ok(Verdict::Truncated("dump ended inside a CLASS reference entry".to_string()));
+                }
+            }
+            15 => {
+                if read_cp_value(source, 3)?.is_none() {
+                    return Ok(Verdict::Truncated("dump ended inside a CLASS method-handle entry".to_string()));
+                }
+            }
+            _ => {
+                return Ok(Verdict::Invalid(format!(
+                    "CLASS constant pool tag {tag} is not defined"
+                )))
+            }
+        }
+        index += 1;
+    }
+    for _ in 0..2u64 {
+        if !room_left(source, 2) {
+            return Ok(Verdict::Truncated(
+                "dump ended inside the CLASS this/super class".to_string(),
+            ));
+        }
+        source.skip(2)?;
+    }
+    let Some(interface_count) = peek_array::<2>(source)? else {
+        return Ok(Verdict::Truncated("CLASS interface count is missing".to_string()));
+    };
+    let interfaces = u64::from(u16::from_be_bytes(interface_count));
+    source.skip(2)?;
+    if !room_left(source, interfaces * 2) {
+        return Ok(Verdict::Truncated("dump ended inside the CLASS interface list".to_string()));
+    }
+    source.skip(interfaces * 2)?;
+    // Fields then methods, each { access_flags(2), name(2), descriptor(2),
+    // attributes_count(2), attributes[{ name_index(2), length(4), bytes }] }.
+    for section in ["field", "method"] {
+        let Some(count_bytes) = peek_array::<2>(source)? else {
+            return Ok(Verdict::Truncated(format!("CLASS {section} count is missing")));
+        };
+        let count = u64::from(u16::from_be_bytes(count_bytes));
+        source.skip(2)?;
+        for _ in 0..count {
+            if !room_left(source, 8) {
+                return Ok(Verdict::Truncated(format!("dump ended inside a CLASS {section} entry")));
+            }
+            source.skip(6)?;
+            let Some(attr_count_bytes) = peek_array::<2>(source)? else {
+                return Ok(Verdict::Truncated(format!("CLASS {section} attribute count is missing")));
+            };
+            let attr_count = u64::from(u16::from_be_bytes(attr_count_bytes));
+            source.skip(2)?;
+            for _ in 0..attr_count {
+                let Some(attr_len_bytes) = peek_array::<6>(source)? else {
+                    return Ok(Verdict::Truncated(format!("CLASS {section} attribute header is missing")));
+                };
+                let attr_len = u32::from_be_bytes([
+                    attr_len_bytes[2], attr_len_bytes[3], attr_len_bytes[4], attr_len_bytes[5],
+                ]) as u64;
+                source.skip(6)?;
+                if !room_left(source, attr_len) {
+                    return Ok(Verdict::Truncated(format!("dump ended inside a CLASS {section} attribute")));
+                }
+                source.skip(attr_len)?;
+            }
+        }
+    }
+    // Class-level attributes.
+    let Some(attr_count_bytes) = peek_array::<2>(source)? else {
+        return Ok(Verdict::Truncated("CLASS attribute count is missing".to_string()));
+    };
+    let attr_count = u64::from(u16::from_be_bytes(attr_count_bytes));
+    source.skip(2)?;
+    for _ in 0..attr_count {
+        let Some(attr_len_bytes) = peek_array::<6>(source)? else {
+            return Ok(Verdict::Truncated("CLASS attribute header is missing".to_string()));
+        };
+        let attr_len = u32::from_be_bytes([
+            attr_len_bytes[2], attr_len_bytes[3], attr_len_bytes[4], attr_len_bytes[5],
+        ]) as u64;
+        source.skip(6)?;
+        if !room_left(source, attr_len) {
+            return Ok(Verdict::Truncated("dump ended inside a CLASS attribute".to_string()));
+        }
+        source.skip(attr_len)?;
+    }
+    Ok(Verdict::Valid)
+}
+
+fn carve_rtf(source: &mut Source<'_>) -> io::Result<Verdict> {
+    if peek_array::<6>(source)? != Some(*b"{\\rtf1") {
+        return Ok(Verdict::Invalid("missing RTF magic".to_string()));
+    }
+    let mut depth = 0i64;
+    let mut offset = 0u64;
+    while source.abs() < source.end && offset < MAX_RTF_BYTES {
+        let Some(byte) = peek_u8(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside the RTF document".to_string()));
+        };
+        match byte {
+            0x00 => {
+                return Ok(Verdict::Invalid("NUL byte inside the RTF document".to_string()))
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    source.skip(1)?;
+                    return Ok(Verdict::Valid);
+                }
+            }
+            _ => {}
+        }
+        source.skip(1)?;
+        offset += 1;
+    }
+    if offset >= MAX_RTF_BYTES {
+        return Ok(Verdict::Truncated(
+            "RTF document exceeded the 16 MiB scan limit".to_string(),
+        ));
+    }
+    Ok(Verdict::Truncated(
+        "dump ended before the RTF root group closed".to_string(),
+    ))
+}
+
+fn carve_evtx(source: &mut Source<'_>) -> io::Result<Verdict> {
+    const CHUNK_SIZE: u64 = 65536;
+    let Some(header) = peek_array::<128>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the EVTX file header".to_string()));
+    };
+    if &header[..8] != b"ElfFile\x00" {
+        return Ok(Verdict::Invalid("missing EVTX magic".to_string()));
+    }
+    let header_size = u32::from_le_bytes([header[48], header[49], header[50], header[51]]);
+    let version_minor = u16::from_le_bytes([header[64], header[65]]);
+    let version_major = u16::from_le_bytes([header[66], header[67]]);
+    let first_chunk = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    let last_chunk = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+    if header_size != 128 || version_major == 0 || version_minor > 3 {
+        return Ok(Verdict::Invalid(
+            "EVTX header size/version is implausible".to_string(),
+        ));
+    }
+    if last_chunk < first_chunk {
+        return Ok(Verdict::Invalid(
+            "EVTX chunk range is reversed".to_string(),
+        ));
+    }
+    source.skip(u64::from(header_size))?;
+    let mut chunks: u64 = 0;
+    loop {
+        if source.abs() >= source.end {
+            break;
+        }
+        let Some(chunk) = peek_array::<8>(source)? else {
+            return Ok(Verdict::Truncated("dump ended inside an EVTX chunk header".to_string()));
+        };
+        if &chunk != b"ElfChnk\x00" {
+            if chunks == 0 {
+                return Ok(Verdict::Invalid(
+                    "EVTX first chunk is not an ElfChnk container".to_string(),
+                ));
+            }
+            break;
+        }
+        chunks += 1;
+        if !room_left(source, CHUNK_SIZE) {
+            return Ok(Verdict::Truncated("dump ended inside an EVTX chunk".to_string()));
+        }
+        source.skip(CHUNK_SIZE)?;
+        if source.abs() - source.origin >= window_len(source) {
+            break;
+        }
+    }
+    if chunks == 0 {
+        return Ok(Verdict::Invalid("EVTX contains no chunks".to_string()));
+    }
+    Ok(Verdict::Valid)
+}
+
+fn carve_vdi(source: &mut Source<'_>) -> io::Result<Verdict> {
+    if peek_array::<40>(source)? != Some(*b"<<< Oracle VM VirtualBox Disk Image >>>\n") {
+        return Ok(Verdict::Invalid("missing VDI magic".to_string()));
+    }
+    let Some(rest) = peek_array::<58>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the VDI header".to_string()));
+    };
+    if !rest[..58]
+        .iter()
+        .all(|&byte| byte == 0x00 || (0x20..=0x7e).contains(&byte))
+    {
+        return Ok(Verdict::Invalid("VDI creator string is not printable".to_string()));
+    }
+    let carved = window_len(source).min(4096);
+    source.skip(carved)?;
+    Ok(Verdict::Truncated(
+        "VDI body not parsed; only the 4 KiB header was carved".to_string(),
+    ))
+}
+
+fn carve_vmdk(source: &mut Source<'_>) -> io::Result<Verdict> {
+    let Some(header) = peek_array::<512>(source)? else {
+        return Ok(Verdict::Truncated("dump ended inside the VMDK sparse header".to_string()));
+    };
+    if &header[..4] != b"KDMV" {
+        return Ok(Verdict::Invalid("missing VMDK sparse magic".to_string()));
+    }
+    let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let capacity = u64::from_le_bytes([
+        header[12], header[13], header[14], header[15], header[16], header[17], header[18],
+        header[19],
+    ]);
+    let grain_size = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+    if !(1..=3).contains(&version) || capacity == 0 || capacity > 1u64 << 40 || grain_size == 0 {
+        return Ok(Verdict::Invalid("implausible VMDK sparse header fields".to_string()));
+    }
+    let carved = window_len(source).min(65536);
+    source.skip(carved)?;
+    Ok(Verdict::Truncated(
+        "VMDK extents not parsed; only the 64 KiB header was carved".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -1995,6 +4310,274 @@ mod tests {
         out.extend_from_slice(&central_offset.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // comment length
         out
+    }
+
+    /// Deterministic high-entropy bytes standing in for ciphertext.
+    fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// A ZIP entry whose first 8 KiB is structured text and whose last 8 KiB
+    /// is "encrypted", with no central directory: the shape partial
+    /// encryption leaves behind. The encrypted part starts 39 + 8192 bytes in.
+    fn half_encrypted_zip() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // stored
+        out.extend_from_slice(&[0u8; 4]); // time + date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc (not checked)
+        out.extend_from_slice(&16384u32.to_le_bytes()); // packed size
+        out.extend_from_slice(&16384u32.to_le_bytes()); // unpacked size
+        out.extend_from_slice(&9u16.to_le_bytes()); // name length
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        out.extend_from_slice(b"notes.txt");
+        out.extend_from_slice(&vec![b'A'; 8192]);
+        out.extend_from_slice(&pseudo_random(8192, 0x9e37_79b9_7f4a_7c15));
+        out
+    }
+
+    #[test]
+    fn incomplete_zip_reports_corruption_and_entropy_spike_offsets() {
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&half_encrypted_zip());
+        dump.extend_from_slice(&[0u8; 64]);
+
+        let path = write_dump("partial-zip", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.kind, CarveKind::Zip);
+        assert!(!file.complete, "{file:?}");
+        assert_eq!(file.corrupted_offset, Some(file.offset + file.size));
+        let spike = file
+            .entropy_spike_at
+            .expect("the structured -> random jump must be flagged");
+        let encrypted_from = file.offset + 39 + 8192;
+        assert!(
+            spike <= encrypted_from && encrypted_from < spike + SPIKE_WINDOW as u64,
+            "spike {spike:#x} does not cover the encrypted start {encrypted_from:#x}"
+        );
+    }
+
+    #[test]
+    fn complete_files_carry_no_corruption_metadata() {
+        let zip = zip_bytes("a.txt", b"hello");
+        let mut dump = vec![0u8; 32];
+        dump.extend_from_slice(&zip);
+        dump.extend_from_slice(&[0u8; 32]);
+
+        let path = write_dump("complete-zip", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert!(report.files[0].complete);
+        assert_eq!(report.files[0].corrupted_offset, None);
+        assert_eq!(report.files[0].entropy_spike_at, None);
+    }
+
+    #[test]
+    fn random_from_the_first_byte_has_no_entropy_spike() {
+        // Ciphertext with no structured prefix has no boundary to report.
+        let mut zip = half_encrypted_zip();
+        let header = 39;
+        zip.splice(header..header + 8192, pseudo_random(8192, 7));
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&zip);
+        dump.extend_from_slice(&[0u8; 64]);
+
+        let path = write_dump("all-random", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert!(!report.files[0].complete);
+        assert_eq!(report.files[0].entropy_spike_at, None);
+    }
+
+    /// A ZIP whose local headers and data are replaced by "ciphertext" but
+    /// whose central directory and end record survive. Returns the dump and
+    /// the absolute offset where the surviving tail starts.
+    fn zip_with_ruined_head() -> (Vec<u8>, usize) {
+        let zip = zip_bytes("a.txt", b"hello world, hello world");
+        let eocd_at = zip
+            .windows(4)
+            .rposition(|chunk| chunk == b"PK\x05\x06")
+            .unwrap();
+        let cd_size =
+            u32::from_le_bytes(zip[eocd_at + 12..eocd_at + 16].try_into().unwrap()) as usize;
+        let cd_at = eocd_at - cd_size;
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&pseudo_random(cd_at, 0x1357_9bdf_2468_ace1));
+        let tail_at = dump.len();
+        dump.extend_from_slice(&zip[cd_at..]);
+        dump.extend_from_slice(&[0u8; 64]);
+        (dump, tail_at)
+    }
+
+    #[test]
+    fn salvage_recovers_a_zip_central_directory_whose_head_is_gone() {
+        let (dump, tail_at) = zip_with_ruined_head();
+        let path = write_dump("salvage-zip", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let plain = Carver::new(options.clone())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        let salvaged = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(
+            plain
+                .files
+                .iter()
+                .all(|file| !file.notes.starts_with("salvage:tail")),
+            "salvage must stay off by default: {plain:?}"
+        );
+        let tails: Vec<_> = salvaged
+            .files
+            .iter()
+            .filter(|file| file.notes.starts_with("salvage:tail"))
+            .collect();
+        assert_eq!(tails.len(), 1, "{salvaged:?}");
+        let tail = tails[0];
+        assert_eq!(tail.kind, CarveKind::Zip);
+        assert!(!tail.complete);
+        assert_eq!(tail.offset, tail_at as u64);
+        assert_eq!(tail.size, (dump.len() - 64 - tail_at) as u64);
+        assert_eq!(tail.corrupted_offset, Some(tail.offset));
+    }
+
+    #[test]
+    fn salvage_recovers_a_pdf_trailer_behind_a_ruined_body() {
+        let trailer: &[u8] =
+            b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n9999\n%%EOF\n";
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&pseudo_random(8192, 0x2545_f491_4f6c_dd1d));
+        let tail_at = dump.len() as u64;
+        dump.extend_from_slice(trailer);
+        dump.extend_from_slice(&[0u8; 64]);
+
+        let path = write_dump("salvage-pdf", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        let tails: Vec<_> = report
+            .files
+            .iter()
+            .filter(|file| file.kind == CarveKind::Pdf && file.notes.starts_with("salvage:tail"))
+            .collect();
+        assert_eq!(tails.len(), 1, "{report:?}");
+        let tail = tails[0];
+        assert!(!tail.complete);
+        // The boundary may overshoot by the few ciphertext bytes that happen
+        // to look like text, but never undershoot the trailer.
+        assert!(tail.offset <= tail_at, "{tail:?}");
+        assert!(tail_at - tail.offset < 16, "{tail:?}");
+        assert_eq!(tail.offset + tail.size, tail_at + trailer.len() as u64);
+        assert!(tail.entropy_spike_at.is_some(), "{tail:?}");
+    }
+
+    #[test]
+    fn salvage_skips_footers_inside_files_the_header_pass_carved() {
+        let zip = zip_bytes("a.txt", b"hello");
+        let mut dump = vec![0u8; 32];
+        dump.extend_from_slice(&zip);
+        dump.extend_from_slice(&[0u8; 32]);
+
+        let path = write_dump("salvage-covered", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert!(report.files[0].complete);
+        assert!(!report.files[0].notes.starts_with("salvage:tail"));
+    }
+
+    #[test]
+    fn incomplete_files_go_to_partial_dir_only_when_asked() {
+        let zip = zip_bytes("ok.txt", b"a complete archive payload");
+        let mut dump = vec![0u8; 32];
+        dump.extend_from_slice(&zip);
+        dump.extend_from_slice(&[0u8; 128]);
+        dump.extend_from_slice(&half_encrypted_zip());
+        dump.extend_from_slice(&[0u8; 64]);
+
+        let path = write_dump("partial-dir", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+
+        let out = root.join("split");
+        let report = Carver::new(options.clone())
+            .with_incomplete_dir(true)
+            .carve_to_dir(path.to_str().unwrap(), &out)
+            .unwrap();
+        assert_eq!(report.files.len(), 2, "{report:?}");
+        let complete = report.files.iter().find(|file| file.complete).unwrap();
+        let partial = report.files.iter().find(|file| !file.complete).unwrap();
+        assert_eq!(complete.path.as_ref().unwrap().parent(), Some(out.as_path()));
+        assert_eq!(
+            partial.path.as_ref().unwrap().parent(),
+            Some(out.join("partial").as_path())
+        );
+        assert!(partial.path.as_ref().unwrap().is_file());
+
+        // Default keeps the old flat layout.
+        let flat = root.join("flat");
+        let report = Carver::new(options)
+            .carve_to_dir(path.to_str().unwrap(), &flat)
+            .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(report.files.len(), 2, "{report:?}");
+        for file in &report.files {
+            assert_eq!(file.path.as_ref().unwrap().parent(), Some(flat.as_path()));
+        }
     }
 
     #[test]
@@ -2231,9 +4814,12 @@ mod tests {
         dump.extend_from_slice(&png);
         let path = write_dump("bad-crc", &dump);
 
-        let report = Carver::new(CarveOptions::default())
-            .scan(path.to_str().unwrap())
-            .unwrap();
+        let report = Carver::new(CarveOptions {
+            kinds: vec![CarveKind::Png],
+            ..Default::default()
+        })
+        .scan(path.to_str().unwrap())
+        .unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
 
         assert!(report.files.is_empty(), "{report:?}");
@@ -2492,5 +5078,306 @@ mod tests {
         );
         assert!(CarveKind::from_list("xyz").is_err());
         assert!(CarveKind::from_list("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod new_formats {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bxmap-new-fmt-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_dump(name: &str, data: &[u8]) -> PathBuf {
+        let dir = temp_dir(name);
+        let path = dir.join("dump.bin");
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    fn carve_one(name: &str, kind: CarveKind, payload: &[u8]) -> CarveReport {
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(payload);
+        dump.extend_from_slice(&[0u8; 64]);
+        let path = write_dump(name, &dump);
+        let options = CarveOptions {
+            kinds: vec![kind],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        report
+    }
+
+    fn minimal_class() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\xca\xfe\xba\xbe"); // magic
+        out.extend_from_slice(&0u16.to_be_bytes()); // minor
+        out.extend_from_slice(&61u16.to_be_bytes()); // major (Java 17)
+        out.extend_from_slice(&1u16.to_be_bytes()); // cp_count (empty pool)
+        out.extend_from_slice(&0u16.to_be_bytes()); // access_flags
+        out.extend_from_slice(&0u16.to_be_bytes()); // this_class
+        out.extend_from_slice(&0u16.to_be_bytes()); // super_class
+        out.extend_from_slice(&0u16.to_be_bytes()); // interface_count
+        out.extend_from_slice(&0u16.to_be_bytes()); // field_count
+        out.extend_from_slice(&0u16.to_be_bytes()); // method_count
+        out.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+        out
+    }
+
+    fn minimal_dex() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"dex\n035\x00"); // magic + version
+        out.extend_from_slice(&[0u8; 4]); // checksum (patched below)
+        out.extend_from_slice(&[0u8; 20]); // signature
+        out.extend_from_slice(&0x70u32.to_le_bytes()); // file_size (patched below)
+        out.extend_from_slice(&0x70u32.to_le_bytes()); // header_size
+        out.extend_from_slice(&0x12345678u32.to_le_bytes()); // endian_tag
+        out.extend_from_slice(&0u32.to_le_bytes()); // link_size
+        out.extend_from_slice(&0u32.to_le_bytes()); // link_off
+        out.extend_from_slice(&0x00u32.to_le_bytes()); // map_off (offset 0 is never read; size is 0)
+        out.extend_from_slice(&0u32.to_le_bytes()); // string_ids_size
+        out.extend_from_slice(&0x00u32.to_le_bytes()); // string_ids_off
+        out.extend_from_slice(&0u32.to_le_bytes()); // type_ids_size
+        out.extend_from_slice(&0x00u32.to_le_bytes()); // type_ids_off
+        out.extend_from_slice(&0u32.to_le_bytes()); // proto_ids_size
+        out.extend_from_slice(&0x00u32.to_le_bytes()); // proto_ids_off
+        out.extend_from_slice(&0u32.to_le_bytes()); // field_ids_size
+        out.extend_from_slice(&0x00u32.to_le_bytes()); // field_ids_off
+        out.extend_from_slice(&0u32.to_le_bytes()); // method_ids_size
+        out.extend_from_slice(&0x00u32.to_le_bytes()); // method_ids_off
+        out.extend_from_slice(&0u32.to_le_bytes()); // class_defs_size
+        out.extend_from_slice(&0x00u32.to_le_bytes()); // class_defs_off
+        out.extend_from_slice(&0u32.to_le_bytes()); // data_size
+        out.extend_from_slice(&0x00u32.to_le_bytes()); // data_off
+        let file_size = out.len() as u32;
+        out[32..36].copy_from_slice(&file_size.to_le_bytes());
+        let checksum = adler32(&out[12..]);
+        out[8..12].copy_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    fn minimal_tar() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[b'A'; 100]); // name
+        out.extend_from_slice(&[0u8; 8]); // mode
+        out.extend_from_slice(&[0u8; 8]); // uid
+        out.extend_from_slice(&[0u8; 8]); // gid
+        out.extend_from_slice(b"00000000000\x00"); // size (octal 0, 12 bytes)
+        out.extend_from_slice(b"00000000000\x00"); // mtime (12 bytes)
+        out.extend_from_slice(&[b' '; 8]); // checksum (patched below)
+        out.push(b'0'); // typeflag regular
+        out.extend_from_slice(&[0u8; 100]); // linkname
+        out.extend_from_slice(b"ustar\x00"); // magic
+        out.extend_from_slice(b"00"); // version
+        out.extend_from_slice(&[0u8; 64]); // uname + gname (32 + 32)
+        out.extend_from_slice(&[0u8; 16]); // devmajor + devminor (8 + 8)
+        out.extend_from_slice(&[0u8; 155]); // prefix
+        out.extend_from_slice(&[0u8; 12]); // padding
+        assert_eq!(out.len(), 512);
+        let mut sum: u64 = 0;
+        for (i, &byte) in out.iter().enumerate() {
+            sum += u64::from(if (148..156).contains(&i) { b' ' } else { byte });
+        }
+        out[148..156].copy_from_slice(format!("{sum:07o}\x00").as_bytes());
+        out.extend_from_slice(&[0u8; 1024]); // two zero blocks
+        out
+    }
+
+    fn minimal_pcap() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xa1b2c3d4u32.to_be_bytes()); // BE magic
+        out.extend_from_slice(&2u16.to_be_bytes()); // version major
+        out.extend_from_slice(&4u16.to_be_bytes()); // version minor
+        out.extend_from_slice(&0u32.to_be_bytes()); // thiszone
+        out.extend_from_slice(&0u32.to_be_bytes()); // sigfigs
+        out.extend_from_slice(&65535u32.to_be_bytes()); // snaplen
+        out.extend_from_slice(&101u32.to_be_bytes()); // network = Ethernet
+        out.extend_from_slice(&0u32.to_be_bytes()); // ts sec
+        out.extend_from_slice(&0u32.to_be_bytes()); // ts usec
+        out.extend_from_slice(&4u32.to_be_bytes()); // incl len
+        out.extend_from_slice(&4u32.to_be_bytes()); // orig len
+        out.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // payload
+        out
+    }
+
+    fn minimal_pcapng() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0a0d0d0au32.to_le_bytes()); // section magic
+        out.extend_from_slice(&28u32.to_le_bytes()); // section length
+        out.extend_from_slice(&0x1a2b3c4du32.to_le_bytes()); // BOM (LE)
+        out.extend_from_slice(&1u16.to_le_bytes()); // major
+        out.extend_from_slice(&0u16.to_le_bytes()); // minor
+        out.extend_from_slice(&(-1i64).to_le_bytes()); // section length unknown
+        out.extend_from_slice(&28u32.to_le_bytes()); // SHB trailing length
+        out.extend_from_slice(&1u32.to_le_bytes()); // block type = IDB
+        out.extend_from_slice(&20u32.to_le_bytes()); // block length
+        out.extend_from_slice(&1u16.to_le_bytes()); // linktype Ethernet
+        out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        out.extend_from_slice(&65535u32.to_le_bytes()); // snaplen
+        out.extend_from_slice(&20u32.to_le_bytes()); // trailing length
+        out
+    }
+
+    fn minimal_evtx() -> Vec<u8> {
+        let mut out = vec![0u8; 128];
+        out[..8].copy_from_slice(b"ElfFile\x00");
+        out[8..12].copy_from_slice(&0u32.to_le_bytes()); // first_chunk
+        out[12..16].copy_from_slice(&0u32.to_le_bytes()); // last_chunk
+        out[48..52].copy_from_slice(&128u32.to_le_bytes()); // header_size
+        out[64..66].copy_from_slice(&1u16.to_le_bytes()); // minor
+        out[66..68].copy_from_slice(&3u16.to_le_bytes()); // major
+        out.extend_from_slice(b"ElfChnk\x00");
+        out.extend_from_slice(&[0u8; 65536 - 8]);
+        out
+    }
+
+    fn minimal_flac() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"fLaC");
+        out.push(0x80); // last-metadata-block flag | STREAMINFO(0)
+        out.extend_from_slice(&[0, 0, 34]); // length 34
+        out.extend_from_slice(&[0u8; 34]);
+        out
+    }
+
+    fn minimal_ogg(opus: bool) -> Vec<u8> {
+        let marker: &[u8] = if opus { b"OpusHead" } else { b"vorbis" };
+        let mut out = Vec::new();
+        out.extend_from_slice(b"OggS");
+        out.push(0); // version
+        out.push(0x02); // BOS
+        out.extend_from_slice(&0u64.to_le_bytes()); // granule position
+        out.extend_from_slice(&42u32.to_le_bytes()); // serial
+        out.extend_from_slice(&0u32.to_le_bytes()); // page number
+        out.extend_from_slice(&0u32.to_le_bytes()); // CRC (not checked)
+        out.push(1); // segment count
+        out.push(marker.len() as u8); // segment 1 size
+        out.extend_from_slice(marker);
+        out
+    }
+
+    fn minimal_mp3_frame() -> Vec<u8> {
+        // MPEG1 Layer III, 128 kbps, 44100 Hz. bitrate idx 9, sr idx 0.
+        let mut out = vec![0xff, 0xfb, 0x90, 0x00];
+        out.extend(std::iter::repeat(0u8).take(417));
+        out
+    }
+
+    fn minimal_mp3_with_id3() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ID3");
+        out.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0]); // ver 3, syncsafe size 0
+        out.extend_from_slice(&minimal_mp3_frame());
+        out
+    }
+
+    fn minimal_gif() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GIF89a");
+        out.extend_from_slice(&1u16.to_le_bytes()); // width
+        out.extend_from_slice(&1u16.to_le_bytes()); // height
+        out.push(0x00); // packed (no global color table)
+        out.push(0); // background
+        out.push(0); // aspect
+        out.push(0x2c); // image descriptor
+        out.extend_from_slice(&[0u8; 8]); // left/top/width/height
+        out.push(0x00); // packed (no local color table)
+        out.push(2); // LZW minimum code size
+        out.push(2); // sub-block size
+        out.extend_from_slice(&[0x44, 0x01]); // data
+        out.push(0x00); // block terminator
+        out.push(0x3b); // trailer
+        out
+    }
+
+    fn minimal_ico() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        out.extend_from_slice(&1u16.to_le_bytes()); // type = icon
+        out.extend_from_slice(&1u16.to_le_bytes()); // count
+        out.push(16); // width
+        out.push(16); // height
+        out.push(0); // colors
+        out.push(0); // reserved
+        out.extend_from_slice(&1u16.to_le_bytes()); // planes
+        out.extend_from_slice(&32u16.to_le_bytes()); // bitcount
+        out.extend_from_slice(&4u32.to_le_bytes()); // bytes in resource
+        out.extend_from_slice(&22u32.to_le_bytes()); // offset of data
+        out.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // data
+        out
+    }
+
+    fn minimal_lnk() -> Vec<u8> {
+        let mut out = vec![0u8; 0x4c];
+        out[..4].copy_from_slice(&0x4cu32.to_le_bytes()); // HeaderSize
+        out[4..20].copy_from_slice(&[
+            0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x46,
+        ]);
+        out[0x14..0x18].copy_from_slice(&0u32.to_le_bytes()); // flags = 0
+        out
+    }
+
+    #[test]
+    fn all_new_validators_accept_minimal_fixtures() {
+        let cases: Vec<(&str, CarveKind, Vec<u8>)> = vec![
+            ("class", CarveKind::Class, minimal_class()),
+            ("dex", CarveKind::Dex, minimal_dex()),
+            ("tar", CarveKind::Tar, minimal_tar()),
+            ("pcap", CarveKind::Pcap, minimal_pcap()),
+            ("pcapng", CarveKind::Pcapng, minimal_pcapng()),
+            ("evtx", CarveKind::Evtx, minimal_evtx()),
+            ("flac", CarveKind::Flac, minimal_flac()),
+            ("ogg", CarveKind::Ogg, minimal_ogg(false)),
+            ("opus", CarveKind::Opus, minimal_ogg(true)),
+            ("mp3-frame", CarveKind::Mp3, minimal_mp3_frame()),
+            ("mp3-id3", CarveKind::Mp3, minimal_mp3_with_id3()),
+            ("gif", CarveKind::Gif, minimal_gif()),
+            ("ico", CarveKind::Ico, minimal_ico()),
+            ("lnk", CarveKind::Lnk, minimal_lnk()),
+        ];
+        for (name, kind, payload) in cases {
+            let report = carve_one(name, kind, &payload);
+            assert_eq!(report.files.len(), 1, "{name}: {report:?}");
+            assert_eq!(report.files[0].kind, kind, "{name}");
+            assert!(report.files[0].complete, "{name}: {:?}", report.files[0]);
+        }
+    }
+
+    #[test]
+    fn aliases_map_to_shared_validators() {
+        for (name, list) in [
+            ("docx", "docx"),
+            ("xlsx", "xlsx"),
+            ("pptx", "pptx"),
+            ("odt", "odt"),
+            ("ods", "ods"),
+            ("jar", "jar"),
+            ("apk", "apk"),
+            ("doc", "doc"),
+            ("xls", "xls"),
+            ("ppt", "ppt"),
+            ("msi", "msi"),
+            ("msg", "msg"),
+            ("so", "so"),
+            ("dll", "dll"),
+            ("sys", "sys"),
+            ("db", "db"),
+            ("sqlite3", "sqlite3"),
+            ("mov", "mov"),
+            ("m4a", "m4a"),
+            ("jpg", "jpg"),
+            ("tiff", "tiff"),
+        ] {
+            assert!(CarveKind::from_list(list).is_ok(), "{name} must parse");
+        }
+        assert_eq!(CarveKind::from_list("docx").unwrap(), vec![CarveKind::Zip]);
+        assert_eq!(CarveKind::from_list("msi").unwrap(), vec![CarveKind::Ole]);
+        assert_eq!(CarveKind::from_list("db").unwrap(), vec![CarveKind::Sqlite]);
     }
 }

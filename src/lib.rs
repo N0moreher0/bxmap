@@ -1143,14 +1143,18 @@ impl<'a> StringRunScanner<'a> {
         // Sort by offset (pending is small, typically < 10 items)
         self.pending.sort_by_key(|s| s.offset);
         // Emit all results with offset < threshold
-        let mut i = 0;
-        while i < self.pending.len() && self.pending[i].offset < threshold {
-            let result = self.pending[i].clone();
-            (self.on_found)(result);
-            i += 1;
+        let mut ready = 0;
+        while ready < self.pending.len() && self.pending[ready].offset < threshold {
+            ready += 1;
         }
-        if i > 0 {
-            self.pending.drain(0..i);
+        for index in 0..ready {
+            let result = self.pending[index].clone();
+            if !has_preferred_cp1252_alias(&result, &self.pending[..ready]) {
+                (self.on_found)(result);
+            }
+        }
+        if ready > 0 {
+            self.pending.drain(0..ready);
         }
     }
 
@@ -1160,8 +1164,11 @@ impl<'a> StringRunScanner<'a> {
             return;
         }
         self.pending.sort_by_key(|s| s.offset);
-        for result in self.pending.drain(..) {
-            (self.on_found)(result);
+        let results = std::mem::take(&mut self.pending);
+        for result in &results {
+            if !has_preferred_cp1252_alias(result, &results) {
+                (self.on_found)(result.clone());
+            }
         }
     }
 
@@ -1729,6 +1736,8 @@ impl<'a> StringRunScanner<'a> {
             && !is_low_information_repeat(&self.latin1_buf, &self.noise_cfg)
             && !has_acpi_field_noise(&self.latin1_buf)
             && !single_byte_high_entropy_noise(&self.latin1_buf, &self.noise_cfg)
+            && !(self.encodings.utf8
+                && has_readable_multibyte_utf8_interpretation(&self.latin1_buf, &self.noise_cfg))
         {
             // Decode Latin1 bytes to UTF-8 string
             let text = self
@@ -1760,6 +1769,8 @@ impl<'a> StringRunScanner<'a> {
             && !is_low_information_repeat(&self.cp1252_buf, &self.noise_cfg)
             && !has_acpi_field_noise(&self.cp1252_buf)
             && !single_byte_high_entropy_noise(&self.cp1252_buf, &self.noise_cfg)
+            && !(self.encodings.utf8
+                && has_readable_multibyte_utf8_interpretation(&self.cp1252_buf, &self.noise_cfg))
         {
             // Decode CP1252 bytes to UTF-8 string
             let text = self
@@ -1822,7 +1833,9 @@ impl<'a> StringRunScanner<'a> {
         {
             // Decode Shift-JIS to UTF-8
             let text = shift_jis_to_utf8(&self.shift_jis_buf);
-            if !decoded_text_noise(&text, &self.noise_cfg) {
+            let utf8_is_more_likely = self.encodings.utf8
+                && has_readable_multibyte_utf8_interpretation(&self.shift_jis_buf, &self.noise_cfg);
+            if !utf8_is_more_likely && !shift_jis_text_noise(&text, &self.noise_cfg) {
                 self.pending.push(ExtractedString {
                     offset: self.shift_jis_start as u64,
                     encoding: "shift_jis",
@@ -1872,6 +1885,31 @@ fn is_low_information_repeat(buf: &[u8], cfg: &NoiseConfig) -> bool {
     }
 
     false
+}
+
+/// Prefer the strictly validated UTF-8 interpretation when the same byte run
+/// would otherwise be emitted as a legacy single-byte encoding or Shift-JIS.
+/// This check is only used when UTF-8 scanning is enabled; an explicitly
+/// requested legacy-only scan retains its original results.
+fn has_readable_multibyte_utf8_interpretation(buf: &[u8], cfg: &NoiseConfig) -> bool {
+    if !buf.iter().any(|&byte| byte >= 0x80) {
+        return false;
+    }
+    std::str::from_utf8(buf)
+        .ok()
+        .is_some_and(|text| !decoded_text_noise(text, cfg))
+}
+
+/// Latin1 and CP1252 have identical output for many byte runs. When both
+/// interpretations produce the same text at the same offset, CP1252 is the
+/// canonical label for Windows memory dumps and avoids duplicate records.
+fn has_preferred_cp1252_alias(candidate: &ExtractedString, peers: &[ExtractedString]) -> bool {
+    candidate.encoding == "latin1"
+        && peers.iter().any(|peer| {
+            peer.offset == candidate.offset
+                && peer.encoding == "cp1252"
+                && peer.text == candidate.text
+        })
 }
 
 fn estimate_capacity(input_len: u64, max_strings: usize) -> usize {
@@ -2035,6 +2073,23 @@ fn decoded_text_noise(text: &str, cfg: &NoiseConfig) -> bool {
         return bad > 0;
     }
     bad * 10 > total || readable * 10 < total * 6
+}
+
+/// Random memory bytes often form valid Shift-JIS pairs that decode to long
+/// runs of Han characters. Natural Japanese text usually contains hiragana or
+/// katakana as well, so require that script evidence for longer runs. The
+/// short-run exception preserves compact names, and `--noise-threshold 0`
+/// disables this heuristic along with the other noise filters.
+fn shift_jis_text_noise(text: &str, cfg: &NoiseConfig) -> bool {
+    if decoded_text_noise(text, cfg) {
+        return true;
+    }
+    if cfg.repeat1_min_len == usize::MAX || text.chars().count() < 4 {
+        return false;
+    }
+    !text
+        .chars()
+        .any(|c| ('\u{3040}'..='\u{30FF}').contains(&c) || ('\u{FF66}'..='\u{FF9D}').contains(&c))
 }
 
 /// Returns a list of `ExtractedString`, sorted by ascending offset, from a

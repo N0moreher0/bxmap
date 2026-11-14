@@ -767,7 +767,7 @@ pub fn write_results(
                         None => write!(writer, "\tpid=-")?,
                     }
                 }
-                if DUMP_MAP.get().is_some() {
+                if has_dump_map() {
                     match va_annotation(result.offset) {
                         Some((va, label)) => write!(writer, "\tva={va:#x}\t{label}")?,
                         None => write!(writer, "\tva=-\t-")?,

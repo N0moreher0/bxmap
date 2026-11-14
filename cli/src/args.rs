@@ -7,8 +7,16 @@
 use super::*;
 use bxmap::artifacts::ArtifactKinds;
 use bxmap::{EncodingFilter, MAX_STRINGS, MIN_STRING_LEN};
+#[derive(Clone)]
 pub struct Args {
     pub path: String,
+    /// Additional inputs, accepted only with `--parallel-files N`.
+    pub additional_paths: Vec<String>,
+    /// Maximum number of input dumps scanned concurrently.
+    pub parallel_files: usize,
+    pub parallel_files_explicit: bool,
+    /// Directory for one output file per input in batch mode.
+    pub output_dir: Option<String>,
     pub start: Option<u64>,
     pub end: Option<u64>,
     pub min_len: usize,
@@ -105,8 +113,8 @@ pub const ENC_ALL_BITS: u8 =
 pub fn encoding_bit_for_name(name: &str) -> Option<u8> {
     Some(match name {
         "ascii" => ENC_ASCII,
-        "utf16" | "utf-16" => ENC_UTF16,
-        "utf32" | "utf-32" => ENC_UTF32,
+        "utf16" | "utf-16" | "utf16le" | "utf-16le" | "utf16be" | "utf-16be" => ENC_UTF16,
+        "utf32" | "utf-32" | "utf32le" | "utf-32le" | "utf32be" | "utf-32be" => ENC_UTF32,
         "latin1" | "iso-8859-1" => ENC_LATIN1,
         "cp1252" | "windows-1252" => ENC_CP1252,
         "utf8" | "utf-8" => ENC_UTF8,
@@ -301,6 +309,8 @@ pub fn completions_for(shell: &str) -> String {
         "--encoding",
         "--noise-threshold",
         "--threads",
+        "--parallel-files",
+        "--output-dir",
         "--auto-tune",
         "--max-memory",
         "--config",
@@ -456,6 +466,10 @@ pub fn parse_args() -> Result<Args, String> {
 pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), String> {
     let mut args = Args {
         path: String::new(),
+        additional_paths: Vec::new(),
+        parallel_files: 1,
+        parallel_files_explicit: false,
+        output_dir: None,
         start: None,
         end: None,
         min_len: MIN_STRING_LEN,
@@ -567,6 +581,7 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
             }
             "--filter-appdata" => args.filter_appdata = true,
             "--max-str-len" => {
+                explicit.max_str_len = true;
                 args.max_str_len = next(&mut i)?
                     .parse()
                     .map_err(|_| "invalid --max-str-len".to_string())?
@@ -586,8 +601,12 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
                 explicit.encoding = true;
                 args.encoding = parse_encoding_spec(&next(&mut i)?)?;
             }
-            "-o" | "--output" => args.output = Some(next(&mut i)?),
+            "-o" | "--output" => {
+                explicit.output = true;
+                args.output = Some(next(&mut i)?);
+            }
             "--noise-threshold" => {
+                explicit.noise_threshold = true;
                 args.noise_threshold = Some(
                     next(&mut i)?
                         .parse()
@@ -595,6 +614,7 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
                 )
             }
             "--threads" => {
+                explicit.threads = true;
                 args.threads = next(&mut i)?
                     .parse()
                     .map_err(|_| "invalid --threads".to_string())?;
@@ -602,8 +622,22 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
                     return Err("--threads must be at least 1".to_string());
                 }
             }
-            "--auto-tune" => args.auto_tune = true,
+            "--parallel-files" => {
+                args.parallel_files_explicit = true;
+                args.parallel_files = next(&mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --parallel-files".to_string())?;
+                if args.parallel_files == 0 {
+                    return Err("--parallel-files must be at least 1".to_string());
+                }
+            }
+            "--output-dir" => args.output_dir = Some(next(&mut i)?),
+            "--auto-tune" => {
+                explicit.auto_tune = true;
+                args.auto_tune = true;
+            }
             "--max-memory" => {
+                explicit.max_memory = true;
                 args.max_memory = parse_offset(&next(&mut i)?, "--max-memory")?;
             }
             "--config" => {
@@ -660,11 +694,40 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
             }
             "--parse-pid" => args.parse_pid = true,
             "--xor-exhaustive" => args.xor_exhaustive = true,
-            "--stats" => args.stats = true,
+            "--stats" => {
+                explicit.stats = true;
+                args.stats = true;
+            }
             "--filter-regex" => args.filter_regex = Some(next(&mut i)?),
             "--carve" => {
                 explicit.carve = true;
-                args.carve = Some(next(&mut i)?);
+                // The value is optional: a bare `--carve` is a full carve (every
+                // format, the whole dump). The next token only counts as the
+                // type list when it parses as one, so `--carve dump.bin` still
+                // reads `dump.bin` as the dump path, not as a carve type.
+                // The parameter selects file types only, never a technique:
+                // every carve runs the full recovery stack (header-first,
+                // incomplete-candidate partial/ layout and footer-first
+                // salvage), so `salvage` is no longer a token here.
+                let mentions_salvage = values.get(i + 1).is_some_and(|candidate| {
+                    !candidate.starts_with('-')
+                        && candidate
+                            .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+                            .any(|token| token.eq_ignore_ascii_case("salvage"))
+                });
+                if mentions_salvage {
+                    return Err("the `salvage` carve token was removed: footer-first salvage now always runs with `--carve` (pass `./salvage` if you really meant a file called `salvage`)".to_string());
+                }
+                let takes_types = values.get(i + 1).is_some_and(|candidate| {
+                    !candidate.starts_with('-')
+                        && bxmap::carve::CarveKind::from_list(candidate).is_ok()
+                });
+                let types = if takes_types {
+                    next(&mut i)?
+                } else {
+                    "all".to_string()
+                };
+                args.carve = Some(types);
             }
             "--carve-out" => {
                 explicit.carve_out = true;
@@ -713,24 +776,25 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
                 }
             }
             "--detect-format" => {
+                explicit.detect_format = true;
                 args.detect_format = parse_detect_format(&next(&mut i)?)?;
             }
             "--detect-strict" => {
+                explicit.detect_strict = true;
                 args.detect_strict = true;
             }
             "--detect-rules" => {
                 args.custom_rules = Some(next(&mut i)?);
             }
             other if !other.starts_with('-') => {
-                // A bare token is the dump path, wherever it sits on the
-                // command line. Only one path is accepted.
+                // The first bare token is the primary dump path. Extra paths
+                // are validated against --parallel-files after all flags have
+                // been parsed so option order does not matter.
                 if !args.path.is_empty() {
-                    return Err(format!(
-                        "unexpected extra argument '{other}' (one dump path only; \
-                         quote paths that contain spaces)"
-                    ));
+                    args.additional_paths.push(other.to_string());
+                } else {
+                    args.path = other.to_string();
                 }
-                args.path = other.to_string();
             }
             other => return Err(format!("unknown option '{other}'")),
         }
@@ -746,17 +810,28 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
     if args.path.is_empty() {
         return Err("missing dump path\n\nRun `bxmap --help` for usage.".to_string());
     }
+    if !args.additional_paths.is_empty() && !args.parallel_files_explicit {
+        return Err(format!(
+            "unexpected extra argument '{}' (multiple inputs require --parallel-files N)",
+            args.additional_paths[0]
+        ));
+    }
     // Presets only fill flags the user did not spell out, so the order on the
     // command line never matters: `--mode triage --encoding ascii` and
     // `--encoding ascii --mode triage` behave identically.
     if let Some(mode) = mode {
-        let has_output = args.output.is_some();
+        let has_output = args.output.is_some() || args.output_dir.is_some();
         apply_mode_preset(mode, &explicit, has_output, &mut args);
     }
     // `--with <list>` runs after the mode preset: it is the composable
     // mechanism that can turn a plain scan into a full triage in one flag.
     if !with_tokens.is_empty() {
-        apply_with_features(&with_tokens, &explicit, args.output.is_some(), &mut args)?;
+        apply_with_features(
+            &with_tokens,
+            &explicit,
+            args.output.is_some() || args.output_dir.is_some(),
+            &mut args,
+        )?;
     }
     // Sub-flags imply their parent (`--entropy-window` -> `--entropy`,
     // `--carve-out` -> `--carve all`, `--report user` -> path artifacts, ...).
@@ -918,6 +993,61 @@ mod tests {
             assert_eq!(args.min_len, 6);
             assert_eq!(args.carve.as_deref(), Some("jpeg"));
         }
+    }
+
+    #[test]
+    fn bare_carve_means_a_full_carve_of_every_format() {
+        // Flag last, flag first and flag in the middle: the dump path must
+        // never be swallowed as the carve type list.
+        for argv in [
+            vec!["dump.bin", "--carve"],
+            vec!["--carve", "dump.bin"],
+            vec!["--carve", "--min-len", "6", "dump.bin"],
+            vec!["dump.bin", "--carve", "--carve-out", "out"],
+        ] {
+            let args = parse(&argv).unwrap();
+            assert_eq!(args.path, "dump.bin", "{argv:?}");
+            assert_eq!(args.carve.as_deref(), Some("all"), "{argv:?}");
+            assert!(args.additional_paths.is_empty(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn bare_carve_gets_the_default_output_directory() {
+        let args = parse(&["--carve", "dump.bin"]).unwrap();
+        let expected = format!("dump.bin.bxmap{}carved", std::path::MAIN_SEPARATOR);
+        assert_eq!(args.carve_out.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn removed_salvage_token_is_a_clear_error() {
+        // `salvage` is no longer a parameter of --carve; salvage always runs.
+        for argv in [
+            vec!["--carve", "salvage", "dump.bin"],
+            vec!["dump.bin", "--carve", "salvage"],
+            vec!["--carve", "zip,pdf,salvage", "dump.bin"],
+        ] {
+            let error = parse(&argv).map(|_| ()).unwrap_err();
+            assert!(error.contains("salvage"), "{argv:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn removed_carve_incomplete_flag_is_unknown() {
+        // The partial/ layout always applies to --carve; the old flag is gone.
+        let error = parse(&["--carve-incomplete", "dump.bin"])
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.contains("--carve-incomplete"), "{error}");
+    }
+
+    #[test]
+    fn carve_with_an_explicit_type_list_is_unchanged() {
+        let args = parse(&["--carve", "jpeg,png", "dump.bin"]).unwrap();
+        assert_eq!(args.path, "dump.bin");
+        assert_eq!(args.carve.as_deref(), Some("jpeg,png"));
+        let args = parse(&["dump.bin", "--carve", "all"]).unwrap();
+        assert_eq!(args.carve.as_deref(), Some("all"));
     }
 
     #[test]

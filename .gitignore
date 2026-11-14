@@ -30,3 +30,6 @@ fuzz/target/
 _slice64.bin
 _strings_ascii.txt
 _bxmap_ascii.txt
+
+# Venira local state (memory note lives at .venira/memory.md)
+.venira/

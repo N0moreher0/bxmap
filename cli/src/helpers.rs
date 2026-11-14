@@ -78,29 +78,51 @@ pub fn print_user_report(stats: &[UserStat], min_files: usize, filter_appdata: b
     }
 }
 
-pub static DUMP_MAP: OnceLock<bxmap::minidump::Minidump> = OnceLock::new();
+thread_local! {
+    static DUMP_MAP: std::cell::RefCell<Option<bxmap::minidump::Minidump>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub fn set_dump_map(dump: Option<bxmap::minidump::Minidump>) {
+    DUMP_MAP.with(|slot| *slot.borrow_mut() = dump);
+}
+
+pub fn clear_dump_map() {
+    set_dump_map(None);
+}
+
+pub fn with_dump_map<T>(f: impl FnOnce(Option<&bxmap::minidump::Minidump>) -> T) -> T {
+    DUMP_MAP.with(|slot| f(slot.borrow().as_ref()))
+}
+
+pub fn has_dump_map() -> bool {
+    with_dump_map(|dump| dump.is_some())
+}
 
 /// Virtual address and a short module/region label for a file offset,
 /// when `--map-va` loaded a minidump and the offset lies in a captured range.
 pub fn va_annotation(offset: u64) -> Option<(u64, String)> {
-    let dump = DUMP_MAP.get()?;
-    let va = dump.offset_to_va(offset)?;
-    let label = match dump.module_for_va(va) {
-        Some(m) => m
-            .name
-            .rsplit(['\\', '/'])
-            .next()
-            .unwrap_or(&m.name)
-            .to_string(),
-        None => dump.region_for_va(va).map_or("-".to_string(), |r| {
-            format!(
-                "{} {}",
-                r.kind_name(),
-                bxmap::minidump::protect_name(r.protect)
-            )
-        }),
-    };
-    Some((va, label))
+    with_dump_map(|dump| {
+        let dump = dump?;
+        let va = dump.offset_to_va(offset)?;
+        let label = match dump.module_for_va(va) {
+            Some(m) => m
+                .name
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(&m.name)
+                .to_string(),
+            None => dump.region_for_va(va).map_or("-".to_string(), |r| {
+                format!(
+                    "{} {}",
+                    r.kind_name(),
+                    bxmap::minidump::protect_name(r.protect)
+                )
+            }),
+        };
+        Some((va, label))
+    })
 }
 
 pub fn passes_region_filter(
@@ -112,34 +134,36 @@ pub fn passes_region_filter(
     if module.is_none() && !rwx_only && !heap_only {
         return true;
     }
-    let dump = match DUMP_MAP.get() {
-        Some(dump) => dump,
-        None => return true,
-    };
-    let va = match dump.offset_to_va(offset) {
-        Some(va) => va,
-        None => return false,
-    };
-    if let Some(needle) = module {
-        let needle = needle.to_ascii_lowercase();
-        match dump.module_for_va(va) {
-            Some(m) if m.name.to_ascii_lowercase().contains(&needle) => {}
-            _ => return false,
+    with_dump_map(|dump| {
+        let dump = match dump {
+            Some(dump) => dump,
+            None => return true,
+        };
+        let va = match dump.offset_to_va(offset) {
+            Some(va) => va,
+            None => return false,
+        };
+        if let Some(needle) = module {
+            let needle = needle.to_ascii_lowercase();
+            match dump.module_for_va(va) {
+                Some(m) if m.name.to_ascii_lowercase().contains(&needle) => {}
+                _ => return false,
+            }
         }
-    }
-    if rwx_only {
-        match dump.region_for_va(va) {
-            Some(r) if r.is_executable() && r.is_writable() => {}
-            _ => return false,
+        if rwx_only {
+            match dump.region_for_va(va) {
+                Some(r) if r.is_executable() && r.is_writable() => {}
+                _ => return false,
+            }
         }
-    }
-    if heap_only {
-        match dump.region_for_va(va) {
-            Some(r) if r.kind == 0x20000 => {}
-            _ => return false,
+        if heap_only {
+            match dump.region_for_va(va) {
+                Some(r) if r.kind == 0x20000 => {}
+                _ => return false,
+            }
         }
-    }
-    true
+        true
+    })
 }
 
 pub const MAX_XOR_CANDIDATES: usize = 256;
@@ -337,6 +361,15 @@ pub struct ExplicitFlags {
     pub extract: bool,
     pub report: bool,
     pub format: bool,
+    pub max_str_len: bool,
+    pub noise_threshold: bool,
+    pub threads: bool,
+    pub auto_tune: bool,
+    pub max_memory: bool,
+    pub output: bool,
+    pub detect_format: bool,
+    pub detect_strict: bool,
+    pub stats: bool,
 
     pub detectors: bool,
     pub entropy: bool,
@@ -598,6 +631,7 @@ pub const HELP: &str = concat!(
     include_str!("banner.txt"),
     "\nUSAGE:
     bxmap <path> [MODES / FEATURES / OPTIONS]
+    bxmap --parallel-files <N> --output-dir <DIR> <dump1> <dump2> ... [OPTIONS]
 
 FEATURES -- one flag does one complete job:
     --with <list>        Turn capabilities on in one flag. Tokens: iocs,
@@ -623,6 +657,8 @@ ESSENTIAL OPTIONS:
     --max-strings <N>    Maximum results (default 200000; 0 = unlimited)
     --threads <N>        Parallel worker count
     --auto-tune          Choose a safe worker count for this machine
+    --parallel-files <N> Maximum active dump scans (batch mode)
+    --output-dir <DIR>   Separate output file per input (batch mode)
     --max-memory <BYTES> Cap the scanner's own RAM (0 = unlimited); fewer
                            workers are used when the cap requires it
     --config <FILE>     Read defaults from a TOML file (default: ./bxmap.toml)
@@ -644,6 +680,7 @@ pub const HELP_ADVANCED: &str = concat!(
     include_str!("banner.txt"),
     "\nUSAGE:
     bxmap <path> [OPTIONS]
+    bxmap --parallel-files <N> --output-dir <DIR> <dump1> <dump2> ... [OPTIONS]
 
 MODES:
     --mode <quick|triage|deep>
@@ -715,6 +752,8 @@ OPTIONS:
                           Repeat-noise threshold; 0 disables filtering
     --threads <N>        Parallel worker count
     --auto-tune          Choose a safe worker count for this machine
+    --parallel-files <N> Batch mode: maximum active input dumps
+    --output-dir <DIR>   Batch mode: one unique output file per input
     --max-memory <BYTES>
                            Cap the RAM the scanner may use for its own buffers
                            (0 = unlimited, the default). When the cap does not
@@ -759,13 +798,33 @@ OPTIONS:
                           only metadata + SHA-1 fingerprint is reported; raw
                           key bytes never leave this process and nothing is
                           decrypted.
-    --carve <types>       Recover structured files from the dump and write them
-                          to --carve-out. Types: jpeg,png,zip,rar,7z,pdf,gzip,
-                          bmp,sqlite,all (comma-separated). Every candidate is
+    --carve [types]       Recover structured files from the dump and write them
+                          to --carve-out. Types: jpeg,png,gif,bmp,tif,ico,webp,
+                          zip,rar,7z,gzip,bz2,xz,tar,pdf,rtf,ole,sqlite,pe,elf,
+                          class,dex,wasm,lnk,evtx,pcap,pcapng,kdbx,pem,mp4,avi,
+                          wav,mkv,webm,ogg,opus,flac,mp3,vdi,vmdk,all
+                          (comma-separated). Extensions work as aliases:
+                          docx/xlsx/pptx/odt/jar/apk=zip, doc/xls/ppt/msi/msg=
+                          ole, dll/sys=pe, so=elf, db/sqlite3=sqlite, jpg=jpeg,
+                          mov/m4a=mp4, tiff=tif. Types select file
+                          formats only, never a technique: every carve runs
+                          the full recovery stack, including a footer-first
+                          second pass for ZIP (central directory + end
+                          record) and PDF (startxref + %%EOF) files whose
+                          header is gone, e.g. after partial encryption.
+                          Tails are labelled salvage:tail, cut back to the
+                          first high-entropy window and written to partial/;
+                          nothing is decrypted or repaired. Incomplete files
+                          (complete: false) always go into the partial/
+                          subfolder and carry corrupted_offset and
+                          entropy_spike_at in the index. With no types,
+                          --carve is a full carve: every format, the whole
+                          dump (same as --carve all). Every candidate is
                           structurally validated before it is written; nothing
                           is decrypted or executed.
-    --carve-out <dir>     Destination directory for carved files (required with
-                          --carve). Existing files are never overwritten.
+    --carve-out <dir>     Destination directory for carved files (default:
+                          <input>.bxmap/carved). Existing files are never
+                          overwritten.
     --carve-index <file>  Write the carve index (.ndjson = one record per line,
                           anything else = JSON array)
     --carve-min-size <N>  Skip files smaller than N bytes (default 64)
@@ -1019,7 +1078,7 @@ pub fn write_string_json(
             None => write!(writer, ",\"pid\":null")?,
         }
     }
-    if DUMP_MAP.get().is_some() {
+    if has_dump_map() {
         match va_annotation(result.offset) {
             Some((va, label)) => write!(
                 writer,
@@ -1786,12 +1845,17 @@ pub fn print_carve_summary(report: &CarveReport) {
         eprintln!("  [i] carve: {}", report.summary_line());
     }
     for file in report.files.iter().filter(|file| !file.complete).take(5) {
+        let spike = file
+            .entropy_spike_at
+            .map(|at| format!(" [entropy rises at {at:#x}]"))
+            .unwrap_or_default();
         eprintln!(
-            "      - incomplete {:#010x} {:<6} {} bytes: {}",
+            "      - incomplete {:#010x} {:<6} {} bytes: {}{}",
             file.offset,
             file.kind.as_str(),
             file.size,
-            file.notes
+            file.notes,
+            spike
         );
     }
     for detail in report.rejected_details.iter().take(3) {
@@ -2195,5 +2259,23 @@ pub fn parse_path_detail(detail: &str) -> Option<(String, String)> {
     match (user, category) {
         (Some(u), Some(c)) => Some((u, c)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod dump_map_tests {
+    use super::{clear_dump_map, has_dump_map, set_dump_map};
+
+    #[test]
+    fn dump_map_context_is_isolated_between_worker_threads() {
+        clear_dump_map();
+        set_dump_map(Some(bxmap::minidump::Minidump::default()));
+        assert!(has_dump_map());
+
+        let other_thread = std::thread::spawn(has_dump_map);
+        assert!(!other_thread.join().unwrap());
+
+        clear_dump_map();
+        assert!(!has_dump_map());
     }
 }

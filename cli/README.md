@@ -23,6 +23,9 @@ bxmap memory.dmp --auto-tune
 bxmap memory.dmp --encoding ascii --format json -o strings.json
 bxmap memory.dmp --entropy --format json -o triage.json
 
+# Scan several dumps concurrently; each gets its own output file
+bxmap --parallel-files 3 --output-dir case-results lab1.raw lab4.raw lab6.raw --format ndjson
+
 # Presets (opt-in; without --mode the defaults are unchanged)
 bxmap memory.dmp --mode triage -o case1.ndjson
 bxmap memory.dmp --mode deep
@@ -90,6 +93,24 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   in ascending offset order, then dropped, so peak RAM stays bounded by
   `threads * 16 MiB` plus the results of the window instead of growing with
   the number of matches.
+- `--parallel-files <N>` — batch mode: scan up to `N` input dumps at once.
+  Supply two or more dump paths and `--output-dir <DIR>`; bxmap creates one
+  uniquely named result per input and never mixes records from different
+  dumps. `--threads` caps scanner workers per dump; bxmap also caps that value
+  by the available CPU share for the active jobs. `--max-memory` is split
+  across active jobs and caps scanner buffers.
+  Progress bars are disabled in batch mode to keep status readable; do not pass
+  `--progress` there. `--report` is also rejected for multiple inputs until
+  report text can be isolated per dump. Minidump string scans with VA/module
+  annotations are supported when you pass `--no-tree`; batch mode keeps the
+  default minidump tree output out of stdout. VMware info, carving and
+  reassembly are rejected until their per-file state and outputs can be
+  isolated. One failed input
+  does not stop the remaining files; failures are summarized at the end.
+  Before starting workers, bxmap checks that none of the generated output paths
+  already exists, so a rerun cannot silently truncate prior results. Results
+  are written to sibling `.partial` files and published under their final names
+  only after a successful scan; failed scans remove their partial output.
 - `--xor-exhaustive` — with `--brute-xor 3b`, enumerate all 16,777,216 keys
   instead of the default frequency-guided search. Prints a byte-op estimate
   first; expect minutes on a large dump.
@@ -137,20 +158,47 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
 
 ### File carving (`--carve`)
 
-- `--carve <types>` — recover structured files and write them to `--carve-out`.
-  Types: `jpeg`, `png`, `zip`, `rar4`, `rar5`, `7z`, `pdf`, `gzip`, `bmp`,
-  `sqlite`, `ole`, `mp4`, `pe`, `elf`, `all` (comma-separated). Aliases: `rar`
-  (both RAR versions), `jpg` (jpeg), `7zip` (7z), `office`/`ms-office` (ole),
-  `exe`/`executable` (pe). Every candidate is structurally validated before
+- `--carve [types]` — recover structured files and write them to `--carve-out`.
+  With no value, `--carve` is a **full carve**: every format below, the whole
+  dump (same as `--carve all`). The next argument is only read as a type list
+  when it parses as one, so `bxmap --carve dump.bin` still treats `dump.bin`
+  as the dump path.
+  Types: `jpeg`, `png`, `gif`, `bmp`, `tif`, `ico`, `webp`, `zip`, `rar4`, `rar5`,
+  `7z`, `gzip`, `bz2`, `xz`, `tar`, `pdf`, `rtf`, `ole`, `sqlite`, `pe`, `elf`,
+  `class`, `dex`, `wasm`, `lnk`, `evtx`, `pcap`, `pcapng`, `kdbx`, `pem`, `mp4`,
+  `avi`, `wav`, `mkv`, `webm`, `ogg`, `opus`, `flac`, `mp3`, `vdi`, `vmdk`, `all`
+  (comma-separated). Aliases: `rar` (both RAR versions), `jpg` (jpeg), `7zip`
+  (7z), `office`/`ms-office` (ole), `exe`/`executable` (pe), and file extensions
+  that share a container: `docx`/`xlsx`/`pptx`/`odt`/`ods`/`jar`/`apk` (zip),
+  `doc`/`xls`/`ppt`/`msi`/`msg` (ole), `dll`/`sys` (pe), `so` (elf),
+  `db`/`sqlite3` (sqlite), `mov`/`m4a` (mp4), `tiff` (tif). Formats without a
+  magic number (plain text, json, xml, html, sql, csv, source code, `.dat`,
+  `.key`) are not carved. Every candidate is structurally validated before
   writing; nothing is decrypted, decompressed, or executed.
-- `--carve-out <dir>` — destination directory (required with `--carve`).
+  Types select file formats only, never a technique: every carve runs the
+  full recovery stack, including a footer-first second pass for ZIP
+  (central directory + end record) and PDF (`startxref` + `%%EOF`) tails
+  whose header is gone, e.g. after partial encryption. Tails are cut out and
+  written to `partial/` with notes starting `salvage:tail`. A tail is walked
+  back until the first high-entropy window (>= 7.8 bits/byte), a file already
+  carved, or `--carve-max-size`. PNG/JPEG/MP4 are not salvaged yet (weak
+  footers, compressed bodies). Heuristic only: compressed data also has high
+  entropy. Incomplete files (`complete: false`) always land in `partial/`.
+- `--carve-out <dir>` — destination directory (default `<input>.bxmap/carved`).
   Existing files are never overwritten; re-running into the same directory
   exits with an error.
 - `--carve-index <file>` — write the carve index. `.ndjson` = one record per
   line; anything else = JSON array. The index is a separate channel from
   `--format` so carving never reshapes the string output.
   Each record has `offset`, `offset_hex`, `type`, `size`, `sha256`, `entropy`,
-  `complete`, `notes`, `path`, and `duplicates`.
+  `complete`, `corrupted_offset`, `entropy_spike_at`, `notes`, `path`, and
+  `duplicates`. For incomplete files `corrupted_offset` is where structural
+  validation stopped and `entropy_spike_at` is the first 4 KiB window that
+  jumps to >= 7.8 bits/byte after structured data (both `null` otherwise).
+- Incomplete files (`complete: false`) are always written into a `partial/`
+  subfolder of `--carve-out` so repair tools (Untrunc, 7-Zip recovery, manual
+  header splicing) can take that folder as input. They carry `corrupted_offset`
+  and `entropy_spike_at` in the index.
 - `--carve-min-size <N>` — skip files smaller than N bytes (default 64).
 - `--carve-max-size <N>` — per-file ceiling; header-declared sizes are clamped
   to it (default 64 MiB).
@@ -160,6 +208,9 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   with code 3.
 
 ```powershell
+# Full carve: bare --carve = every format, whole dump, default output dir
+bxmap dump.bin --carve
+
 # Carve everything, write NDJSON index, no string scan
 bxmap dump.bin --carve all --carve-out carved --carve-index idx.ndjson --max-strings 0 --report none
 
@@ -168,6 +219,9 @@ bxmap dump.bin --carve jpeg,png --carve-out carved --carve-max-total 104857600
 
 # JSON array index
 bxmap dump.bin --carve all --carve-out carved --carve-index idx.json
+
+# Ransomware aftermath: --carve always salvages ZIP/PDF tails whose header was encrypted
+bxmap dump.bin --carve --carve-index idx.ndjson
 ```
 
 ⚠️ **Malware handling warning**: Carved files are raw bytes from the dump.
@@ -288,7 +342,7 @@ Ready-to-copy `bxmap-cli` commands grouped by triage target. Replace `<dump.raw>
 .\target\release\bxmap-cli.exe <dump.raw> --mode deep --max-strings 0 --carve all --carve-out ./carved_all --carve-max-files 10000 --carve-max-total 536870912 --format ndjson --output triage.ndjson --stats
 ```
 
-- `--carve all`: all supported formats (jpeg, png, zip, rar, 7z, pdf, gzip, bmp, sqlite, ole, mp4, pe, elf, …).
+- `--carve all`: all supported formats (41 kinds: images, archives, documents, executables, media, disk images, captures, logs, …).
 - `--carve-max-total 536870912`: 512 MB cap total (avoids filling disk).
 
 ### 5. Minidump inputs (.mdmp / .hdmp / .dmp)
@@ -313,7 +367,7 @@ Ready-to-copy `bxmap-cli` commands grouped by triage target. Replace `<dump.raw>
 | `--detect all` | Scan ip, url, domain, base64, secret. |
 | `--signature all` | Scan magic bytes + private-key candidates. |
 | `--entropy` | Find encrypted/packed regions. |
-| `--carve <types>` | Recover structured files from dump into `--carve-out` dir. |
+| `--carve [types]` | Recover structured files into `--carve-out` (default `<input>.bxmap/carved`). No types = full carve of every format. |
 | `--format ndjson --output file.ndjson` | Write ndjson for easy script parsing. |
 | `--stats` | Final summary table. |
 

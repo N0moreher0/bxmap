@@ -1614,6 +1614,122 @@ fn jpeg_fixture(payload: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn golden_carve_new_formats_gif_and_lnk() {
+    // GIF tối giản (header + 1 image descriptor + trailer) và LNK tối giản
+    // (ShellLinkHeader 0x4c byte: HeaderSize@0, CLSID@4..20, flags@0x14 = 0).
+    let mut gif = b"GIF89a".to_vec();
+    gif.extend_from_slice(&1u16.to_le_bytes()); // width
+    gif.extend_from_slice(&1u16.to_le_bytes()); // height
+    gif.extend_from_slice(&[0x00, 0, 0]); // packed, background, aspect
+    gif.push(0x2c); // image descriptor
+    gif.extend_from_slice(&[0u8; 8]); // left/top/width/height
+    gif.extend_from_slice(&[0x00, 2, 2, 0x44, 0x01, 0x00]); // packed, LZW min, block, data, terminator
+    gif.push(0x3b); // trailer
+
+    let mut lnk = vec![0u8; 0x4c];
+    lnk[..4].copy_from_slice(&0x4cu32.to_le_bytes()); // HeaderSize
+    lnk[4..20].copy_from_slice(&[
+        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ]); // LinkCLSID 00021401-0000-0000-C000-000000000046
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut dump = vec![0u8; 256];
+    dump.extend_from_slice(&gif);
+    dump.extend_from_slice(&vec![0u8; 512]);
+    dump.extend_from_slice(&lnk);
+    dump.extend_from_slice(&[0u8; 128]);
+
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let out_dir = dir.path().join("carved");
+    let index = dir.path().join("index.ndjson");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "gif,lnk",
+            "--carve-min-size",
+            "1",
+            "--carve-out",
+            out_dir.to_str().unwrap(),
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("carve: 2 file(s) (2 complete)"), "{stderr}");
+
+    let records = std::fs::read_to_string(&index).unwrap();
+    let lines = records.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2, "{records}");
+    assert!(lines[0].contains("\"type\":\"gif\""), "{records}");
+    assert!(lines[1].contains("\"type\":\"lnk\""), "{records}");
+    assert!(lines[0].contains("\"complete\":true"), "{records}");
+    assert!(lines[1].contains("\"complete\":true"), "{records}");
+
+    // Byte-identical: validator cắt đúng ranh giới file.
+    let read_kind = |needle: &str| {
+        std::fs::read_dir(&out_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().contains(needle))
+            .map(|entry| std::fs::read(entry.path()).unwrap())
+            .unwrap()
+    };
+    assert_eq!(read_kind("-gif-"), gif, "carved GIF must be byte-identical");
+    assert_eq!(read_kind("-lnk-"), lnk, "carved LNK must be byte-identical");
+}
+
+#[test]
+fn golden_carve_extension_alias_selects_the_container_kind() {
+    // `jpg` là alias của `jpeg`: chọn loại theo đuôi file, kết quả vẫn type=jpeg.
+    let dir = tempfile::tempdir().unwrap();
+    let jpeg = jpeg_fixture(&vec![0x5au8; 300]);
+    let mut dump = vec![0u8; 256];
+    dump.extend_from_slice(&jpeg);
+    dump.extend_from_slice(&[0u8; 128]);
+
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let out_dir = dir.path().join("carved");
+    let index = dir.path().join("index.ndjson");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "jpg",
+            "--carve-out",
+            out_dir.to_str().unwrap(),
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("carve: 1 file(s) (1 complete)"), "{stderr}");
+    let records = std::fs::read_to_string(&index).unwrap();
+    assert!(records.contains("\"type\":\"jpeg\""), "{records}");
+}
+
+#[test]
 fn golden_carve_writes_validated_files_and_index() {
     let dir = tempfile::tempdir().unwrap();
     let png = png_fixture(b"png payload bytes");
@@ -1753,6 +1869,165 @@ fn golden_carve_defaults_out_dir() {
     );
     let default_dir = dir.path().join("dump.bin.bxmap").join("carved");
     assert!(default_dir.is_dir(), "carve defaults dir not created");
+}
+
+#[test]
+fn golden_bare_carve_is_a_full_carve() {
+    let dir = tempfile::tempdir().unwrap();
+    let png = png_fixture(b"png payload bytes");
+    let jpeg = jpeg_fixture(&vec![0x5au8; 300]);
+    let mut dump = vec![0u8; 256];
+    dump.extend_from_slice(&png);
+    dump.extend_from_slice(&vec![0u8; 512]);
+    dump.extend_from_slice(&jpeg);
+    dump.extend_from_slice(&[0u8; 128]);
+
+    // `--carve` with no types, after the dump path and before it. The dump
+    // path must never be swallowed as a type list, and every format is tried.
+    for (name, flag_first) in [("a.bin", false), ("b.bin", true)] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &dump).unwrap();
+        let mut args: Vec<&str> = Vec::new();
+        if flag_first {
+            args.extend(["--carve", path.to_str().unwrap()]);
+        } else {
+            args.extend([path.to_str().unwrap(), "--carve"]);
+        }
+        args.extend(["--max-strings", "0", "--no-progress", "--report", "none"]);
+        let output = Command::new(bin_path()).args(&args).output().unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains("carve: 2 file(s) (2 complete)"), "{name}: {stderr}");
+        let carved = dir.path().join(format!("{name}.bxmap")).join("carved");
+        let names = std::fs::read_dir(&carved)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2, "{name}: {names:?}");
+        assert!(names.iter().any(|file| file.contains("-png-")), "{names:?}");
+        assert!(names.iter().any(|file| file.contains("-jpeg-")), "{names:?}");
+    }
+}
+
+#[test]
+fn golden_carve_splits_partial_files_and_indexes_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    // A ZIP entry that is structured for 8 KiB and then "encrypted" for 8 KiB,
+    // with no central directory behind it: the shape partial encryption leaves.
+    let mut zip = Vec::new();
+    zip.extend_from_slice(b"PK\x03\x04");
+    zip.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    zip.extend_from_slice(&0u16.to_le_bytes()); // flags
+    zip.extend_from_slice(&0u16.to_le_bytes()); // stored
+    zip.extend_from_slice(&[0u8; 4]); // time + date
+    zip.extend_from_slice(&0u32.to_le_bytes()); // crc (not checked)
+    zip.extend_from_slice(&16384u32.to_le_bytes()); // packed size
+    zip.extend_from_slice(&16384u32.to_le_bytes()); // unpacked size
+    zip.extend_from_slice(&9u16.to_le_bytes()); // name length
+    zip.extend_from_slice(&0u16.to_le_bytes()); // extra length
+    zip.extend_from_slice(b"notes.txt");
+    zip.extend_from_slice(&vec![b'A'; 8192]);
+    zip.extend_from_slice(&high_entropy_bytes(8192));
+
+    let mut dump = vec![0u8; 64];
+    let zip_offset = dump.len();
+    dump.extend_from_slice(&zip);
+    dump.extend_from_slice(&[0u8; 64]);
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let index = dir.path().join("index.ndjson");
+
+    // Bare `--carve` is a full carve into the default dir and always splits
+    // incomplete files into partial/.
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("incomplete"), "{stderr}");
+    assert!(stderr.contains("entropy rises at"), "{stderr}");
+
+    let carved = dir.path().join("dump.bin.bxmap").join("carved");
+    let partial = std::fs::read_dir(carved.join("partial")).unwrap().count();
+    assert_eq!(partial, 1, "the incomplete ZIP belongs in partial/");
+    let loose = std::fs::read_dir(&carved)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .count();
+    assert_eq!(loose, 0, "nothing incomplete may sit beside complete files");
+
+    let records = std::fs::read_to_string(&index).unwrap();
+    assert_eq!(records.lines().count(), 1, "{records}");
+    assert!(records.contains("\"complete\":false"), "{records}");
+    assert!(
+        records.contains(&format!("\"offset\":{zip_offset}")),
+        "{records}"
+    );
+    assert!(records.contains("\"corrupted_offset\":"), "{records}");
+    assert!(!records.contains("\"corrupted_offset\":null"), "{records}");
+    assert!(records.contains("\"entropy_spike_at\":"), "{records}");
+    assert!(!records.contains("\"entropy_spike_at\":null"), "{records}");
+}
+
+#[test]
+fn golden_carve_recovers_a_pdf_tail_after_partial_encryption() {
+    let dir = tempfile::tempdir().unwrap();
+    // A PDF whose header and body were "encrypted": only the trailer survives.
+    let trailer: &[u8] =
+        b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n9999\n%%EOF\n";
+    let mut dump = vec![0u8; 64];
+    dump.extend_from_slice(&high_entropy_bytes(8192));
+    dump.extend_from_slice(trailer);
+    dump.extend_from_slice(&[0u8; 64]);
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+
+    // `--carve` (bare or with types) always salvages: the tail has no header,
+    // but `salvage` is no longer a token and always runs.
+    let index = dir.path().join("salvage.ndjson");
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = std::fs::read_to_string(&index).unwrap();
+    assert_eq!(records.lines().count(), 1, "{records}");
+    assert!(records.contains("\"type\":\"pdf\""), "{records}");
+    assert!(records.contains("salvage:tail"), "{records}");
+    assert!(records.contains("\"complete\":false"), "{records}");
+    assert!(!records.contains("\"corrupted_offset\":null"), "{records}");
+    let carved = dir.path().join("dump.bin.bxmap").join("carved");
+    let partial = std::fs::read_dir(carved.join("partial")).unwrap().count();
+    assert_eq!(partial, 1, "the salvaged tail belongs in partial/");
 }
 
 // ---------------------------------------------------------------------------

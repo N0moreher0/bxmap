@@ -5,7 +5,39 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- `--carve` no longer takes a `salvage` token: the parameter selects file
+  types only, never a technique. Every carve runs the full recovery stack —
+  header-first, incomplete-candidate `partial/` layout and footer-first
+  salvage (ZIP central directory + end record, PDF `startxref` + `%%EOF`) —
+  for the selected types. `--carve salvage` (or `zip,pdf,salvage`) now exits
+  with a clear error naming the removed token. `salvage:tail` notes, the
+  high-entropy back-walk and the `partial/` output are unchanged.
+- Incomplete files (`complete: false`) are always written to a `partial/`
+  subfolder of `--carve-out` with `corrupted_offset`/`entropy_spike_at` in the
+  index; there is no longer a flat mode.
+
+### Removed
+- `--carve-incomplete`: the `partial/` layout is always on, so the flag is
+  gone. Passing it is an unknown-flag error. Library API unchanged:
+  `Carver::with_salvage(bool)` / `Carver::with_incomplete_dir(bool)` remain
+  opt-in for library callers. Carved files keep the `.carved` extension.
+
 ### Added
+- Multi-format carving (8.8): `--carve` now recognises 41 kinds. New
+  validators for `gif`, `ico`, `tar`, `pcap`, `pcapng`, `lnk`, `wasm`, `dex`,
+  `kdbx`, `pem`, `avi`/`wav`/`webp` (RIFF), `mkv`/`webm` (EBML), `ogg`/`opus`,
+  `flac`, `mp3`, `tif`, `vdi`, `vmdk`, `bz2`, `xz`, `class`, `rtf` and `evtx`;
+  every candidate is structurally validated and nothing is decrypted or
+  executed. File extensions that share a container are accepted as aliases
+  (`docx`/`xlsx`/`pptx`/`odt`/`ods`/`jar`/`apk` -> zip, `doc`/`xls`/`ppt`/
+  `msi`/`msg` -> ole, `dll`/`sys` -> pe, `so` -> elf, `db`/`sqlite3` ->
+  sqlite, `mov`/`m4a` -> mp4, `tiff` -> tif). Formats without a magic number
+  (plain text, json, xml, html, sql, csv, source code, `.dat`, `.key`) are
+  not carved. Entropy stays a boundary hint only, never a rejection rule.
+  TAR is matched on the `ustar` field at offset 257 and back-adjusted to the
+  true start; the matcher now reports every pattern that shares a needle
+  (e.g. `OggS` for both ogg and opus).
 - `--config <FILE>` (or a `bxmap.toml` in the working directory) holds the
   options that repeat for every dump in a case. Precedence: command line
   flags > config file > `--mode`/`--with` presets > defaults. The file is

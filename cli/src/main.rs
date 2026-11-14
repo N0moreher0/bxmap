@@ -35,6 +35,7 @@ mod custom_rules;
 use custom_rules::{load_custom_rules, match_custom_rules, CompiledCustomRule};
 
 mod config;
+mod multi_scan;
 
 use bxmap::{
     artifacts::{Artifact, ArtifactCollector, ArtifactKind, ArtifactKinds},
@@ -143,7 +144,18 @@ fn main() {
 /// one place makes the error messages consistent and gives a single target for
 /// the conflict-matrix tests.
 fn run() -> Result<(), String> {
-    let mut args = parse_args()?;
+    let args = parse_args()?;
+    if !args.additional_paths.is_empty() || args.output_dir.is_some() {
+        return multi_scan::run(args);
+    }
+    if args.parallel_files_explicit {
+        return Err("--parallel-files requires at least two input paths".to_string());
+    }
+    run_single_scan(args)
+}
+
+fn run_single_scan(mut args: Args) -> Result<(), String> {
+    clear_dump_map();
     apply_input_autodetect(&mut args);
     if args.vmware_info {
         let state = bxmap::vmware::VmwareState::open(&args.path)
@@ -166,7 +178,7 @@ fn run() -> Result<(), String> {
         || args.path.to_ascii_lowercase().ends_with(".dmp")
     {
         if let Ok(dump) = bxmap::minidump::Minidump::open(&args.path) {
-            let _ = DUMP_MAP.set(dump);
+            set_dump_map(Some(dump));
         }
     }
     let filter_regex = args
@@ -297,6 +309,8 @@ fn run() -> Result<(), String> {
             print_reassembly_summary(&report);
         } else {
             let report = Carver::new(options)
+                .with_incomplete_dir(true)
+                .with_salvage(true)
                 .carve_to_dir(&args.path, Path::new(out_dir))
                 .map_err(|error| format!("carve failed: {error}"))?;
             if let Some(index_path) = args.carve_index.as_deref() {
