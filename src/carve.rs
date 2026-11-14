@@ -1519,12 +1519,18 @@ fn text_token_len(bytes: &[u8], i: usize) -> usize {
     len
 }
 
-/// Share of `block` that decodes as text tokens, `0.0..=1.0`.
+/// Share of `block` that decodes as text tokens, `0.0..=1.0`. A block
+/// dominated by one byte is never text, however printable that byte looks:
+/// a run of `?` passes the ASCII test but is junk, not evidence.
 fn text_block_ratio(block: &[u8]) -> f64 {
     let mut i = 0usize;
     let mut matched = 0u64;
+    let mut counts = [0u64; 256];
     while i < block.len() {
         let len = text_token_len(block, i);
+        for &byte in &block[i..i + len.max(1)] {
+            counts[byte as usize] += 1;
+        }
         if len > 0 {
             matched += len as u64;
             i += len;
@@ -1533,6 +1539,10 @@ fn text_block_ratio(block: &[u8]) -> f64 {
         }
     }
     if block.is_empty() {
+        return 0.0;
+    }
+    let max_freq = counts.iter().max().copied().unwrap_or(0);
+    if max_freq as f64 / block.len() as f64 > 0.90 {
         return 0.0;
     }
     matched as f64 / block.len() as f64
@@ -5759,6 +5769,27 @@ mod tests {
         assert_eq!(file.offset, text_at + 64);
         assert_eq!(file.size, text.len() as u64 - 64);
         assert_eq!(file.entropy, file.entropy.min(6.0));
+    }
+
+    #[test]
+    fn text_pass_rejects_constant_byte_runs() {
+        // 0x3F ('?') is printable, so a run of it scores 100% "text" by any
+        // printable-ratio rule; it is junk, not evidence, and must not be
+        // carved.
+        let mut dump = pseudo_random(0x10000, 0x0ca11_ab1e_0000_0001);
+        dump.extend_from_slice(&vec![b'?'; 0x4000]);
+        dump.extend_from_slice(&pseudo_random(0x4000, 0xfeed_face_1111_2222));
+
+        let path = write_dump("text-degenerate", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Text],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(report.files.is_empty(), "{report:?}");
     }
 
     #[test]
