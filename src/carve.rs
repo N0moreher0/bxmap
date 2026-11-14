@@ -61,6 +61,18 @@ const SPIKE_WINDOW: usize = 4096;
 const SPIKE_HIGH: f64 = 7.8;
 /// A window below this entropy is clearly structured data (text, headers, tables).
 const SPIKE_LOW: f64 = 7.0;
+/// Block the text pass scores. Block-granular detection (plus a byte-level
+/// refine at the edges) keeps a stray non-text byte from splitting a long
+/// plaintext run.
+const TEXT_BLOCK: usize = 4096;
+/// Share of a block that must decode as text for the block itself to count.
+/// Random data scores ~30-38%, so 0.97 separates cleanly.
+const TEXT_BLOCK_RATIO: f64 = 0.97;
+/// A non-text block this long *inside* a run is bridged, not a boundary
+/// (one 4 KiB glitch should not split a 350 KB note).
+const TEXT_BRIDGE_BLOCKS: u64 = 1;
+/// Smallest region the text pass emits. Below this it is noise, not evidence.
+const TEXT_MIN_REGION: u64 = 2048;
 
 /// A format the carver understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -106,6 +118,10 @@ pub enum CarveKind {
     Class,
     Rtf,
     Evtx,
+    /// Plaintext (txt, md, logs, source, ...). It has no magic number, so the
+    /// text pass finds it by content and it is **not** part of
+    /// [`CarveKind::ALL`]: ask for it with `--carve text` (or `all,text`).
+    Text,
 }
 
 impl CarveKind {
@@ -153,6 +169,7 @@ impl CarveKind {
             CarveKind::Class => "class",
             CarveKind::Rtf => "rtf",
             CarveKind::Evtx => "evtx",
+            CarveKind::Text => "text",
         }
     }
 
@@ -246,6 +263,7 @@ impl CarveKind {
             "class" => Some(CarveKind::Class),
             "rtf" => Some(CarveKind::Rtf),
             "evtx" => Some(CarveKind::Evtx),
+            "text" | "txt" => Some(CarveKind::Text),
             _ => None,
         }
     }
@@ -272,7 +290,7 @@ impl CarveKind {
                 "elf" => vec![CarveKind::Elf],
                 other => vec![CarveKind::from_id(other).ok_or_else(|| {
                     format!(
-                        "unknown carve type '{other}' (known: {})",
+                        "unknown carve type '{other}' (known: {}, text)",
                         CarveKind::ALL
                             .iter()
                             .map(|kind| kind.as_str())
@@ -677,6 +695,9 @@ impl Carver {
         if self.salvage {
             self.salvage_pass(dump_path, out_dir, file_len, &mut report)?;
         }
+        if self.options.kinds.contains(&CarveKind::Text) {
+            self.text_pass(dump_path, out_dir, file_len, &mut report)?;
+        }
         Ok(report)
     }
 
@@ -813,6 +834,128 @@ impl Carver {
             }
             !stop
         })?;
+
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Third pass behind `--carve text` (it runs only when [`CarveKind::Text`]
+    /// is in the wanted kinds): find long runs of printable text that carry
+    /// no magic — notes, logs, Markdown, source dumps — and cut them out.
+    ///
+    /// The boundary is a heuristic, so every file is labelled `complete:
+    /// false` with a `text:region` note and lands in `partial/`. Offset,
+    /// size and a content sniff (`json`/`xml`/`html`/`csv`/`text`) are
+    /// recorded; dedupe and the `max_files`/`max_total` caps match the other
+    /// passes. Nothing is decrypted or repaired.
+    fn text_pass(
+        &self,
+        dump_path: &str,
+        out_dir: Option<&Path>,
+        file_len: u64,
+        report: &mut CarveReport,
+    ) -> io::Result<()> {
+        // A header pass that already hit a cap must not be extended.
+        if report.truncated {
+            return Ok(());
+        }
+        let mut by_hash: HashMap<String, usize> = HashMap::new();
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        for (index, file) in report.files.iter().enumerate() {
+            by_hash.insert(file.sha256.clone(), index);
+            covered.push((file.offset, file.offset + file.size));
+            for &duplicate in &file.duplicates {
+                covered.push((duplicate, duplicate + file.size));
+            }
+        }
+        let mut source = File::open(dump_path)?;
+        let mut failure: Option<io::Error> = None;
+
+        for (start, end) in text_regions(&mut source, file_len, &covered)? {
+            let size = end - start;
+            if size < self.options.min_size.max(1).max(TEXT_MIN_REGION) {
+                continue;
+            }
+            let (sha256, entropy) = match digest_region(&mut source, start, size) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            if let Some(&index) = by_hash.get(&sha256) {
+                report.duplicates += 1;
+                report.duplicate_bytes += size;
+                report.files[index].duplicates.push(start);
+                continue;
+            }
+            let path = match out_dir {
+                Some(dir) => {
+                    // Text boundaries are heuristic, so a text region always
+                    // goes beside the other partial files.
+                    let partial = dir.join("partial");
+                    if let Err(error) = std::fs::create_dir_all(&partial) {
+                        failure = Some(error);
+                        break;
+                    }
+                    let name = format!(
+                        "{:08x}-{}-{}.carved",
+                        start,
+                        CarveKind::Text.as_str(),
+                        &sha256[..8.min(sha256.len())]
+                    );
+                    let path = partial.join(name);
+                    if path.exists() {
+                        failure = Some(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "refusing to overwrite '{}'; use a fresh --carve-out",
+                                path.display()
+                            ),
+                        ));
+                        break;
+                    }
+                    if let Err(error) = write_region(&mut source, start, size, &path) {
+                        failure = Some(error);
+                        break;
+                    }
+                    Some(path)
+                }
+                None => None,
+            };
+            let mut prefix = vec![0u8; size.min(512) as usize];
+            source.seek(SeekFrom::Start(start))?;
+            source.read_exact(&mut prefix)?;
+            let sniff = text_sniff(&prefix);
+            let notes = format!(
+                "text:region 0x{start:x}-0x{end:x}; boundary cut to newline; looks like {sniff}"
+            );
+            by_hash.insert(sha256.clone(), report.files.len());
+            report.bytes_written += size;
+            report.files.push(CarvedFile {
+                offset: start,
+                kind: CarveKind::Text,
+                size,
+                complete: false,
+                sha256,
+                entropy,
+                notes,
+                path,
+                duplicates: Vec::new(),
+                corrupted_offset: None,
+                entropy_spike_at: None,
+            });
+
+            if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
+                report.truncated = true;
+                break;
+            }
+            if self.options.max_total != 0 && report.bytes_written >= self.options.max_total {
+                report.truncated = true;
+            }
+        }
 
         match failure {
             Some(error) => Err(error),
@@ -1325,6 +1468,287 @@ fn is_text_byte(byte: u8) -> bool {
     matches!(byte, b'\n' | b'\r' | b'\t') || (0x20..=0x7e).contains(&byte)
 }
 
+/// Printable ASCII plus form feed: the pure-ASCII subset the text pass uses
+/// to walk backwards/forwards from a block boundary to a byte-exact edge.
+fn is_ascii_text_byte(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r' | b'\t' | 0x0c) || (0x20..=0x7e).contains(&byte)
+}
+
+/// Length in bytes of the text token starting at `bytes[i]`, or `0` when the
+/// byte does not start one. A token is one printable ASCII byte, one of the
+/// common whitespace bytes (`\n`, `\r`, `\t`, form feed) or a valid UTF-8
+/// multibyte sequence (no overlongs, no surrogates, no noncharacters U+FFFE /
+/// U+FFFF, no C1 controls U+0080-U+009F). Counting token bytes instead of
+/// classifying per byte keeps the block ratio meaningful for Vietnamese and
+/// other UTF-8 text mixed with ASCII.
+fn text_token_len(bytes: &[u8], i: usize) -> usize {
+    let byte = bytes[i];
+    if is_ascii_text_byte(byte) {
+        return 1;
+    }
+    let len = match byte {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return 0,
+    };
+    if i + len > bytes.len() {
+        return 0;
+    }
+    let b1 = bytes[i + 1];
+    let second = match byte {
+        0xe0 => 0xa0..=0xbf,
+        0xed => 0x80..=0x9f,
+        0xf0 => 0x90..=0xbf,
+        0xf4 => 0x80..=0x8f,
+        _ => 0x80..=0xbf,
+    };
+    if !second.contains(&b1) {
+        return 0;
+    }
+    if !bytes[i + 2..i + len].iter().all(|b| (0x80..=0xbf).contains(b)) {
+        return 0;
+    }
+    // C1 controls arrive as C2 80..C2 9F; U+FFFE/U+FFFF as EF BF BE/BF.
+    if byte == 0xc2 && (0x80..=0x9f).contains(&b1) {
+        return 0;
+    }
+    if byte == 0xef && b1 == 0xbf && matches!(bytes[i + 2], 0xbe | 0xbf) {
+        return 0;
+    }
+    len
+}
+
+/// Share of `block` that decodes as text tokens, `0.0..=1.0`.
+fn text_block_ratio(block: &[u8]) -> f64 {
+    let mut i = 0usize;
+    let mut matched = 0u64;
+    while i < block.len() {
+        let len = text_token_len(block, i);
+        if len > 0 {
+            matched += len as u64;
+            i += len;
+        } else {
+            i += 1;
+        }
+    }
+    if block.is_empty() {
+        return 0.0;
+    }
+    matched as f64 / block.len() as f64
+}
+
+/// Cheap content sniff for the note attached to a text region. Coarse on
+/// purpose: the point is to help an analyst pick a viewer, not to classify.
+fn text_sniff(prefix: &[u8]) -> &'static str {
+    let start = prefix
+        .iter()
+        .position(|&byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .unwrap_or(prefix.len());
+    let trimmed = &prefix[start..];
+    if trimmed.starts_with(b"{") || trimmed.starts_with(b"[") {
+        return "json";
+    }
+    if trimmed.starts_with(b"<?xml") {
+        return "xml";
+    }
+    if trimmed.starts_with(b"<!DOCTYPE") || trimmed.starts_with(b"<html") {
+        return "html";
+    }
+    // CSV: the first non-empty line and the second share a comma count.
+    let text = String::from_utf8_lossy(&prefix[..prefix.len().min(4096)]);
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    if let (Some(first), Some(second)) = (lines.next(), lines.next()) {
+        let commas = |line: &str| line.matches(',').count();
+        if commas(first) >= 2 && commas(first) == commas(second) {
+            return "csv";
+        }
+    }
+    "text"
+}
+
+/// Carve away every byte of `region` covered by an already carved file.
+/// Returns the uncovered pieces, in offset order. A text region may end up
+/// split in two by a binary island (a ZIP smaller than one block, bridged by
+/// the block merger); each surviving piece stands alone.
+fn subtract_covered(region: (u64, u64), covered: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut pieces = vec![region];
+    for &(a, b) in covered {
+        let mut next = Vec::with_capacity(pieces.len() + 1);
+        for (s, e) in pieces {
+            if b <= s || a >= e {
+                next.push((s, e));
+                continue;
+            }
+            if s < a {
+                next.push((s, a));
+            }
+            if b < e {
+                next.push((b, e));
+            }
+        }
+        pieces = next;
+    }
+    pieces
+}
+
+/// Absolute offsets of the text runs in `file`: blocks of at least
+/// [`TEXT_BLOCK_RATIO`] text tokens, merged with a one-block bridge over
+/// non-text glitches, refined backwards/forwards to byte-exact edges, cut to
+/// the first and last newline (the boundary lines are usually fragments) and
+/// filtered to [`TEXT_MIN_REGION`]. Already-covered ranges are subtracted.
+fn text_regions(
+    file: &mut File,
+    file_len: u64,
+    covered: &[(u64, u64)],
+) -> io::Result<Vec<(u64, u64)>> {
+    // Pass 1: score every block without holding the file in memory.
+    let mut blocks: Vec<(u64, bool)> = Vec::new();
+    file.seek(SeekFrom::Start(0))?;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut abs = 0u64;
+    loop {
+        let mut filled = 0usize;
+        while filled < buffer.len() {
+            let read = file.read(&mut buffer[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+        for block in buffer[..filled].chunks(TEXT_BLOCK) {
+            blocks.push((abs, text_block_ratio(block) >= TEXT_BLOCK_RATIO));
+            abs += block.len() as u64;
+        }
+    }
+
+    // Pass 2: merge consecutive text blocks with a one-block bridge.
+    let block_len = |index: usize| -> u64 {
+        if index + 1 < blocks.len() {
+            blocks[index + 1].0 - blocks[index].0
+        } else {
+            file_len - blocks[index].0
+        }
+    };
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    let mut i = 0usize;
+    while i < blocks.len() {
+        if !blocks[i].1 {
+            i += 1;
+            continue;
+        }
+        let start = blocks[i].0;
+        let mut end = blocks[i].0 + block_len(i);
+        let mut gap = 0u64;
+        let mut j = i + 1;
+        while j < blocks.len() {
+            if blocks[j].1 {
+                gap = 0;
+                end = blocks[j].0 + block_len(j);
+            } else {
+                gap += 1;
+                if gap > TEXT_BRIDGE_BLOCKS {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        merged.push((start, end));
+        i = j;
+    }
+
+    // Pass 3: subtract covered ranges, refine edges, cut to newlines.
+    let mut out = Vec::new();
+    for region in merged {
+        for piece in subtract_covered(region, covered) {
+            out.extend(refine_text_piece(file, piece, file_len, covered)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Byte-level refine of one grid piece: walk to the true edges over ASCII
+/// text, drop the fragments of the first and last line (the cut usually
+/// lands mid-line) and apply [`TEXT_MIN_REGION`]. Covered ranges are
+/// subtracted again after the walk, since it may creep into an already
+/// carved file by a few printable bytes.
+fn refine_text_piece(
+    file: &mut File,
+    (start, end): (u64, u64),
+    file_len: u64,
+    covered: &[(u64, u64)],
+) -> io::Result<Vec<(u64, u64)>> {
+    const WALK: u64 = TEXT_BLOCK as u64;
+
+    // Walk backwards over ASCII text (catches a run the grid clipped).
+    let back = start.min(WALK);
+    let mut new_start = start;
+    if back > 0 {
+        let mut buf = vec![0u8; back as usize];
+        file.seek(SeekFrom::Start(start - back))?;
+        file.read_exact(&mut buf)?;
+        for index in (0..buf.len()).rev() {
+            if is_ascii_text_byte(buf[index]) {
+                new_start = start - back + index as u64;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Walk forwards over ASCII text.
+    let front = (file_len - end).min(WALK);
+    let mut new_end = end;
+    if front > 0 {
+        let mut buf = vec![0u8; front as usize];
+        file.seek(SeekFrom::Start(end))?;
+        file.read_exact(&mut buf)?;
+        for (index, &byte) in buf.iter().enumerate() {
+            if is_ascii_text_byte(byte) {
+                new_end = end + index as u64 + 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Cut the fragments of the boundary lines in one pass.
+    let mut first_nl: Option<u64> = None;
+    let mut last_nl: Option<u64> = None;
+    let mut base = new_start;
+    stream_region(file, new_start, new_end - new_start, |chunk| {
+        for (index, &byte) in chunk.iter().enumerate() {
+            if byte == b'\n' {
+                let abs_nl = base + index as u64;
+                if first_nl.is_none() {
+                    first_nl = Some(abs_nl);
+                }
+                last_nl = Some(abs_nl);
+            }
+        }
+        base += chunk.len() as u64;
+        Ok(())
+    })?;
+    if let Some(nl) = first_nl {
+        new_start = nl + 1;
+    }
+    if let Some(nl) = last_nl {
+        new_end = nl + 1;
+    }
+    if new_end <= new_start {
+        return Ok(Vec::new());
+    }
+
+    // The walk may have crept into a carved file: subtract again.
+    Ok(subtract_covered((new_start, new_end), covered)
+        .into_iter()
+        .filter(|(s, e)| e - s >= TEXT_MIN_REGION)
+        .collect())
+}
+
 /// Walk backwards from `end` in [`SPIKE_WINDOW`] steps while the data stays
 /// below [`SPIKE_HIGH`]. At the first high-entropy window, trim back only over
 /// the text bytes at its tail so the boundary is not 4 KiB-coarse. Returns
@@ -1627,6 +2051,7 @@ fn validate(kind: CarveKind, file: &mut File, offset: u64, end: u64) -> io::Resu
         CarveKind::Class => carve_class(&mut source)?,
         CarveKind::Rtf => carve_rtf(&mut source)?,
         CarveKind::Evtx => carve_evtx(&mut source)?,
+        CarveKind::Text => Verdict::Invalid("text has no header; it is found by the text pass".to_string()),
     };
     Ok((verdict, source.produced()))
 }
@@ -5295,6 +5720,188 @@ mod tests {
         );
         assert!(CarveKind::from_list("xyz").is_err());
         assert!(CarveKind::from_list("").is_err());
+    }
+
+    /// Block-aligned deterministic text fixture: `blocks` blocks of 64-byte
+    /// lines, ending on a newline. The first line is exactly 64 bytes.
+    fn md_text(blocks: usize) -> Vec<u8> {
+        let line = format!("{:<63}\n", "Lorem ipsum dolor sit amet, consectetur adipiscing elit");
+        assert_eq!(line.len(), 64, "fixture lines must be exactly 64 bytes");
+        let mut out = Vec::with_capacity(blocks * TEXT_BLOCK);
+        for _ in 0..blocks * (TEXT_BLOCK / 64) {
+            out.extend_from_slice(line.as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn text_pass_recovers_the_readable_region_and_skips_random_data() {
+        let text = md_text(2);
+        let mut dump = pseudo_random(0x10000, 0x9e37_79b9_7f4a_7c15);
+        dump.extend_from_slice(&text);
+        dump.extend_from_slice(&pseudo_random(0x4000, 0x3f84_d5b5_b547_0917));
+        let text_at = 0x10000u64;
+        let path = write_dump("text-basic", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Text],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.kind, CarveKind::Text);
+        assert!(!file.complete);
+        assert!(file.notes.starts_with("text:region"), "{file:?}");
+        // The ragged first line is cut at the newline.
+        assert_eq!(file.offset, text_at + 64);
+        assert_eq!(file.size, text.len() as u64 - 64);
+        assert_eq!(file.entropy, file.entropy.min(6.0));
+    }
+
+    #[test]
+    fn text_pass_bridges_one_bad_block_inside_a_run() {
+        let head = md_text(1);
+        let tail = md_text(2);
+        let mut dump = pseudo_random(0x10000, 0xdead_beef_cafe_f00d);
+        let base = dump.len() as u64;
+        dump.extend_from_slice(&head);
+        dump.extend_from_slice(&pseudo_random(0x1000, 0x1eaf_5eed_1234_5678));
+        dump.extend_from_slice(&tail);
+        dump.extend_from_slice(&pseudo_random(0x4000, 0x0bad_f00d_0bad_f00d));
+
+        let path = write_dump("text-bridge", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Text],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        // One 4 KiB non-text block does not split the region.
+        assert_eq!(file.offset, base + 64);
+        assert_eq!(file.size, (0x4000 - 64) as u64);
+    }
+
+    #[test]
+    fn text_pass_yields_nothing_on_pure_random_data() {
+        let dump = pseudo_random(1 << 20, 0x1234_5678_9abc_def0);
+        let path = write_dump("text-random", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Text],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(report.files.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn text_pass_is_opt_in_and_all_does_not_include_it() {
+        // `all` must not change: text is an explicit opt-in.
+        assert!(!CarveKind::ALL.contains(&CarveKind::Text));
+        assert_eq!(
+            CarveKind::from_list("all").unwrap(),
+            CarveKind::ALL.to_vec()
+        );
+        assert!(CarveKind::from_list("text").unwrap().contains(&CarveKind::Text));
+        assert!(CarveKind::from_list("txt").unwrap().contains(&CarveKind::Text));
+        assert!(CarveKind::from_list("all,text").unwrap().contains(&CarveKind::Text));
+
+        let text = md_text(2);
+        let mut dump = pseudo_random(0x10000, 0xabcd_ef01_2345_6789);
+        dump.extend_from_slice(&text);
+        dump.extend_from_slice(&pseudo_random(0x4000, 0x0f0e_0d0c_0b0a_0908));
+        let path = write_dump("text-optin", &dump);
+        let report = Carver::new(CarveOptions::default())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert!(
+            report.files.iter().all(|file| file.kind != CarveKind::Text),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn text_pass_clips_regions_around_already_carved_files() {
+        let text = md_text(2);
+        let zip = zip_bytes("ok.txt", b"hello");
+        let mut dump = pseudo_random(0x10000, 0x0ddc_0ffe_ee11_2233);
+        let zip_at = dump.len() as u64;
+        dump.extend_from_slice(&zip);
+        dump.extend_from_slice(&text);
+        dump.extend_from_slice(&pseudo_random(0x4000, 0x5544_3322_1100_ffee));
+
+        let path = write_dump("text-clip", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Zip, CarveKind::Text],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        let zip_file = report
+            .files
+            .iter()
+            .find(|file| file.kind == CarveKind::Zip)
+            .expect("zip must be carved");
+        assert_eq!(zip_file.offset, zip_at);
+        let zip_end = zip_at + zip_file.size;
+        let text_file = report
+            .files
+            .iter()
+            .find(|file| file.kind == CarveKind::Text)
+            .unwrap_or_else(|| panic!("text region must be recovered: {report:?}"));
+        assert!(
+            text_file.offset >= zip_end && text_file.offset + text_file.size <= zip_at + zip.len() as u64 + text.len() as u64 + 1,
+            "text region must not enter the carved zip: {text_file:?}"
+        );
+    }
+
+    #[test]
+    fn text_pass_recovers_utf8_vietnamese_content() {
+        let line = "Tiếng Việt có dấu, chữ Latin pha trộn.\n";
+        assert!(line.len() > 16);
+        let mut text = Vec::new();
+        while text.len() < 0x10000 {
+            text.extend_from_slice(line.as_bytes());
+        }
+        // End on a complete line so the fixture is deterministic.
+        text.truncate(text.len() - (text.len() % line.len()));
+        let text_at = 0x10000u64;
+        let mut dump = pseudo_random(0x10000, 0x1234_abcd_5678_9abc);
+        dump.extend_from_slice(&text);
+        dump.extend_from_slice(&pseudo_random(0x4000, 0x9876_5432_10fe_dcba));
+
+        let path = write_dump("text-utf8", &dump);
+        let out_dir = path.parent().unwrap().join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Text],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        let file = report
+            .files
+            .iter()
+            .find(|file| file.kind == CarveKind::Text)
+            .unwrap_or_else(|| panic!("utf-8 region must be recovered: {report:?}"));
+        assert_eq!(file.offset, text_at + line.len() as u64);
+        let written = std::fs::read(file.path.as_ref().unwrap()).unwrap();
+        let recovered = String::from_utf8_lossy(&written);
+        assert!(recovered.contains("Tiếng Việt có dấu"));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }
 

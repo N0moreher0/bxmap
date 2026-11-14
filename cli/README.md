@@ -166,14 +166,18 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   Types: `jpeg`, `png`, `gif`, `bmp`, `tif`, `ico`, `webp`, `zip`, `rar4`, `rar5`,
   `7z`, `gzip`, `bz2`, `xz`, `tar`, `pdf`, `rtf`, `ole`, `sqlite`, `pe`, `elf`,
   `class`, `dex`, `wasm`, `lnk`, `evtx`, `pcap`, `pcapng`, `kdbx`, `pem`, `mp4`,
-  `avi`, `wav`, `mkv`, `webm`, `ogg`, `opus`, `flac`, `mp3`, `vdi`, `vmdk`, `all`
-  (comma-separated). Aliases: `rar` (both RAR versions), `jpg` (jpeg), `7zip`
+  `avi`, `wav`, `mkv`, `webm`, `ogg`, `opus`, `flac`, `mp3`, `vdi`, `vmdk`, `all`,
+  `text` (comma-separated). `text` recovers plaintext (notes, logs, Markdown,
+  source dumps) by content rather than by magic; it is not part of `all` - ask
+  for it with `--carve text` or `--carve all,text`. Its boundaries are a
+  heuristic, so recovered text lands in `partial/` with `complete: false` and
+  a `text:region` note (region offsets, newline-cut, content sniff). Aliases: `rar` (both RAR versions), `jpg` (jpeg), `7zip`
   (7z), `office`/`ms-office` (ole), `exe`/`executable` (pe), and file extensions
   that share a container: `docx`/`xlsx`/`pptx`/`odt`/`ods`/`jar`/`apk` (zip),
   `doc`/`xls`/`ppt`/`msi`/`msg` (ole), `dll`/`sys` (pe), `so` (elf),
   `db`/`sqlite3` (sqlite), `mov`/`m4a` (mp4), `tiff` (tif). Formats without a
-  magic number (plain text, json, xml, html, sql, csv, source code, `.dat`,
-  `.key`) are not carved. Every candidate is structurally validated before
+  magic number are not carved, except plaintext via `text` above. Every
+  candidate is structurally validated before
   writing; nothing is decrypted, decompressed, or executed.
   Types select file formats only, never a technique: every carve runs the
   full recovery stack, including a footer-first second pass for ZIP

@@ -435,9 +435,11 @@ Recover structured files directly from a raw dump. The carver:
 - Selects by format or by file extension: `--carve docx` / `xlsx` / `jar` / `apk`
   use the ZIP validator, `doc` / `xls` / `msi` / `msg` the OLE one, `dll` / `sys`
   the PE one, `so` the ELF one, `db` the SQLite one. 41 kinds in total
-  (`--carve all`). Formats with no magic number (plain text, json, xml, html,
-  sql, csv, source code, `.dat`, `.key`) are not carved. Entropy is only a
-  boundary hint; structural validation decides what is written.
+  (`--carve all`). Formats with no magic number are not carved, except plaintext
+  via the opt-in `text` kind (`--carve text` / `--carve all,text`): content-based
+  recovery of notes, logs, Markdown and source dumps, written to `partial/` with
+  `complete: false` and a `text:region` note. Entropy is only a boundary hint;
+  structural validation decides what is written.
 - Deduplicates by SHA-256; identical files found at multiple offsets are recorded
   once with `duplicates: [offsets]` in the index.
 - Writes files with a neutral `.carved` extension (`<offset:08x>-<kind>-<sha8>.carved`)

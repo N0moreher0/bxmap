@@ -6,6 +6,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `--carve text`: new opt-in carve of plaintext regions (notes, logs,
+  Markdown, source dumps). `Text` is a `CarveKind` that is NOT in
+  `CarveKind::ALL`: `--carve all` is unchanged; ask for it with
+  `--carve text` (or `all,text`). Detection is content-based: 4 KiB blocks
+  scoring >= 97% text tokens (printable ASCII, common whitespace, valid
+  UTF-8), merged with a one-block bridge, refined to byte-exact edges, cut to
+  the first/last newline and clipped against files already carved. Each
+  region is written to `partial/` with `complete: false` and a note
+  `text:region 0x..-0x..; boundary cut to newline; looks like
+  json|xml|html|csv|text`. Verified on a synthetic `md.dump` (455,111 B,
+  head 25% random): the pass recovered the full plaintext tail byte
+  for byte (341,323/341,323 bytes identical to `orig.md`) and reported
+  nothing on pure-random data.
 - Footer-first salvage now understands PNG: when the head of a PNG (signature,
   IHDR, first IDATs) is gone but the `IEND` chunk survived, the carver walks
   back from it over contiguous IDAT chunks whose length and CRC verify and keeps
@@ -13,34 +26,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`salvage:tail: PNG IDAT run (N chunk(s)) + IEND at 0x...; signature and IHDR
   are missing`). The file is evidence of the compressed pixel data, not a
   viewable image (the zlib header and IHDR are lost with the head).
-
-### Fixed
-- `--carve png`: a PNG whose chunk CRC (or chunk length) is damaged after the
-  header — e.g. partial encryption or overwrite of the middle/tail — is no
-  longer dropped. The chunks that verified are kept, the file ends right before
-  the damaged chunk and lands in `partial/` with a note
-  (`PNG IDAT chunk CRC mismatch at 0x...; kept N valid chunk(s)`). A bad IHDR is
-  still rejected.
-
-### Changed
-- `--carve` no longer takes a `salvage` token: the parameter selects file
-  types only, never a technique. Every carve runs the full recovery stack —
-  header-first, incomplete-candidate `partial/` layout and footer-first
-  salvage (ZIP central directory + end record, PDF `startxref` + `%%EOF`) —
-  for the selected types. `--carve salvage` (or `zip,pdf,salvage`) now exits
-  with a clear error naming the removed token. `salvage:tail` notes, the
-  high-entropy back-walk and the `partial/` output are unchanged.
-- Incomplete files (`complete: false`) are always written to a `partial/`
-  subfolder of `--carve-out` with `corrupted_offset`/`entropy_spike_at` in the
-  index; there is no longer a flat mode.
-
-### Removed
-- `--carve-incomplete`: the `partial/` layout is always on, so the flag is
-  gone. Passing it is an unknown-flag error. Library API unchanged:
-  `Carver::with_salvage(bool)` / `Carver::with_incomplete_dir(bool)` remain
-  opt-in for library callers. Carved files keep the `.carved` extension.
-
-### Added
 - Multi-format carving (8.8): `--carve` now recognises 41 kinds. New
   validators for `gif`, `ico`, `tar`, `pcap`, `pcapng`, `lnk`, `wasm`, `dex`,
   `kdbx`, `pem`, `avi`/`wav`/`webp` (RIFF), `mkv`/`webm` (EBML), `ogg`/`opus`,
@@ -51,7 +36,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `msi`/`msg` -> ole, `dll`/`sys` -> pe, `so` -> elf, `db`/`sqlite3` ->
   sqlite, `mov`/`m4a` -> mp4, `tiff` -> tif). Formats without a magic number
   (plain text, json, xml, html, sql, csv, source code, `.dat`, `.key`) are
-  not carved. Entropy stays a boundary hint only, never a rejection rule.
+  not carved, except plaintext via the opt-in 	ext kind above. Entropy
+  stays a boundary hint only, never a rejection rule.
   TAR is matched on the `ustar` field at offset 257 and back-adjusted to the
   true start; the matcher now reports every pattern that shares a needle
   (e.g. `OggS` for both ogg and opus).
@@ -90,107 +76,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   set and offset order as the in-memory scanner across region boundaries, with
   ASCII/UTF-16LE/UTF-16BE runs that straddle, end on and start on a boundary,
   plus encoding filters and `max_strings` truncation parity.
-
-### Changed
-- String classification now checksums crypto and card values before labelling
-  them: a Bitcoin address with a broken Base58Check/Bech32 checksum, or a digit
-  run that is not a real card number, is no longer reported under that type.
-  Checksum failures do not delete evidence, they only change the label.
-- The non-secret rule set used by `classify()` gets the same anchor prefilter
-  the secret patterns already had: one Aho-Corasick pass decides which rules
-  can possibly match, so a plain string no longer runs 20+ regexes. The
-  outcome is unchanged (regression test compares against running every rule).
-- `validate_jwt` now requires the `alg` header (mandatory in RFC 7519) instead
-  of `typ` (optional), accepts an empty signature only for `alg: none`, and
-  rejects a signature that is not base64url.
-
-### Fixed
-- Generic `password=`/`token=` matches that are really something else are
-  filtered out: e-mail addresses, URLs, dates and timestamps (`2024-01-15`,
-  `10:30:00`, ISO-8601) and long runs of digits (ids, counters, phone
-  numbers).
-- UTF-8 strings containing CJK characters are no longer cut at the first
-  multi-byte character. The UTF-8 and Shift-JIS branches both advanced the
-  shared scan index, so the Shift-JIS branch consumed a byte of the UTF-8
-  sequence and the run was flushed half way through. Found while building the
-  synthetic regression corpus.
-- `--vmss`/`.vmsn` tag walking no longer overflows on a hostile group table:
-  a `tags_offset` of `u64::MAX` made `pos + 2` (and `pos + 8`) abort the
-  process with overflow checks on. Both bounds checks now use `checked_add`.
-  Found by the new `fuzz` CI job on its first run; two regression tests cover
-  the hostile offset and a `u32::MAX` data length.
-- `bxmap --carve jpeg dump.bin` no longer fails with `unknown option 'jpeg'`:
-  the dump path may now appear anywhere on the command line, a second bare
-  token is reported as an extra argument, and a missing path says so instead
-  of parsing the first flag as the file name. `--help-advanced` / `--help-all`
-  now print the advanced help instead of being treated as a path.
-- `--carve 7z` now verifies `StartHeaderCRC` over the start header before
-  trusting the declared sizes, so random data with the 7-Zip signature is
-  rejected instead of reported as a complete archive.
-- README MSRV section matches the real minimums (1.80 declared, 1.85 with the
-  locked workspace, 1.95 for the default yara-x build) instead of "Rust 1.70".
-
-## [1.0.18] - 2026-11-10
-
-CLI release aligned with `bxmap` 1.0.7. No CLI code changes.
-
-### Changed
-- Depends on `bxmap` 1.0.7.
-
-## [1.0.7] - 2026-11-10
-
-### Fixed
-- Multi-byte decoding (UTF-8, Shift-JIS) no longer emits unreadable text:
-  invalid UTF-8 structure, unassigned Shift-JIS pairs, undefined CP1252 bytes,
-  replacement/C1/private-use characters and decoded runs made mostly of them
-  are rejected.
-- Long decoded runs are scored by bad-character and non-readable ratios while
-  short runs require hard evidence, so normal text and short strings survive.
-
-## [1.0.17] - 2026-11-10
-
-### Changed
-- Internal clippy cleanups only (`Option::is_none_or`); no behaviour change.
-
-## [1.0.16] - 2026-11-10
-
-CLI release aligned with `bxmap` 1.0.6.
-
-### Fixed
-- `--detect-strict` now drops findings below confidence 0.60, so noisy
-  generic/public-client matches no longer survive strict scans.
-- `--dedupe` merges findings by value across rules (including rich output)
-  and keeps the lowest-confidence classification instead of promoting it.
-- Secret detection on real memory dumps no longer reports Azure SAS tokens for
-  non-Azure signed URLs, or generic secrets for identifiers, UUIDs, paths and
-  low-entropy values.
-
-### Changed
-- Depends on `bxmap` 1.0.6.
-- Lite MSRV is 1.85; the full default build requires Rust 1.95 (yara-x 1.23).
-
-## [1.0.6] - 2026-11-09
-
-### Fixed
-- Secret detection false positives on real memory dumps: fixed-prefix rules now
-  use token boundaries; `AZURE_SAS_TOKEN` requires an Azure storage host, so
-  YouTube signed URLs are no longer reported as SAS tokens.
-- `GENERIC_SECRET` now rejects query strings, paths, camelCase API identifiers,
-  short hex GUID/.NET assembly tokens, UUIDs and low-entropy values.
-- `--detect-strict` drops findings below confidence 0.60 (generic, public
-  client, OAuth client id and Google API key stay available in non-strict mode).
-- `--dedupe` collapses findings by value across rules and keeps the
-  lowest-confidence classification, so a public client key cannot be promoted.
-- Calibrated `GENERIC_SECRET`, `PUBLIC_CLIENT_KEY`, `GOOGLE_OAUTH_CLIENT_ID`
-  and `GOOGLE_API_KEY` confidence/severity.
-
-### Changed
-- Lite MSRV is 1.80 (Cargo 1.70-1.75 cannot resolve the optional yara-x graph);
-  the full default build requires Rust 1.95 (yara-x 1.23).
-
-## [Unreleased]
-
-### Added
 - Encoding-scoped scanning (`EncodingFilter`) so `--encoding ascii|utf16|utf32`
   only scans requested encodings instead of all 5.
 - 8-byte word fast-skip in the no-open-run path for random / high-byte data.
@@ -329,6 +214,27 @@ CLI release aligned with `bxmap` 1.0.6.
   Raw key bytes are never surfaced and nothing is decrypted.
 
 ### Changed
+- `--carve` no longer takes a `salvage` token: the parameter selects file
+  types only, never a technique. Every carve runs the full recovery stack —
+  header-first, incomplete-candidate `partial/` layout and footer-first
+  salvage (ZIP central directory + end record, PDF `startxref` + `%%EOF`) —
+  for the selected types. `--carve salvage` (or `zip,pdf,salvage`) now exits
+  with a clear error naming the removed token. `salvage:tail` notes, the
+  high-entropy back-walk and the `partial/` output are unchanged.
+- Incomplete files (`complete: false`) are always written to a `partial/`
+  subfolder of `--carve-out` with `corrupted_offset`/`entropy_spike_at` in the
+  index; there is no longer a flat mode.
+- String classification now checksums crypto and card values before labelling
+  them: a Bitcoin address with a broken Base58Check/Bech32 checksum, or a digit
+  run that is not a real card number, is no longer reported under that type.
+  Checksum failures do not delete evidence, they only change the label.
+- The non-secret rule set used by `classify()` gets the same anchor prefilter
+  the secret patterns already had: one Aho-Corasick pass decides which rules
+  can possibly match, so a plain string no longer runs 20+ regexes. The
+  outcome is unchanged (regression test compares against running every rule).
+- `validate_jwt` now requires the `alg` header (mandatory in RFC 7519) instead
+  of `typ` (optional), accepts an empty signature only for `alg: none`, and
+  rejects a signature that is not base64url.
 - Shift-JIS (`--encoding shift_jis`) now decodes through `encoding_rs`
   (JIS X 0208 with the usual extension axes), replacing the partial
   hand-rolled table. New optional dependency `encoding_rs` sits behind a
@@ -374,7 +280,43 @@ CLI release aligned with `bxmap` 1.0.6.
   and all-encoding scans plus the parallel file path, and `bench/bench.py` for
   end-to-end wall time, throughput and peak RSS (optionally against `strings`).
 
+### Removed
+- `--carve-incomplete`: the `partial/` layout is always on, so the flag is
+  gone. Passing it is an unknown-flag error. Library API unchanged:
+  `Carver::with_salvage(bool)` / `Carver::with_incomplete_dir(bool)` remain
+  opt-in for library callers. Carved files keep the `.carved` extension.
+
 ### Fixed
+- `--carve png`: a PNG whose chunk CRC (or chunk length) is damaged after the
+  header — e.g. partial encryption or overwrite of the middle/tail — is no
+  longer dropped. The chunks that verified are kept, the file ends right before
+  the damaged chunk and lands in `partial/` with a note
+  (`PNG IDAT chunk CRC mismatch at 0x...; kept N valid chunk(s)`). A bad IHDR is
+  still rejected.
+- Generic `password=`/`token=` matches that are really something else are
+  filtered out: e-mail addresses, URLs, dates and timestamps (`2024-01-15`,
+  `10:30:00`, ISO-8601) and long runs of digits (ids, counters, phone
+  numbers).
+- UTF-8 strings containing CJK characters are no longer cut at the first
+  multi-byte character. The UTF-8 and Shift-JIS branches both advanced the
+  shared scan index, so the Shift-JIS branch consumed a byte of the UTF-8
+  sequence and the run was flushed half way through. Found while building the
+  synthetic regression corpus.
+- `--vmss`/`.vmsn` tag walking no longer overflows on a hostile group table:
+  a `tags_offset` of `u64::MAX` made `pos + 2` (and `pos + 8`) abort the
+  process with overflow checks on. Both bounds checks now use `checked_add`.
+  Found by the new `fuzz` CI job on its first run; two regression tests cover
+  the hostile offset and a `u32::MAX` data length.
+- `bxmap --carve jpeg dump.bin` no longer fails with `unknown option 'jpeg'`:
+  the dump path may now appear anywhere on the command line, a second bare
+  token is reported as an extra argument, and a missing path says so instead
+  of parsing the first flag as the file name. `--help-advanced` / `--help-all`
+  now print the advanced help instead of being treated as a path.
+- `--carve 7z` now verifies `StartHeaderCRC` over the start header before
+  trusting the declared sizes, so random data with the 7-Zip signature is
+  rejected instead of reported as a complete archive.
+- README MSRV section matches the real minimums (1.80 declared, 1.85 with the
+  locked workspace, 1.95 for the default yara-x build) instead of "Rust 1.70".
 - Carving: a candidate whose deflate stream was corrupt (false positive behind a
   gzip magic hit) aborted the whole scan with `carve failed: deflate
   decompression error`. Corrupt candidates are now treated as `Invalid` verdicts
@@ -408,13 +350,64 @@ CLI release aligned with `bxmap` 1.0.6.
 - The 21-line ASCII logo is only printed by `-h`/`--help`, not on every scan,
   and the leftover `[DEBUG]` lines were removed from the report writer.
 
-## [1.0.14] - 2026-10-30 (`bxmap-cli`)
+## [1.0.18] - 2026-11-10
+CLI release aligned with `bxmap` 1.0.7. No CLI code changes.
 
+### Changed
+- Depends on `bxmap` 1.0.7.
+
+## [1.0.7] - 2026-11-10
+### Fixed
+- Multi-byte decoding (UTF-8, Shift-JIS) no longer emits unreadable text:
+  invalid UTF-8 structure, unassigned Shift-JIS pairs, undefined CP1252 bytes,
+  replacement/C1/private-use characters and decoded runs made mostly of them
+  are rejected.
+- Long decoded runs are scored by bad-character and non-readable ratios while
+  short runs require hard evidence, so normal text and short strings survive.
+
+## [1.0.17] - 2026-11-10
+### Changed
+- Internal clippy cleanups only (`Option::is_none_or`); no behaviour change.
+
+## [1.0.16] - 2026-11-10
+CLI release aligned with `bxmap` 1.0.6.
+
+### Fixed
+- `--detect-strict` now drops findings below confidence 0.60, so noisy
+  generic/public-client matches no longer survive strict scans.
+- `--dedupe` merges findings by value across rules (including rich output)
+  and keeps the lowest-confidence classification instead of promoting it.
+- Secret detection on real memory dumps no longer reports Azure SAS tokens for
+  non-Azure signed URLs, or generic secrets for identifiers, UUIDs, paths and
+  low-entropy values.
+
+### Changed
+- Depends on `bxmap` 1.0.6.
+- Lite MSRV is 1.85; the full default build requires Rust 1.95 (yara-x 1.23).
+
+## [1.0.6] - 2026-11-09
+### Fixed
+- Secret detection false positives on real memory dumps: fixed-prefix rules now
+  use token boundaries; `AZURE_SAS_TOKEN` requires an Azure storage host, so
+  YouTube signed URLs are no longer reported as SAS tokens.
+- `GENERIC_SECRET` now rejects query strings, paths, camelCase API identifiers,
+  short hex GUID/.NET assembly tokens, UUIDs and low-entropy values.
+- `--detect-strict` drops findings below confidence 0.60 (generic, public
+  client, OAuth client id and Google API key stay available in non-strict mode).
+- `--dedupe` collapses findings by value across rules and keeps the
+  lowest-confidence classification, so a public client key cannot be promoted.
+- Calibrated `GENERIC_SECRET`, `PUBLIC_CLIENT_KEY`, `GOOGLE_OAUTH_CLIENT_ID`
+  and `GOOGLE_API_KEY` confidence/severity.
+
+### Changed
+- Lite MSRV is 1.80 (Cargo 1.70-1.75 cannot resolve the optional yara-x graph);
+  the full default build requires Rust 1.95 (yara-x 1.23).
+
+## [1.0.14] - 2026-10-30 (`bxmap-cli`)
 ### Changed
 - CLI version bump (see CLI changelog below); uses `bxmap 1.0.4`.
 
 ## [1.0.4] - 2026-10-30 (`bxmap`)
-
 ### Added
 - Encoding-scoped extraction APIs for library users.
 - Encoding-filtered CLI scans.

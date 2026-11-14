@@ -802,8 +802,14 @@ OPTIONS:
                           to --carve-out. Types: jpeg,png,gif,bmp,tif,ico,webp,
                           zip,rar,7z,gzip,bz2,xz,tar,pdf,rtf,ole,sqlite,pe,elf,
                           class,dex,wasm,lnk,evtx,pcap,pcapng,kdbx,pem,mp4,avi,
-                          wav,mkv,webm,ogg,opus,flac,mp3,vdi,vmdk,all
-                          (comma-separated). Extensions work as aliases:
+                          wav,mkv,webm,ogg,opus,flac,mp3,vdi,vmdk,all,text
+                          (comma-separated). text recovers plaintext (notes,
+                          logs, Markdown, source dumps) by content rather
+                          than by magic; it is not part of all - ask for it
+                          with --carve text or all,text. Text boundaries are
+                          a heuristic, so text files land in partial/ with
+                          complete: false and a text:region note. Extensions
+                          work as aliases:
                           docx/xlsx/pptx/odt/jar/apk=zip, doc/xls/ppt/msi/msg=
                           ole, dll/sys=pe, so=elf, db/sqlite3=sqlite, jpg=jpeg,
                           mov/m4a=mp4, tiff=tif. Types select file
