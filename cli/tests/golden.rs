@@ -1708,8 +1708,18 @@ fn golden_carve_new_formats_gif_and_lnk() {
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert!(names.iter().any(|n| n.contains("-gif-") && n.ends_with(".gif.carved")), "{names:?}");
-    assert!(names.iter().any(|n| n.contains("-lnk-") && n.ends_with(".lnk.carved")), "{names:?}");
+    assert!(
+        names
+            .iter()
+            .any(|n| n.contains("-gif-") && n.ends_with(".gif.carved")),
+        "{names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.contains("-lnk-") && n.ends_with(".lnk.carved")),
+        "{names:?}"
+    );
 }
 
 #[test]
@@ -1809,7 +1819,10 @@ fn golden_carve_exact_extension_filter_and_carved_alias() {
     let (stderr, names, records) = run("--carved", "--carved-out", "dll", "only-dll");
     assert!(names.is_empty(), "{names:?}");
     assert!(records.trim().is_empty(), "{records}");
-    assert!(stderr.contains("1 file(s) filtered by extension"), "{stderr}");
+    assert!(
+        stderr.contains("1 file(s) filtered by extension"),
+        "{stderr}"
+    );
 
     for (carve, carve_out, kinds, name) in [
         ("--carve", "--carve-out", "exe", "exe"),
@@ -1829,7 +1842,11 @@ fn golden_crc32(data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= u32::from(byte);
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -1890,8 +1907,11 @@ fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
     let mut prose = Vec::new();
     for i in 0..400u32 {
         prose.extend_from_slice(
-            format!("line {i}: the quick brown fox jumps over the lazy dog {}\n", i * 7919)
-                .as_bytes(),
+            format!(
+                "line {i}: the quick brown fox jumps over the lazy dog {}\n",
+                i * 7919
+            )
+            .as_bytes(),
         );
     }
 
@@ -1956,7 +1976,10 @@ fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
 
     let find = |ext: &str| {
         let suffix = format!(".{ext}.carved");
-        let hits = names.iter().filter(|n| n.ends_with(&suffix)).collect::<Vec<_>>();
+        let hits = names
+            .iter()
+            .filter(|n| n.ends_with(&suffix))
+            .collect::<Vec<_>>();
         assert_eq!(hits.len(), 1, "{ext}: {names:?}");
         hits[0].clone()
     };
@@ -1969,8 +1992,14 @@ fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
         assert!(name.starts_with(&format!("{offset:08x}-")), "{name}");
         let carved = std::fs::read(out_dir.join(&name)).unwrap();
         if ext == "exe" {
-            assert!(carved.starts_with(original), "exe must start with the original bytes");
-            assert!(carved[original.len()..].iter().all(|&b| b == 0), "exe overlay");
+            assert!(
+                carved.starts_with(original),
+                "exe must start with the original bytes"
+            );
+            assert!(
+                carved[original.len()..].iter().all(|&b| b == 0),
+                "exe overlay"
+            );
         } else {
             assert_eq!(&carved, original, "{ext} must be byte-identical");
         }
@@ -1982,12 +2011,20 @@ fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert_eq!(partial.len(), 1, "{partial:?}");
-    assert!(partial[0].contains("-text-") && partial[0].ends_with(".txt.carved"), "{partial:?}");
+    assert!(
+        partial[0].contains("-text-") && partial[0].ends_with(".txt.carved"),
+        "{partial:?}"
+    );
 
     // Every name only uses the whitelist (hex, `-`, lowercase, dots).
-    for name in names.iter().filter(|n| n.as_str() != "partial").chain(partial.iter()) {
+    for name in names
+        .iter()
+        .filter(|n| n.as_str() != "partial")
+        .chain(partial.iter())
+    {
         assert!(
-            name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'),
+            name.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'),
             "{name}"
         );
         assert!(name.ends_with(".carved") && name.len() < 64, "{name}");
@@ -2002,7 +2039,10 @@ fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
             .to_string()
     };
     let docx_line = line_for("docx");
-    assert!(docx_line.contains("\"ext_source\":\"sniff:zip/word\""), "{docx_line}");
+    assert!(
+        docx_line.contains("\"ext_source\":\"sniff:zip/word\""),
+        "{docx_line}"
+    );
     assert!(docx_line.contains("\"tier\":1"), "{docx_line}");
     assert!(docx_line.contains("\"complete\":true"), "{docx_line}");
     let exe_line = line_for("exe");
@@ -2180,7 +2220,10 @@ fn golden_bare_carve_is_a_full_carve() {
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{name}: {stderr}");
-        assert!(stderr.contains("carve: 2 file(s) (2 complete)"), "{name}: {stderr}");
+        assert!(
+            stderr.contains("carve: 2 file(s) (2 complete)"),
+            "{name}: {stderr}"
+        );
         let carved = dir.path().join(format!("{name}.bxmap")).join("carved");
         let names = std::fs::read_dir(&carved)
             .unwrap()
@@ -2189,7 +2232,10 @@ fn golden_bare_carve_is_a_full_carve() {
             .collect::<Vec<_>>();
         assert_eq!(names.len(), 2, "{name}: {names:?}");
         assert!(names.iter().any(|file| file.contains("-png-")), "{names:?}");
-        assert!(names.iter().any(|file| file.contains("-jpeg-")), "{names:?}");
+        assert!(
+            names.iter().any(|file| file.contains("-jpeg-")),
+            "{names:?}"
+        );
     }
 }
 

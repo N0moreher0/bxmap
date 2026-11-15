@@ -415,8 +415,10 @@ mod tests {
         let (_dir, path) = write_config("min-len = 8\n");
         let config = load_config(&path).unwrap();
         let mut args = default_args();
-        let mut explicit = ExplicitFlags::default();
-        explicit.min_len = true;
+        let mut explicit = ExplicitFlags {
+            min_len: true,
+            ..ExplicitFlags::default()
+        };
         args.min_len = 4;
         apply_config(&mut args, &mut explicit, &config).unwrap();
         assert_eq!(args.min_len, 4);

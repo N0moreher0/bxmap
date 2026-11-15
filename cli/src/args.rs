@@ -1157,7 +1157,13 @@ mod tests {
             vec!["--carve-out", "a", "--carved-out", "b", "dump.bin"],
             vec!["--carved-out", "a", "--carve-out", "b", "dump.bin"],
             vec!["--carve", "zip", "--carved", "zip", "dump.bin"],
-            vec!["--carve-max-files", "1", "--carved-max-files", "1", "dump.bin"],
+            vec![
+                "--carve-max-files",
+                "1",
+                "--carved-max-files",
+                "1",
+                "dump.bin",
+            ],
         ] {
             let error = parse(&argv).map(|_| ()).unwrap_err();
             assert!(error.contains("same option"), "{argv:?}: {error}");
@@ -1166,7 +1172,9 @@ mod tests {
 
     #[test]
     fn a_carved_option_without_a_value_names_the_spelling_the_user_typed() {
-        let error = parse(&["dump.bin", "--carved-out"]).map(|_| ()).unwrap_err();
+        let error = parse(&["dump.bin", "--carved-out"])
+            .map(|_| ())
+            .unwrap_err();
         assert!(error.contains("--carved-out"), "{error}");
     }
 

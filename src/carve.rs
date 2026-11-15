@@ -138,17 +138,11 @@ fn evidence_for(
 ) -> (u8, Vec<&'static str>, CarveConfidence) {
     match role {
         CarveRole::Tail => (2, vec!["footer"], CarveConfidence::Low),
-        CarveRole::Reassembled => (
-            2,
-            vec!["magic", "reassembled"],
-            CarveConfidence::Medium,
-        ),
+        CarveRole::Reassembled => (2, vec!["magic", "reassembled"], CarveConfidence::Medium),
         CarveRole::Whole if kind == CarveKind::Text => {
             (3, vec!["text_ratio"], CarveConfidence::Low)
         }
-        CarveRole::Whole if kind == CarveKind::Bin => {
-            (3, vec!["entropy"], CarveConfidence::Low)
-        }
+        CarveRole::Whole if kind == CarveKind::Bin => (3, vec!["entropy"], CarveConfidence::Low),
         CarveRole::Whole if complete => {
             let mut evidence = vec!["magic", "structure_ok", "terminator_ok"];
             if ext_source.starts_with("sniff:") {
@@ -200,7 +194,10 @@ pub fn carved_file_name_with_ext(
             format!("{offset:08x}-{kind_id}-{}.{ext}.carved", short_hash(sha256))
         }
         CarveRole::Tail => {
-            format!("{offset:08x}-{kind_id}-{}.{ext}.tail.carved", short_hash(sha256))
+            format!(
+                "{offset:08x}-{kind_id}-{}.{ext}.tail.carved",
+                short_hash(sha256)
+            )
         }
         CarveRole::Reassembled => {
             format!("{offset:08x}-{kind_id}-reassembled.{ext}.carved")
@@ -656,7 +653,7 @@ pub struct CarvedFile {
     /// bytes the validator could walk). `None` for complete files.
     pub corrupted_offset: Option<u64>,
     /// Absolute start of the first 4 KiB window whose entropy jumps to
-    /// >= 7.8 bits/byte after structured (< 7.0) data: a hint of where an
+    /// ≥ 7.8 bits/byte after structured (< 7.0) data: a hint of where an
     /// encrypted region begins. Heuristic only (compressed data looks the
     /// same). `None` for complete files or when no such jump exists.
     pub entropy_spike_at: Option<u64>,
@@ -1281,8 +1278,7 @@ impl Carver {
                         failure = Some(error);
                         break;
                     }
-                    let name =
-                        carved_file_name(start, CarveKind::Text, CarveRole::Whole, &sha256);
+                    let name = carved_file_name(start, CarveKind::Text, CarveRole::Whole, &sha256);
                     let path = partial.join(name);
                     if path.exists() {
                         failure = Some(io::Error::new(
@@ -1942,7 +1938,12 @@ struct SalvageTail {
 
 /// Read exactly `len` bytes at `offset`, or `None` when they do not fit in
 /// the dump.
-fn salvage_read(file: &mut File, offset: u64, len: usize, file_len: u64) -> io::Result<Option<Vec<u8>>> {
+fn salvage_read(
+    file: &mut File,
+    offset: u64,
+    len: usize,
+    file_len: u64,
+) -> io::Result<Option<Vec<u8>>> {
     match offset.checked_add(len as u64) {
         Some(end) if end <= file_len => {}
         _ => return Ok(None),
@@ -2006,7 +2007,10 @@ fn text_token_len(bytes: &[u8], i: usize) -> usize {
     if !second.contains(&b1) {
         return 0;
     }
-    if !bytes[i + 2..i + len].iter().all(|b| (0x80..=0xbf).contains(b)) {
+    if !bytes[i + 2..i + len]
+        .iter()
+        .all(|b| (0x80..=0xbf).contains(b))
+    {
         return 0;
     }
     // C1 controls arrive as C2 80..C2 9F; U+FFFE/U+FFFF as EF BF BE/BF.
@@ -2619,8 +2623,12 @@ fn validate(kind: CarveKind, file: &mut File, offset: u64, end: u64) -> io::Resu
         CarveKind::Class => carve_class(&mut source)?,
         CarveKind::Rtf => carve_rtf(&mut source)?,
         CarveKind::Evtx => carve_evtx(&mut source)?,
-        CarveKind::Text => Verdict::Invalid("text has no header; it is found by the text pass".to_string()),
-        CarveKind::Bin => Verdict::Invalid("bin has no header; it is found by the bin pass".to_string()),
+        CarveKind::Text => {
+            Verdict::Invalid("text has no header; it is found by the text pass".to_string())
+        }
+        CarveKind::Bin => {
+            Verdict::Invalid("bin has no header; it is found by the bin pass".to_string())
+        }
     };
     Ok((verdict, source.produced()))
 }
@@ -3806,11 +3814,12 @@ fn crc32(state: u32, data: &[u8]) -> u32 {
 const MAX_GIF_BLOCKS: u64 = 1_000_000;
 const MAX_EBML_ELEMENTS: u64 = 4_000_000;
 
-
 /// Element ID reader for EBML: like [`ebml_vint`] but keeps the length bits
 /// as part of the value, as the EBML spec requires. IDs are at most 4 bytes.
 fn ebml_element_id(source: &mut Source<'_>) -> io::Result<Option<(u64, usize)>> {
-    let Some(first) = peek_u8(source)? else { return Ok(None) };
+    let Some(first) = peek_u8(source)? else {
+        return Ok(None);
+    };
     let mut length = 1usize;
     let mut mask = 0x80u8;
     while mask != 0 && first & mask == 0 {
@@ -3820,7 +3829,9 @@ fn ebml_element_id(source: &mut Source<'_>) -> io::Result<Option<(u64, usize)>> 
     if length > 4 {
         return Ok(None);
     }
-    let Some(bytes) = take_bytes(source, length)? else { return Ok(None) };
+    let Some(bytes) = take_bytes(source, length)? else {
+        return Ok(None);
+    };
     let mut value: u64 = 0;
     for &byte in &bytes {
         value = (value << 8) | u64::from(byte);
@@ -3840,10 +3851,14 @@ fn carve_ebml(source: &mut Source<'_>, expected_doctype: &[u8]) -> io::Result<Ve
             break;
         }
         let Some((id, _)) = ebml_element_id(source)? else {
-            return Ok(Verdict::Truncated("EBML element id desyncs from the stream".to_string()));
+            return Ok(Verdict::Truncated(
+                "EBML element id desyncs from the stream".to_string(),
+            ));
         };
         let Some((size, slen)) = ebml_vint(source)? else {
-            return Ok(Verdict::Truncated("EBML element size desyncs from the stream".to_string()));
+            return Ok(Verdict::Truncated(
+                "EBML element size desyncs from the stream".to_string(),
+            ));
         };
         let unknown_size = size == (1u64 << (7 * slen as u64)) - 1;
         let element_end = if unknown_size {
@@ -3851,7 +3866,11 @@ fn carve_ebml(source: &mut Source<'_>, expected_doctype: &[u8]) -> io::Result<Ve
         } else {
             match source.abs().checked_add(size) {
                 Some(end) if end <= source.end => end,
-                _ => return Ok(Verdict::Truncated("EBML element extends past the candidate".to_string())),
+                _ => {
+                    return Ok(Verdict::Truncated(
+                        "EBML element extends past the candidate".to_string(),
+                    ))
+                }
             }
         };
         if id == 0x42_82 {
@@ -3879,7 +3898,9 @@ fn carve_ebml(source: &mut Source<'_>, expected_doctype: &[u8]) -> io::Result<Ve
             "EBML DocType '{}' does not match this kind",
             String::from_utf8_lossy(&found)
         ))),
-        None => Ok(Verdict::Invalid("EBML DocType element not found".to_string())),
+        None => Ok(Verdict::Invalid(
+            "EBML DocType element not found".to_string(),
+        )),
     }
 }
 
@@ -3894,7 +3915,9 @@ fn carve_ogg(source: &mut Source<'_>, expect_opus: bool) -> io::Result<Verdict> 
     while source.abs() < source.end {
         pages += 1;
         if pages > MAX_OGG_PAGES {
-            return Ok(Verdict::Truncated("OGG page count exceeded the limit".to_string()));
+            return Ok(Verdict::Truncated(
+                "OGG page count exceeded the limit".to_string(),
+            ));
         }
         // Dump padding (all zero bytes) follows the last page; treat it as
         // the end of the stream.
@@ -3904,22 +3927,32 @@ fn carve_ogg(source: &mut Source<'_>, expect_opus: bool) -> io::Result<Verdict> 
             }
         }
         let Some(header) = peek_array::<27>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside an OGG page header".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside an OGG page header".to_string(),
+            ));
         };
         if &header[..4] != b"OggS" || header[4] != 0 {
-            return Ok(Verdict::Invalid("OGG page magic/version mismatch".to_string()));
+            return Ok(Verdict::Invalid(
+                "OGG page magic/version mismatch".to_string(),
+            ));
         }
         let flags = header[5];
         if flags & 0x80 != 0 {
-            return Ok(Verdict::Invalid("OGG continuation flag is not supported".to_string()));
+            return Ok(Verdict::Invalid(
+                "OGG continuation flag is not supported".to_string(),
+            ));
         }
         if first && flags & 0x02 == 0 {
-            return Ok(Verdict::Invalid("OGG stream does not start with a BOS page".to_string()));
+            return Ok(Verdict::Invalid(
+                "OGG stream does not start with a BOS page".to_string(),
+            ));
         }
         let serial = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
         if !serials.contains(&serial) {
             if serials.len() >= 64 {
-                return Ok(Verdict::Invalid("OGG serial count exceeded the limit".to_string()));
+                return Ok(Verdict::Invalid(
+                    "OGG serial count exceeded the limit".to_string(),
+                ));
             }
             serials.push(serial);
         }
@@ -3927,11 +3960,17 @@ fn carve_ogg(source: &mut Source<'_>, expect_opus: bool) -> io::Result<Verdict> 
         let segment_count = usize::from(header[26]);
         let table = match take_bytes(source, segment_count)? {
             Some(table) => table,
-            None => return Ok(Verdict::Truncated("dump ended inside an OGG segment table".to_string())),
+            None => {
+                return Ok(Verdict::Truncated(
+                    "dump ended inside an OGG segment table".to_string(),
+                ))
+            }
         };
         let payload: u64 = table.iter().map(|&size| u64::from(size)).sum();
         if !room_left(source, payload) {
-            return Ok(Verdict::Truncated("dump ended inside an OGG page payload".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside an OGG page payload".to_string(),
+            ));
         }
         let page = take_bytes(source, payload as usize)?.unwrap_or_default();
         if first && page.windows(8).any(|w| w == b"OpusHead") {
@@ -3940,7 +3979,9 @@ fn carve_ogg(source: &mut Source<'_>, expect_opus: bool) -> io::Result<Verdict> 
         first = false;
     }
     if expect_opus && !opus_head {
-        return Ok(Verdict::Invalid("OGG stream has no OpusHead packet on its first page".to_string()));
+        return Ok(Verdict::Invalid(
+            "OGG stream has no OpusHead packet on its first page".to_string(),
+        ));
     }
     Ok(Verdict::Valid)
 }
@@ -3951,13 +3992,17 @@ fn carve_flac(source: &mut Source<'_>) -> io::Result<Verdict> {
     }
     source.skip(4)?;
     let Some(streaminfo) = peek_array::<4>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside a FLAC STREAMINFO header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside a FLAC STREAMINFO header".to_string(),
+        ));
     };
     let streaminfo_type = streaminfo[0] & 0x7f;
     let streaminfo_last = streaminfo[0] & 0x80 != 0;
     let streaminfo_len = u32::from_be_bytes([0, streaminfo[1], streaminfo[2], streaminfo[3]]);
     if streaminfo_type != 0 || streaminfo_len != 34 {
-        return Ok(Verdict::Invalid("FLAC STREAMINFO block is missing or mis-sized".to_string()));
+        return Ok(Verdict::Invalid(
+            "FLAC STREAMINFO block is missing or mis-sized".to_string(),
+        ));
     }
     source.skip(4 + 34)?;
     if streaminfo_last {
@@ -3965,7 +4010,9 @@ fn carve_flac(source: &mut Source<'_>) -> io::Result<Verdict> {
     }
     for _ in 0..4096u64 {
         let Some(block) = peek_array::<4>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside a FLAC metadata block".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a FLAC metadata block".to_string(),
+            ));
         };
         let last = block[0] & 0x80 != 0;
         let block_len = u32::from_be_bytes([0, block[1], block[2], block[3]]);
@@ -3979,7 +4026,9 @@ fn carve_flac(source: &mut Source<'_>) -> io::Result<Verdict> {
             return Ok(Verdict::Valid);
         }
     }
-    Ok(Verdict::Truncated("FLAC metadata block count exceeded the limit".to_string()))
+    Ok(Verdict::Truncated(
+        "FLAC metadata block count exceeded the limit".to_string(),
+    ))
 }
 
 fn carve_riff(source: &mut Source<'_>, expected_form: &[u8; 4]) -> io::Result<Verdict> {
@@ -3987,11 +4036,15 @@ fn carve_riff(source: &mut Source<'_>, expected_form: &[u8; 4]) -> io::Result<Ve
         return Ok(Verdict::Invalid("missing RIFF signature".to_string()));
     }
     let Some(header) = peek_array::<12>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the RIFF header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the RIFF header".to_string(),
+        ));
     };
     let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     if &header[8..12] != expected_form {
-        return Ok(Verdict::Invalid("RIFF form type does not match this kind".to_string()));
+        return Ok(Verdict::Invalid(
+            "RIFF form type does not match this kind".to_string(),
+        ));
     }
     let riff_end = source.origin + 8 + u64::from(size);
     if riff_end > source.end {
@@ -4005,12 +4058,18 @@ fn carve_riff(source: &mut Source<'_>, expected_form: &[u8; 4]) -> io::Result<Ve
             break;
         }
         let Some(chunk) = peek_array::<8>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside a RIFF chunk header".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a RIFF chunk header".to_string(),
+            ));
         };
         let chunk_size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
         let padded = u64::from(chunk_size) + (u64::from(chunk_size) & 1);
         source.skip(8)?;
-        if source.abs().checked_add(padded).is_none_or(|end| end > riff_end) {
+        if source
+            .abs()
+            .checked_add(padded)
+            .map_or(true, |end| end > riff_end)
+        {
             return Ok(Verdict::Truncated(format!(
                 "dump ended inside a RIFF chunk of {chunk_size} bytes"
             )));
@@ -4107,25 +4166,34 @@ fn room_left(source: &Source<'_>, amount: u64) -> bool {
 }
 
 fn carve_gif(source: &mut Source<'_>) -> io::Result<Verdict> {
-    if peek_array::<6>(source)? != Some(*b"GIF87a") && peek_array::<6>(source)? != Some(*b"GIF89a") {
-        return Ok(Verdict::Invalid("missing GIF87a/GIF89a signature".to_string()));
+    if peek_array::<6>(source)? != Some(*b"GIF87a") && peek_array::<6>(source)? != Some(*b"GIF89a")
+    {
+        return Ok(Verdict::Invalid(
+            "missing GIF87a/GIF89a signature".to_string(),
+        ));
     }
     source.skip(6)?;
     let Some(lsd) = peek_array::<7>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the GIF logical screen descriptor".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the GIF logical screen descriptor".to_string(),
+        ));
     };
     let packed = lsd[4];
     source.skip(7)?;
     if packed & 0x80 != 0 {
         let gct = 3u64 << (u32::from(packed & 0x07));
         if !room_left(source, gct) {
-            return Ok(Verdict::Truncated("dump ended inside the GIF global color table".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside the GIF global color table".to_string(),
+            ));
         }
         source.skip(gct)?;
     }
     for _ in 0..MAX_GIF_BLOCKS {
         let Some(marker) = peek_u8(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside a GIF block".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a GIF block".to_string(),
+            ));
         };
         match marker {
             0x3b => {
@@ -4135,7 +4203,9 @@ fn carve_gif(source: &mut Source<'_>) -> io::Result<Verdict> {
             0x21 => {
                 source.skip(1)?;
                 let Some(_label) = peek_u8(source)? else {
-                    return Ok(Verdict::Truncated("dump ended inside a GIF extension block".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended inside a GIF extension block".to_string(),
+                    ));
                 };
                 source.skip(1)?;
                 if let Some(v) = gif_subblocks(source)? {
@@ -4145,43 +4215,59 @@ fn carve_gif(source: &mut Source<'_>) -> io::Result<Verdict> {
             0x2c => {
                 source.skip(1)?;
                 let Some(desc) = peek_array::<9>(source)? else {
-                    return Ok(Verdict::Truncated("dump ended inside a GIF image descriptor".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended inside a GIF image descriptor".to_string(),
+                    ));
                 };
                 let image_packed = desc[8];
                 source.skip(9)?;
                 if image_packed & 0x80 != 0 {
                     let lct = 3u64 << (u32::from(image_packed & 0x07));
                     if !room_left(source, lct) {
-                        return Ok(Verdict::Truncated("dump ended inside a GIF local color table".to_string()));
+                        return Ok(Verdict::Truncated(
+                            "dump ended inside a GIF local color table".to_string(),
+                        ));
                     }
                     source.skip(lct)?;
                 }
                 let Some(_) = peek_u8(source)? else {
-                    return Ok(Verdict::Truncated("dump ended at the GIF LZW minimum code size".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended at the GIF LZW minimum code size".to_string(),
+                    ));
                 };
                 source.skip(1)?;
                 if let Some(v) = gif_subblocks(source)? {
                     return Ok(v);
                 }
             }
-            _ => return Ok(Verdict::Invalid(format!("unexpected GIF block marker 0x{marker:02x}"))),
+            _ => {
+                return Ok(Verdict::Invalid(format!(
+                    "unexpected GIF block marker 0x{marker:02x}"
+                )))
+            }
         }
     }
-    Ok(Verdict::Truncated("GIF block count exceeded the limit".to_string()))
+    Ok(Verdict::Truncated(
+        "GIF block count exceeded the limit".to_string(),
+    ))
 }
 
 /// Walk GIF data sub-blocks up to the zero terminator.
 fn gif_subblocks(source: &mut Source<'_>) -> io::Result<Option<Verdict>> {
     loop {
         let Some(size) = peek_u8(source)? else {
-            return Ok(Some(Verdict::Truncated("dump ended inside a GIF data sub-block".to_string())));
+            return Ok(Some(Verdict::Truncated(
+                "dump ended inside a GIF data sub-block".to_string(),
+            )));
         };
         if size == 0 {
             source.skip(1)?;
             return Ok(None);
         }
         if !room_left(source, 1 + u64::from(size)) {
-            return Ok(Some(Verdict::Truncated("dump ended inside a GIF data sub-block".to_string())));
+            return Ok(Some(Verdict::Truncated(
+                "dump ended inside a GIF data sub-block".to_string(),
+            )));
         }
         source.skip(1 + u64::from(size))?;
     }
@@ -4190,19 +4276,25 @@ fn gif_subblocks(source: &mut Source<'_>) -> io::Result<Option<Verdict>> {
 fn carve_ico(source: &mut Source<'_>) -> io::Result<Verdict> {
     let window = window_len(source);
     let Some(header) = peek_array::<6>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the ICO header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the ICO header".to_string(),
+        ));
     };
     let reserved = u16::from_le_bytes([header[0], header[1]]);
     let kind = u16::from_le_bytes([header[2], header[3]]);
     let count = u16::from_le_bytes([header[4], header[5]]);
     if reserved != 0 || !matches!(kind, 1 | 2) || count == 0 || count > 256 {
-        return Ok(Verdict::Invalid("implausible ICO reserved/kind/count fields".to_string()));
+        return Ok(Verdict::Invalid(
+            "implausible ICO reserved/kind/count fields".to_string(),
+        ));
     }
     source.skip(6)?;
     let mut data_end: u64 = 6 + u64::from(count) * 16;
     for _ in 0..count {
         let Some(entry) = peek_array::<16>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside an ICO directory entry".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside an ICO directory entry".to_string(),
+            ));
         };
         source.skip(16)?;
         let size = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
@@ -4223,16 +4315,26 @@ fn carve_tar(source: &mut Source<'_>) -> io::Result<Verdict> {
     const BLOCK: usize = 512;
     let first = match peek_array::<BLOCK>(source)? {
         Some(header) => header,
-        None => return Ok(Verdict::Truncated("dump ended inside the TAR header block".to_string())),
+        None => {
+            return Ok(Verdict::Truncated(
+                "dump ended inside the TAR header block".to_string(),
+            ))
+        }
     };
     if &first[257..262] != b"ustar" {
-        return Ok(Verdict::Invalid("ustar marker is missing from the TAR header".to_string()));
+        return Ok(Verdict::Invalid(
+            "ustar marker is missing from the TAR header".to_string(),
+        ));
     }
     let stored = parse_octal(&first[148..156]);
     let computed = {
         let mut sum: u64 = 0;
         for (index, &byte) in first.iter().enumerate() {
-            let byte = if (148..156).contains(&index) { b' ' } else { byte };
+            let byte = if (148..156).contains(&index) {
+                b' '
+            } else {
+                byte
+            };
             sum += u64::from(byte);
         }
         sum
@@ -4248,7 +4350,9 @@ fn carve_tar(source: &mut Source<'_>) -> io::Result<Verdict> {
     source.skip(BLOCK as u64)?;
     for _ in 0..1_000_000u64 {
         let Some(header) = peek_array::<BLOCK>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside a TAR file".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a TAR file".to_string(),
+            ));
         };
         if header.iter().all(|&byte| byte == 0) {
             source.skip(BLOCK as u64)?;
@@ -4261,7 +4365,9 @@ fn carve_tar(source: &mut Source<'_>) -> io::Result<Verdict> {
             return Ok(Verdict::Valid);
         }
         if &header[257..262] != b"ustar" {
-            return Ok(Verdict::Invalid("TAR file boundary does not line up with a header block".to_string()));
+            return Ok(Verdict::Invalid(
+                "TAR file boundary does not line up with a header block".to_string(),
+            ));
         }
         let size_field = &header[124..136];
         let size: u64 = if size_field[0] & 0x80 != 0 {
@@ -4293,12 +4399,16 @@ fn carve_tar(source: &mut Source<'_>) -> io::Result<Verdict> {
             // next header is the real file entry; handled by this loop.
         }
     }
-    Ok(Verdict::Truncated("TAR entry count exceeded the limit".to_string()))
+    Ok(Verdict::Truncated(
+        "TAR entry count exceeded the limit".to_string(),
+    ))
 }
 
 fn carve_pcap(source: &mut Source<'_>) -> io::Result<Verdict> {
     if !room_left(source, 24) {
-        return Ok(Verdict::Truncated("dump ended inside the PCAP global header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the PCAP global header".to_string(),
+        ));
     }
     let magic = peek_array::<4>(source)?.unwrap();
     let little_endian = match &magic {
@@ -4330,7 +4440,9 @@ fn carve_pcap(source: &mut Source<'_>) -> io::Result<Verdict> {
     }
     let snaplen = read32(&header[16..20]);
     if !(64..=64 * 1024 * 1024).contains(&snaplen) {
-        return Ok(Verdict::Invalid(format!("implausible PCAP snaplen {snaplen}")));
+        return Ok(Verdict::Invalid(format!(
+            "implausible PCAP snaplen {snaplen}"
+        )));
     }
     source.skip(24)?;
     for _ in 0..1_000_000u64 {
@@ -4338,7 +4450,9 @@ fn carve_pcap(source: &mut Source<'_>) -> io::Result<Verdict> {
             break;
         }
         let Some(record) = peek_array::<16>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside a PCAP packet record".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a PCAP packet record".to_string(),
+            ));
         };
         let incl_len = read32(&record[8..12]);
         let orig_len = read32(&record[12..16]);
@@ -4348,7 +4462,9 @@ fn carve_pcap(source: &mut Source<'_>) -> io::Result<Verdict> {
             ));
         }
         if !room_left(source, 16 + u64::from(incl_len)) {
-            return Ok(Verdict::Truncated("dump ended inside a PCAP packet".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a PCAP packet".to_string(),
+            ));
         }
         source.skip(16 + u64::from(incl_len))?;
     }
@@ -4370,7 +4486,11 @@ fn carve_pcapng(source: &mut Source<'_>) -> io::Result<Verdict> {
     let little_endian = match &bom[8..12] {
         [0x4d, 0x3c, 0x2b, 0x1a] => true,
         [0x1a, 0x2b, 0x3c, 0x4d] => false,
-        _ => return Ok(Verdict::Invalid("PCAPNG byte-order magic is wrong".to_string())),
+        _ => {
+            return Ok(Verdict::Invalid(
+                "PCAPNG byte-order magic is wrong".to_string(),
+            ))
+        }
     };
     let read32 = |bytes: &[u8]| -> u32 {
         if little_endian {
@@ -4381,7 +4501,9 @@ fn carve_pcapng(source: &mut Source<'_>) -> io::Result<Verdict> {
     };
     let section_len = read32(&bom[4..8]);
     if section_len < 28 || u64::from(section_len) > window_len(source) {
-        return Ok(Verdict::Invalid("PCAPNG section length is implausible".to_string()));
+        return Ok(Verdict::Invalid(
+            "PCAPNG section length is implausible".to_string(),
+        ));
     }
     source.skip(u64::from(section_len))?;
     for _ in 0..1_000_000u64 {
@@ -4403,7 +4525,9 @@ fn carve_pcapng(source: &mut Source<'_>) -> io::Result<Verdict> {
         }
         let block_len = read32(&block[4..8]);
         if block_len < 12 || u64::from(block_len) > source.end - source.abs() {
-            return Ok(Verdict::Truncated("PCAPNG block length is implausible".to_string()));
+            return Ok(Verdict::Truncated(
+                "PCAPNG block length is implausible".to_string(),
+            ));
         }
         source.skip(u64::from(block_len) - 4)?;
         let trailing = match peek_array::<4>(source)? {
@@ -4435,7 +4559,9 @@ fn carve_wasm(source: &mut Source<'_>) -> io::Result<Verdict> {
         ));
     };
     if version != 1u32.to_le_bytes() && version != 2u32.to_le_bytes() {
-        return Ok(Verdict::Invalid("unsupported WebAssembly binary version".to_string()));
+        return Ok(Verdict::Invalid(
+            "unsupported WebAssembly binary version".to_string(),
+        ));
     }
     source.skip(4)?;
     for _ in 0..4096u64 {
@@ -4470,23 +4596,27 @@ fn carve_wasm(source: &mut Source<'_>) -> io::Result<Verdict> {
 
 fn carve_lnk(source: &mut Source<'_>) -> io::Result<Verdict> {
     let Some(header) = peek_array::<0x4c>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the LNK header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the LNK header".to_string(),
+        ));
     };
     let clsid = [
-        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x46,
+        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
     ];
-    if &header[..4] != b"L\0\0\0"
-        || header[4..20] != clsid
-    {
-        return Ok(Verdict::Invalid("implausible LNK header (magic/CLSID)".to_string()));
+    if &header[..4] != b"L\0\0\0" || header[4..20] != clsid {
+        return Ok(Verdict::Invalid(
+            "implausible LNK header (magic/CLSID)".to_string(),
+        ));
     }
     let flags = u32::from_le_bytes([header[0x14], header[0x15], header[0x16], header[0x17]]);
     let is_unicode = flags & 0x0000_0080 != 0;
     source.skip(0x4c)?;
     if flags & 0x0000_0001 != 0 {
         let Some(size) = peek_array::<2>(source)? else {
-            return Ok(Verdict::Truncated("LNK LinkTargetIDListSize is missing".to_string()));
+            return Ok(Verdict::Truncated(
+                "LNK LinkTargetIDListSize is missing".to_string(),
+            ));
         };
         let idlist = u16::from_le_bytes(size);
         source.skip(2)?;
@@ -4499,7 +4629,9 @@ fn carve_lnk(source: &mut Source<'_>) -> io::Result<Verdict> {
     }
     if flags & 0x0000_0002 != 0 {
         let Some(size) = peek_array::<4>(source)? else {
-            return Ok(Verdict::Truncated("LNK LinkInfoSize is missing".to_string()));
+            return Ok(Verdict::Truncated(
+                "LNK LinkInfoSize is missing".to_string(),
+            ));
         };
         let link_info = u32::from_le_bytes(size);
         if !room_left(source, u64::from(link_info)) {
@@ -4578,7 +4710,9 @@ fn carve_pem(source: &mut Source<'_>) -> io::Result<Verdict> {
     let mut label: Vec<u8> = Vec::new();
     loop {
         let Some(byte) = peek_u8(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside the PEM label".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside the PEM label".to_string(),
+            ));
         };
         if byte == b'-' {
             break;
@@ -4652,10 +4786,15 @@ fn carve_pem(source: &mut Source<'_>) -> io::Result<Verdict> {
 
 fn carve_kdbx(source: &mut Source<'_>) -> io::Result<Verdict> {
     let Some(magic) = peek_array::<12>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the KDBX signature".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the KDBX signature".to_string(),
+        ));
     };
     if magic[..4] != [0x03, 0xd9, 0xa2, 0x9a]
-        || !matches!(&magic[4..8], [0x67, 0xfb, 0x4b, 0xb5] | [0x66, 0xfb, 0x4b, 0xb5] | [0x65, 0xfb, 0x4b, 0xb5])
+        || !matches!(
+            &magic[4..8],
+            [0x67, 0xfb, 0x4b, 0xb5] | [0x66, 0xfb, 0x4b, 0xb5] | [0x65, 0xfb, 0x4b, 0xb5]
+        )
     {
         return Ok(Verdict::Invalid("implausible KDBX signature".to_string()));
     }
@@ -4669,7 +4808,9 @@ fn carve_kdbx(source: &mut Source<'_>) -> io::Result<Verdict> {
     source.skip(12)?;
     for _ in 0..512u64 {
         let Some(id) = peek_u8(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside a KDBX header field".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a KDBX header field".to_string(),
+            ));
         };
         source.skip(1)?;
         if id == 0 {
@@ -4696,7 +4837,9 @@ fn carve_kdbx(source: &mut Source<'_>) -> io::Result<Verdict> {
     source.skip(64)?;
     for _ in 0..1_000_000u64 {
         let Some(block) = peek_array::<12>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside a KDBX block header".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a KDBX block header".to_string(),
+            ));
         };
         let id = u64::from_le_bytes(block[..8].try_into().unwrap());
         let size = i32::from_le_bytes(block[8..12].try_into().unwrap());
@@ -4722,7 +4865,9 @@ fn carve_kdbx(source: &mut Source<'_>) -> io::Result<Verdict> {
 fn carve_dex(source: &mut Source<'_>) -> io::Result<Verdict> {
     let window = window_len(source);
     let Some(header) = peek_array::<0x70>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the DEX header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the DEX header".to_string(),
+        ));
     };
     if &header[..4] != b"dex\n"
         || !matches!(
@@ -4730,11 +4875,12 @@ fn carve_dex(source: &mut Source<'_>) -> io::Result<Verdict> {
             b"035\x00" | b"036\x00" | b"037\x00" | b"038\x00" | b"039\x00" | b"040\x00"
         )
     {
-        return Ok(Verdict::Invalid("implausible DEX magic/version".to_string()));
+        return Ok(Verdict::Invalid(
+            "implausible DEX magic/version".to_string(),
+        ));
     }
-    let read_u32 = |bytes: &[u8]| -> u32 {
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-    };
+    let read_u32 =
+        |bytes: &[u8]| -> u32 { u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) };
     let header_size = read_u32(&header[36..40]);
     let endian_tag = read_u32(&header[40..44]);
     let file_size = u64::from(read_u32(&header[32..36]));
@@ -4744,18 +4890,24 @@ fn carve_dex(source: &mut Source<'_>) -> io::Result<Verdict> {
     let type_ids_size = u64::from(read_u32(&header[64..68]));
     let type_ids_off = u64::from(read_u32(&header[68..72]));
     if header_size != 0x70 || endian_tag != 0x1234_5678 {
-        return Ok(Verdict::Invalid("DEX header size/endian tag mismatch".to_string()));
+        return Ok(Verdict::Invalid(
+            "DEX header size/endian tag mismatch".to_string(),
+        ));
     }
     if file_size < 0x70 || file_size > window {
         return Ok(Verdict::Truncated(format!(
             "DEX declares {file_size} bytes but the candidate window is smaller"
         )));
     }
-    if map_off >= file_size || string_ids_off >= file_size || type_ids_off >= file_size
+    if map_off >= file_size
+        || string_ids_off >= file_size
+        || type_ids_off >= file_size
         || string_ids_size * 4 > file_size
         || type_ids_size * 4 > file_size
     {
-        return Ok(Verdict::Invalid("DEX offsets point outside the file".to_string()));
+        return Ok(Verdict::Invalid(
+            "DEX offsets point outside the file".to_string(),
+        ));
     }
     // Verify integrity: Adler-32 of everything past the checksum field.
     let checksum = read_u32(&header[8..12]);
@@ -4763,7 +4915,9 @@ fn carve_dex(source: &mut Source<'_>) -> io::Result<Verdict> {
     let checksum_read = {
         let amount = (file_size - 12) as usize;
         let mut buffer = vec![0u8; amount];
-        source.file.seek(std::io::SeekFrom::Start(source.origin + 12))?;
+        source
+            .file
+            .seek(std::io::SeekFrom::Start(source.origin + 12))?;
         std::io::Read::read_exact(&mut source.file, &mut buffer)?;
         adler32(&buffer)
     };
@@ -4778,7 +4932,9 @@ fn carve_dex(source: &mut Source<'_>) -> io::Result<Verdict> {
 
 fn carve_tiff(source: &mut Source<'_>) -> io::Result<Verdict> {
     let Some(magic) = peek_array::<4>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the TIFF magic".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the TIFF magic".to_string(),
+        ));
     };
     let little_endian = match &magic {
         [b'I', b'I', 0x2a, 0x00] => true,
@@ -4802,11 +4958,17 @@ fn carve_tiff(source: &mut Source<'_>) -> io::Result<Verdict> {
     source.skip(4)?;
     let ifd0 = match peek_array::<4>(source)? {
         Some(offset) => read32(&offset) as u64,
-        None => return Ok(Verdict::Truncated("TIFF IFD0 offset is missing".to_string())),
+        None => {
+            return Ok(Verdict::Truncated(
+                "TIFF IFD0 offset is missing".to_string(),
+            ))
+        }
     };
     let window = window_len(source);
     if ifd0 >= window {
-        return Ok(Verdict::Invalid("TIFF IFD0 offset points outside the file".to_string()));
+        return Ok(Verdict::Invalid(
+            "TIFF IFD0 offset points outside the file".to_string(),
+        ));
     }
     source.skip(4)?;
     let type_size: u64 = 8; // upper bound used only for inline-value decisions
@@ -4814,20 +4976,28 @@ fn carve_tiff(source: &mut Source<'_>) -> io::Result<Verdict> {
     let mut ifd = ifd0;
     for _ in 0..MAX_TIFF_IFDS {
         if ifd >= window {
-            return Ok(Verdict::Invalid("TIFF IFD offset points outside the file".to_string()));
+            return Ok(Verdict::Invalid(
+                "TIFF IFD offset points outside the file".to_string(),
+            ));
         }
         source.skip(ifd - source.abs())?;
         let Some(count_bytes) = peek_array::<2>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside a TIFF IFD".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a TIFF IFD".to_string(),
+            ));
         };
         let count = read16(&count_bytes);
         if count == 0 || count > 4096 {
-            return Ok(Verdict::Invalid(format!("TIFF IFD entry count {count} is implausible")));
+            return Ok(Verdict::Invalid(format!(
+                "TIFF IFD entry count {count} is implausible"
+            )));
         }
         source.skip(2)?;
         for _ in 0..count {
             let Some(entry) = peek_array::<12>(source)? else {
-                return Ok(Verdict::Truncated("dump ended inside a TIFF IFD entry".to_string()));
+                return Ok(Verdict::Truncated(
+                    "dump ended inside a TIFF IFD entry".to_string(),
+                ));
             };
             let tag = read16(&entry[0..2]);
             let entry_type = read16(&entry[2..4]);
@@ -4837,7 +5007,7 @@ fn carve_tiff(source: &mut Source<'_>) -> io::Result<Verdict> {
                 3 | 8 => 2,
                 4 | 9 | 11 => 4,
                 5 | 10 | 12 => 8,
-                16 | 17 | 18 => 8,
+                16..=18 => 8,
                 _ => {
                     return Ok(Verdict::Invalid(format!(
                         "TIFF field type {entry_type} is not defined"
@@ -4846,12 +5016,14 @@ fn carve_tiff(source: &mut Source<'_>) -> io::Result<Verdict> {
             };
             let value_count = read32(&entry[4..8]) as u64;
             if value_count > 1_000_000_000 {
-                return Ok(Verdict::Invalid("TIFF field count is implausible".to_string()));
+                return Ok(Verdict::Invalid(
+                    "TIFF field count is implausible".to_string(),
+                ));
             }
             let total = type_len * value_count;
             if total > 4 {
                 let offset = read32(&entry[8..12]) as u64;
-                if offset.checked_add(total).is_none_or(|end| end > window) {
+                if offset.checked_add(total).map_or(true, |end| end > window) {
                     return Ok(Verdict::Truncated(
                         "TIFF field data extends past the candidate".to_string(),
                     ));
@@ -4860,7 +5032,9 @@ fn carve_tiff(source: &mut Source<'_>) -> io::Result<Verdict> {
             source.skip(12)?;
         }
         let Some(next) = peek_array::<4>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside a TIFF IFD trailer".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a TIFF IFD trailer".to_string(),
+            ));
         };
         let next_ifd = read32(&next) as u64;
         source.skip(4)?;
@@ -4869,7 +5043,9 @@ fn carve_tiff(source: &mut Source<'_>) -> io::Result<Verdict> {
         }
         ifd = next_ifd;
     }
-    Ok(Verdict::Truncated("TIFF IFD count exceeded the limit".to_string()))
+    Ok(Verdict::Truncated(
+        "TIFF IFD count exceeded the limit".to_string(),
+    ))
 }
 
 fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
@@ -4878,7 +5054,9 @@ fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
     if peek_array::<3>(source)? == Some(*b"ID3") {
         // ID3v2 header: "ID3", ver(2), flags(1), syncsafe size(4).
         let Some(header) = peek_array::<10>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside the ID3v2 header".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside the ID3v2 header".to_string(),
+            ));
         };
         let id3_len = ((u32::from(header[6]) & 0x7f) << 21)
             | ((u32::from(header[7]) & 0x7f) << 14)
@@ -4894,8 +5072,12 @@ fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
     }
     let mpeg_bitrate = |version: u8, index: usize| -> Option<u32> {
         // Layer III tables, kbps.
-        const MPEG1: [u32; 16] = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
-        const MPEG2: [u32; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
+        const MPEG1: [u32; 16] = [
+            0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+        ];
+        const MPEG2: [u32; 16] = [
+            0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+        ];
         if index >= 16 {
             return None;
         }
@@ -4925,7 +5107,9 @@ fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
             break;
         }
         let Some(header) = peek_array::<4>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside an MP3 frame header".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside an MP3 frame header".to_string(),
+            ));
         };
         if header[0] != 0xff || header[1] & 0xe0 != 0xe0 {
             if frames == 0 {
@@ -4952,7 +5136,9 @@ fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
             Some(value) if value > 0 => value,
             _ => {
                 if frames == 0 {
-                    return Ok(Verdict::Invalid("MP3 frame has an invalid bitrate index".to_string()));
+                    return Ok(Verdict::Invalid(
+                        "MP3 frame has an invalid bitrate index".to_string(),
+                    ));
                 }
                 break;
             }
@@ -4961,14 +5147,16 @@ fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
             Some(value) if value > 0 => value,
             _ => {
                 if frames == 0 {
-                    return Ok(Verdict::Invalid("MP3 frame has an invalid sample rate index".to_string()));
+                    return Ok(Verdict::Invalid(
+                        "MP3 frame has an invalid sample rate index".to_string(),
+                    ));
                 }
                 break;
             }
         };
         let coefficient: u64 = if version == 3 { 144 } else { 72 };
-        let frame_len = coefficient * u64::from(bitrate) * 1000 / u64::from(samplerate)
-            + u64::from(padding);
+        let frame_len =
+            coefficient * u64::from(bitrate) * 1000 / u64::from(samplerate) + u64::from(padding);
         if frame_len < 4 || !room_left(source, frame_len) {
             return Ok(Verdict::Truncated(
                 "dump ended inside an MP3 frame".to_string(),
@@ -4977,7 +5165,9 @@ fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
         source.skip(frame_len)?;
         frames += 1;
         if frames > 10_000_000 {
-            return Ok(Verdict::Truncated("MP3 frame count exceeded the limit".to_string()));
+            return Ok(Verdict::Truncated(
+                "MP3 frame count exceeded the limit".to_string(),
+            ));
         }
     }
     let _ = frames_start;
@@ -4989,10 +5179,14 @@ fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
 
 fn carve_bz2(source: &mut Source<'_>) -> io::Result<Verdict> {
     let Some(header) = peek_array::<10>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the BZIP2 header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the BZIP2 header".to_string(),
+        ));
     };
     if &header[..3] != b"BZh" || !(b'1'..=b'9').contains(&header[3]) {
-        return Ok(Verdict::Invalid("implausible BZIP2 magic/level".to_string()));
+        return Ok(Verdict::Invalid(
+            "implausible BZIP2 magic/level".to_string(),
+        ));
     }
     if &header[4..10] != b"1AY&SY" {
         return Ok(Verdict::Invalid(
@@ -5010,7 +5204,9 @@ fn carve_bz2(source: &mut Source<'_>) -> io::Result<Verdict> {
 
 fn carve_xz(source: &mut Source<'_>) -> io::Result<Verdict> {
     let Some(header) = peek_array::<12>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the XZ header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the XZ header".to_string(),
+        ));
     };
     if &header[..6] != b"\xfd7zXZ\x00" {
         return Ok(Verdict::Invalid("missing XZ magic".to_string()));
@@ -5022,7 +5218,9 @@ fn carve_xz(source: &mut Source<'_>) -> io::Result<Verdict> {
     }
     let expected_crc = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
     if crc32(0, &header[..8]) != expected_crc {
-        return Ok(Verdict::Invalid("XZ header CRC-32 does not match".to_string()));
+        return Ok(Verdict::Invalid(
+            "XZ header CRC-32 does not match".to_string(),
+        ));
     }
     source.skip(window_len(source))?;
     Ok(Verdict::Truncated(
@@ -5032,7 +5230,9 @@ fn carve_xz(source: &mut Source<'_>) -> io::Result<Verdict> {
 
 fn carve_class(source: &mut Source<'_>) -> io::Result<Verdict> {
     let Some(magic) = peek_array::<8>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the CLASS magic".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the CLASS magic".to_string(),
+        ));
     };
     if &magic[..4] != b"\xca\xfe\xba\xbe" {
         return Ok(Verdict::Invalid("missing CLASS magic".to_string()));
@@ -5041,21 +5241,29 @@ fn carve_class(source: &mut Source<'_>) -> io::Result<Verdict> {
     let major = u16::from_be_bytes([magic[6], magic[7]]);
     let _ = minor;
     if !(45..=70).contains(&major) {
-        return Ok(Verdict::Invalid(format!("implausible CLASS major version {major}")));
+        return Ok(Verdict::Invalid(format!(
+            "implausible CLASS major version {major}"
+        )));
     }
     source.skip(8)?;
     let Some(cp_count_bytes) = peek_array::<2>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the CLASS constant pool".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the CLASS constant pool".to_string(),
+        ));
     };
     let cp_count = u64::from(u16::from_be_bytes(cp_count_bytes));
     if cp_count == 0 || cp_count > MAX_CLASS_POOL {
-        return Ok(Verdict::Invalid(format!("CLASS constant pool count {cp_count} is implausible")));
+        return Ok(Verdict::Invalid(format!(
+            "CLASS constant pool count {cp_count} is implausible"
+        )));
     }
     source.skip(2)?;
     let mut index = 1u64;
     while index < cp_count {
         let Some(tag) = peek_u8(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside the CLASS constant pool".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside the CLASS constant pool".to_string(),
+            ));
         };
         source.skip(1)?;
         let read_cp_value = |source: &mut Source<'_>, amount: u64| -> io::Result<Option<()>> {
@@ -5068,38 +5276,52 @@ fn carve_class(source: &mut Source<'_>) -> io::Result<Verdict> {
         match tag {
             1 => {
                 let Some(len_bytes) = peek_array::<2>(source)? else {
-                    return Ok(Verdict::Truncated("dump ended inside a CLASS UTF-8 entry".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended inside a CLASS UTF-8 entry".to_string(),
+                    ));
                 };
                 let len = u64::from(u16::from_be_bytes(len_bytes));
                 source.skip(2)?;
                 if read_cp_value(source, len)?.is_none() {
-                    return Ok(Verdict::Truncated("dump ended inside a CLASS UTF-8 entry".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended inside a CLASS UTF-8 entry".to_string(),
+                    ));
                 }
             }
             3 | 4 => {
                 if read_cp_value(source, 4)?.is_none() {
-                    return Ok(Verdict::Truncated("dump ended inside a CLASS integer entry".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended inside a CLASS integer entry".to_string(),
+                    ));
                 }
             }
             5 | 6 => {
                 if read_cp_value(source, 8)?.is_none() {
-                    return Ok(Verdict::Truncated("dump ended inside a CLASS long entry".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended inside a CLASS long entry".to_string(),
+                    ));
                 }
                 index += 1;
             }
             7 | 8 | 16 | 19 | 20 => {
                 if read_cp_value(source, 2)?.is_none() {
-                    return Ok(Verdict::Truncated("dump ended inside a CLASS reference entry".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended inside a CLASS reference entry".to_string(),
+                    ));
                 }
             }
             9 | 10 | 11 | 12 | 17 | 18 => {
                 if read_cp_value(source, 4)?.is_none() {
-                    return Ok(Verdict::Truncated("dump ended inside a CLASS reference entry".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended inside a CLASS reference entry".to_string(),
+                    ));
                 }
             }
             15 => {
                 if read_cp_value(source, 3)?.is_none() {
-                    return Ok(Verdict::Truncated("dump ended inside a CLASS method-handle entry".to_string()));
+                    return Ok(Verdict::Truncated(
+                        "dump ended inside a CLASS method-handle entry".to_string(),
+                    ));
                 }
             }
             _ => {
@@ -5119,42 +5341,59 @@ fn carve_class(source: &mut Source<'_>) -> io::Result<Verdict> {
         source.skip(2)?;
     }
     let Some(interface_count) = peek_array::<2>(source)? else {
-        return Ok(Verdict::Truncated("CLASS interface count is missing".to_string()));
+        return Ok(Verdict::Truncated(
+            "CLASS interface count is missing".to_string(),
+        ));
     };
     let interfaces = u64::from(u16::from_be_bytes(interface_count));
     source.skip(2)?;
     if !room_left(source, interfaces * 2) {
-        return Ok(Verdict::Truncated("dump ended inside the CLASS interface list".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the CLASS interface list".to_string(),
+        ));
     }
     source.skip(interfaces * 2)?;
     // Fields then methods, each { access_flags(2), name(2), descriptor(2),
     // attributes_count(2), attributes[{ name_index(2), length(4), bytes }] }.
     for section in ["field", "method"] {
         let Some(count_bytes) = peek_array::<2>(source)? else {
-            return Ok(Verdict::Truncated(format!("CLASS {section} count is missing")));
+            return Ok(Verdict::Truncated(format!(
+                "CLASS {section} count is missing"
+            )));
         };
         let count = u64::from(u16::from_be_bytes(count_bytes));
         source.skip(2)?;
         for _ in 0..count {
             if !room_left(source, 8) {
-                return Ok(Verdict::Truncated(format!("dump ended inside a CLASS {section} entry")));
+                return Ok(Verdict::Truncated(format!(
+                    "dump ended inside a CLASS {section} entry"
+                )));
             }
             source.skip(6)?;
             let Some(attr_count_bytes) = peek_array::<2>(source)? else {
-                return Ok(Verdict::Truncated(format!("CLASS {section} attribute count is missing")));
+                return Ok(Verdict::Truncated(format!(
+                    "CLASS {section} attribute count is missing"
+                )));
             };
             let attr_count = u64::from(u16::from_be_bytes(attr_count_bytes));
             source.skip(2)?;
             for _ in 0..attr_count {
                 let Some(attr_len_bytes) = peek_array::<6>(source)? else {
-                    return Ok(Verdict::Truncated(format!("CLASS {section} attribute header is missing")));
+                    return Ok(Verdict::Truncated(format!(
+                        "CLASS {section} attribute header is missing"
+                    )));
                 };
                 let attr_len = u32::from_be_bytes([
-                    attr_len_bytes[2], attr_len_bytes[3], attr_len_bytes[4], attr_len_bytes[5],
+                    attr_len_bytes[2],
+                    attr_len_bytes[3],
+                    attr_len_bytes[4],
+                    attr_len_bytes[5],
                 ]) as u64;
                 source.skip(6)?;
                 if !room_left(source, attr_len) {
-                    return Ok(Verdict::Truncated(format!("dump ended inside a CLASS {section} attribute")));
+                    return Ok(Verdict::Truncated(format!(
+                        "dump ended inside a CLASS {section} attribute"
+                    )));
                 }
                 source.skip(attr_len)?;
             }
@@ -5162,20 +5401,29 @@ fn carve_class(source: &mut Source<'_>) -> io::Result<Verdict> {
     }
     // Class-level attributes.
     let Some(attr_count_bytes) = peek_array::<2>(source)? else {
-        return Ok(Verdict::Truncated("CLASS attribute count is missing".to_string()));
+        return Ok(Verdict::Truncated(
+            "CLASS attribute count is missing".to_string(),
+        ));
     };
     let attr_count = u64::from(u16::from_be_bytes(attr_count_bytes));
     source.skip(2)?;
     for _ in 0..attr_count {
         let Some(attr_len_bytes) = peek_array::<6>(source)? else {
-            return Ok(Verdict::Truncated("CLASS attribute header is missing".to_string()));
+            return Ok(Verdict::Truncated(
+                "CLASS attribute header is missing".to_string(),
+            ));
         };
         let attr_len = u32::from_be_bytes([
-            attr_len_bytes[2], attr_len_bytes[3], attr_len_bytes[4], attr_len_bytes[5],
+            attr_len_bytes[2],
+            attr_len_bytes[3],
+            attr_len_bytes[4],
+            attr_len_bytes[5],
         ]) as u64;
         source.skip(6)?;
         if !room_left(source, attr_len) {
-            return Ok(Verdict::Truncated("dump ended inside a CLASS attribute".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside a CLASS attribute".to_string(),
+            ));
         }
         source.skip(attr_len)?;
     }
@@ -5190,11 +5438,15 @@ fn carve_rtf(source: &mut Source<'_>) -> io::Result<Verdict> {
     let mut offset = 0u64;
     while source.abs() < source.end && offset < MAX_RTF_BYTES {
         let Some(byte) = peek_u8(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside the RTF document".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside the RTF document".to_string(),
+            ));
         };
         match byte {
             0x00 => {
-                return Ok(Verdict::Invalid("NUL byte inside the RTF document".to_string()))
+                return Ok(Verdict::Invalid(
+                    "NUL byte inside the RTF document".to_string(),
+                ))
             }
             b'{' => depth += 1,
             b'}' => {
@@ -5222,7 +5474,9 @@ fn carve_rtf(source: &mut Source<'_>) -> io::Result<Verdict> {
 fn carve_evtx(source: &mut Source<'_>) -> io::Result<Verdict> {
     const CHUNK_SIZE: u64 = 65536;
     let Some(header) = peek_array::<128>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the EVTX file header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the EVTX file header".to_string(),
+        ));
     };
     if &header[..8] != b"ElfFile\x00" {
         return Ok(Verdict::Invalid("missing EVTX magic".to_string()));
@@ -5238,9 +5492,7 @@ fn carve_evtx(source: &mut Source<'_>) -> io::Result<Verdict> {
         ));
     }
     if last_chunk < first_chunk {
-        return Ok(Verdict::Invalid(
-            "EVTX chunk range is reversed".to_string(),
-        ));
+        return Ok(Verdict::Invalid("EVTX chunk range is reversed".to_string()));
     }
     source.skip(u64::from(header_size))?;
     let mut chunks: u64 = 0;
@@ -5249,7 +5501,9 @@ fn carve_evtx(source: &mut Source<'_>) -> io::Result<Verdict> {
             break;
         }
         let Some(chunk) = peek_array::<8>(source)? else {
-            return Ok(Verdict::Truncated("dump ended inside an EVTX chunk header".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside an EVTX chunk header".to_string(),
+            ));
         };
         if &chunk != b"ElfChnk\x00" {
             if chunks == 0 {
@@ -5261,7 +5515,9 @@ fn carve_evtx(source: &mut Source<'_>) -> io::Result<Verdict> {
         }
         chunks += 1;
         if !room_left(source, CHUNK_SIZE) {
-            return Ok(Verdict::Truncated("dump ended inside an EVTX chunk".to_string()));
+            return Ok(Verdict::Truncated(
+                "dump ended inside an EVTX chunk".to_string(),
+            ));
         }
         source.skip(CHUNK_SIZE)?;
         if source.abs() - source.origin >= window_len(source) {
@@ -5279,13 +5535,17 @@ fn carve_vdi(source: &mut Source<'_>) -> io::Result<Verdict> {
         return Ok(Verdict::Invalid("missing VDI magic".to_string()));
     }
     let Some(rest) = peek_array::<58>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the VDI header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the VDI header".to_string(),
+        ));
     };
     if !rest[..58]
         .iter()
         .all(|&byte| byte == 0x00 || (0x20..=0x7e).contains(&byte))
     {
-        return Ok(Verdict::Invalid("VDI creator string is not printable".to_string()));
+        return Ok(Verdict::Invalid(
+            "VDI creator string is not printable".to_string(),
+        ));
     }
     let carved = window_len(source).min(4096);
     source.skip(carved)?;
@@ -5296,7 +5556,9 @@ fn carve_vdi(source: &mut Source<'_>) -> io::Result<Verdict> {
 
 fn carve_vmdk(source: &mut Source<'_>) -> io::Result<Verdict> {
     let Some(header) = peek_array::<512>(source)? else {
-        return Ok(Verdict::Truncated("dump ended inside the VMDK sparse header".to_string()));
+        return Ok(Verdict::Truncated(
+            "dump ended inside the VMDK sparse header".to_string(),
+        ));
     };
     if &header[..4] != b"KDMV" {
         return Ok(Verdict::Invalid("missing VMDK sparse magic".to_string()));
@@ -5308,7 +5570,9 @@ fn carve_vmdk(source: &mut Source<'_>) -> io::Result<Verdict> {
     ]);
     let grain_size = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
     if !(1..=3).contains(&version) || capacity == 0 || capacity > 1u64 << 40 || grain_size == 0 {
-        return Ok(Verdict::Invalid("implausible VMDK sparse header fields".to_string()));
+        return Ok(Verdict::Invalid(
+            "implausible VMDK sparse header fields".to_string(),
+        ));
     }
     let carved = window_len(source).min(65536);
     source.skip(carved)?;
@@ -5668,7 +5932,10 @@ mod tests {
         assert_eq!(report.files.len(), 2, "{report:?}");
         let complete = report.files.iter().find(|file| file.complete).unwrap();
         let partial = report.files.iter().find(|file| !file.complete).unwrap();
-        assert_eq!(complete.path.as_ref().unwrap().parent(), Some(out.as_path()));
+        assert_eq!(
+            complete.path.as_ref().unwrap().parent(),
+            Some(out.as_path())
+        );
         assert_eq!(
             partial.path.as_ref().unwrap().parent(),
             Some(out.join("partial").as_path())
@@ -5892,7 +6159,13 @@ mod tests {
             (odt_file.ext.as_str(), odt_file.ext_source.as_str()),
             ("odt", "sniff:zip/odf-text")
         );
-        let name = odt_file.path.as_ref().unwrap().file_name().unwrap().to_string_lossy();
+        let name = odt_file
+            .path
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
         assert!(name.ends_with(".odt.carved"), "{name}");
         // The bytes are untouched: only the name changed.
         assert_eq!(std::fs::read(odt_file.path.as_ref().unwrap()).unwrap(), odt);
@@ -5902,7 +6175,13 @@ mod tests {
             (pe_file.ext.as_str(), pe_file.ext_source.as_str()),
             ("dll", "sniff:pe/dll")
         );
-        let name = pe_file.path.as_ref().unwrap().file_name().unwrap().to_string_lossy();
+        let name = pe_file
+            .path
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
         assert!(name.ends_with(".dll.carved"), "{name}");
         // The PE validator reads past the headers (size is not exact), so the
         // file may carry trailing padding: it must still start with the PE.
@@ -5923,20 +6202,30 @@ mod tests {
         // Kinds the list does not restrict are untouched.
         assert!(filter.allows(CarveKind::Pdf, "pdf"));
 
-        for list in ["zip", "docx,zip", "all,docx", "jpg,pdf,exe,office", "text,bin"] {
+        for list in [
+            "zip",
+            "docx,zip",
+            "all,docx",
+            "jpg,pdf,exe,office",
+            "text,bin",
+        ] {
             assert!(ExtFilter::from_list(list).unwrap().is_empty(), "{list}");
         }
         // `exe` stays a whole-format alias (every PE), as before 8.10.6.
-        assert!(ExtFilter::from_list("exe").unwrap().allows(CarveKind::Pe, "dll"));
-        assert!(!ExtFilter::from_list("dll").unwrap().allows(CarveKind::Pe, "exe"));
+        assert!(ExtFilter::from_list("exe")
+            .unwrap()
+            .allows(CarveKind::Pe, "dll"));
+        assert!(!ExtFilter::from_list("dll")
+            .unwrap()
+            .allows(CarveKind::Pe, "exe"));
         assert!(ExtFilter::from_list("nope").is_err());
     }
 
     #[test]
     fn every_specific_extension_alias_names_its_container_kind() {
         for name in [
-            "docx", "xlsx", "pptx", "odt", "ods", "odp", "jar", "apk", "doc", "xls", "ppt",
-            "msi", "msg", "dll", "sys", "mov", "m4a", "so",
+            "docx", "xlsx", "pptx", "odt", "ods", "odp", "jar", "apk", "doc", "xls", "ppt", "msi",
+            "msg", "dll", "sys", "mov", "m4a", "so",
         ] {
             let (kind, ext) = ExtFilter::specific(name).expect(name);
             assert_eq!(ext, name);
@@ -5988,7 +6277,9 @@ mod tests {
         let report = run("docx,dll");
         assert_eq!(exts(&report), ["dll"], "{report:?}");
         assert_eq!(report.filtered, 1);
-        assert!(report.summary_line().contains("1 file(s) filtered by extension"));
+        assert!(report
+            .summary_line()
+            .contains("1 file(s) filtered by extension"));
 
         // sys does not match a dll; the whole-format zip keeps the odt.
         let report = run("zip,sys");
@@ -6561,8 +6852,12 @@ mod tests {
             CarveKind::from_list("all").unwrap(),
             CarveKind::ALL.to_vec()
         );
-        assert!(CarveKind::from_list("bin").unwrap().contains(&CarveKind::Bin));
-        assert!(CarveKind::from_list("all,bin").unwrap().contains(&CarveKind::Bin));
+        assert!(CarveKind::from_list("bin")
+            .unwrap()
+            .contains(&CarveKind::Bin));
+        assert!(CarveKind::from_list("all,bin")
+            .unwrap()
+            .contains(&CarveKind::Bin));
         assert_eq!(CarveKind::Bin.default_ext(), "bin");
 
         let dump = pseudo_random(0x20000, 0x5eed_0000_0000_0004);
@@ -6585,7 +6880,10 @@ mod tests {
     /// Block-aligned deterministic text fixture: `blocks` blocks of 64-byte
     /// lines, ending on a newline. The first line is exactly 64 bytes.
     fn md_text(blocks: usize) -> Vec<u8> {
-        let line = format!("{:<63}\n", "Lorem ipsum dolor sit amet, consectetur adipiscing elit");
+        let line = format!(
+            "{:<63}\n",
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit"
+        );
         assert_eq!(line.len(), 64, "fixture lines must be exactly 64 bytes");
         let mut out = Vec::with_capacity(blocks * TEXT_BLOCK);
         for _ in 0..blocks * (TEXT_BLOCK / 64) {
@@ -6626,7 +6924,7 @@ mod tests {
         // 0x3F ('?') is printable, so a run of it scores 100% "text" by any
         // printable-ratio rule; it is junk, not evidence, and must not be
         // carved.
-        let mut dump = pseudo_random(0x10000, 0x0ca11_ab1e_0000_0001);
+        let mut dump = pseudo_random(0x10000, 0x0000_ca11_ab1e_0000_0001);
         dump.extend_from_slice(&vec![b'?'; 0x4000]);
         dump.extend_from_slice(&pseudo_random(0x4000, 0xfeed_face_1111_2222));
 
@@ -6692,9 +6990,15 @@ mod tests {
             CarveKind::from_list("all").unwrap(),
             CarveKind::ALL.to_vec()
         );
-        assert!(CarveKind::from_list("text").unwrap().contains(&CarveKind::Text));
-        assert!(CarveKind::from_list("txt").unwrap().contains(&CarveKind::Text));
-        assert!(CarveKind::from_list("all,text").unwrap().contains(&CarveKind::Text));
+        assert!(CarveKind::from_list("text")
+            .unwrap()
+            .contains(&CarveKind::Text));
+        assert!(CarveKind::from_list("txt")
+            .unwrap()
+            .contains(&CarveKind::Text));
+        assert!(CarveKind::from_list("all,text")
+            .unwrap()
+            .contains(&CarveKind::Text));
 
         let text = md_text(2);
         let mut dump = pseudo_random(0x10000, 0xabcd_ef01_2345_6789);
@@ -6743,7 +7047,9 @@ mod tests {
             .find(|file| file.kind == CarveKind::Text)
             .unwrap_or_else(|| panic!("text region must be recovered: {report:?}"));
         assert!(
-            text_file.offset >= zip_end && text_file.offset + text_file.size <= zip_at + zip.len() as u64 + text.len() as u64 + 1,
+            text_file.offset >= zip_end
+                && text_file.offset + text_file.size
+                    <= zip_at + zip.len() as u64 + text.len() as u64 + 1,
             "text region must not enter the carved zip: {text_file:?}"
         );
     }
@@ -7187,8 +7493,19 @@ mod naming_tests {
     #[test]
     fn hostile_or_malformed_ext_falls_back_to_the_kind_default() {
         for ext in [
-            "", "../x", "..", "DOCX", "docx.exe", "123456789", "a b", "é", "doc\0", "a/b", "a\\b",
-            "c:", " ",
+            "",
+            "../x",
+            "..",
+            "DOCX",
+            "docx.exe",
+            "123456789",
+            "a b",
+            "é",
+            "doc\0",
+            "a/b",
+            "a\\b",
+            "c:",
+            " ",
         ] {
             let name = carved_file_name_with_ext(1, CarveKind::Zip, ext, CarveRole::Whole, SHA);
             assert_eq!(name, "00000001-zip-9f3c1e2a.zip.carved", "{ext:?}");
@@ -7205,7 +7522,9 @@ mod naming_tests {
     /// largest offset.
     #[test]
     fn names_are_never_reserved_windows_names_or_too_long() {
-        const RESERVED: [&str; 8] = ["con", "prn", "aux", "nul", "clock$", "conin$", "conout$", "com1"];
+        const RESERVED: [&str; 8] = [
+            "con", "prn", "aux", "nul", "clock$", "conin$", "conout$", "com1",
+        ];
         let mut kinds: Vec<CarveKind> = CarveKind::ALL.to_vec();
         kinds.push(CarveKind::Text);
         kinds.push(CarveKind::Bin);
@@ -7252,7 +7571,9 @@ mod naming_tests {
             let ext = kind.default_ext();
             assert!(
                 (1..=8).contains(&ext.len())
-                    && ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+                    && ext
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
                 "{kind:?}: bad extension {ext:?}"
             );
             for role in [CarveRole::Whole, CarveRole::Tail, CarveRole::Reassembled] {
@@ -7301,7 +7622,8 @@ mod evidence_tests {
         assert_eq!(confidence, CarveConfidence::High);
 
         // A sniff rule that refined the extension is part of the evidence.
-        let (_, evidence, _) = evidence_for(CarveRole::Whole, CarveKind::Zip, true, "sniff:zip/word");
+        let (_, evidence, _) =
+            evidence_for(CarveRole::Whole, CarveKind::Zip, true, "sniff:zip/word");
         assert_eq!(evidence.last().copied(), Some("sniff:zip/word"));
 
         let (tier, evidence, confidence) =
@@ -7341,7 +7663,10 @@ mod evidence_tests {
         report.files.push(file(2, "png", CarveRole::Tail));
         report.files.push(file(3, "txt", CarveRole::Whole));
         let line = report.summary_line();
-        assert!(line.contains("(tier T1=2 T2=1 T3=1; ext docx=2 png=1 txt=1)"), "{line}");
+        assert!(
+            line.contains("(tier T1=2 T2=1 T3=1; ext docx=2 png=1 txt=1)"),
+            "{line}"
+        );
 
         // No files, no tier/ext clutter.
         assert!(!CarveReport::default().summary_line().contains("tier"));

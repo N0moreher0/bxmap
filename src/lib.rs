@@ -1910,7 +1910,10 @@ fn has_readable_multibyte_utf8_interpretation(buf: &[u8], cfg: &NoiseConfig) -> 
 /// candidate against the whole ready slice, which was O(n^2) per batch and
 /// dominated the runtime on files emitting hundreds of thousands of strings
 /// (real-world BIOS/ACPI regions, ~100k records per 16 MiB).
-fn emit_offset_sorted_batch(on_found: &mut dyn FnMut(ExtractedString), mut batch: Vec<ExtractedString>) {
+fn emit_offset_sorted_batch(
+    on_found: &mut dyn FnMut(ExtractedString),
+    mut batch: Vec<ExtractedString>,
+) {
     // A full (offset, encoding, text) sort: emission order at ties is then
     // identical to a stable sort of the batch, so streaming consumers and the
     // max-strings cut see a deterministic prefix (this is what the parity
@@ -1929,9 +1932,9 @@ fn emit_offset_sorted_batch(on_found: &mut dyn FnMut(ExtractedString), mut batch
         }
         for idx in i..j {
             let suppress = batch[idx].encoding == "latin1"
-                && batch[i..j].iter().any(|peer| {
-                    peer.encoding == "cp1252" && peer.text == batch[idx].text
-                });
+                && batch[i..j]
+                    .iter()
+                    .any(|peer| peer.encoding == "cp1252" && peer.text == batch[idx].text);
             if !suppress {
                 (on_found)(batch[idx].clone());
             }
@@ -2028,10 +2031,7 @@ fn single_byte_high_entropy_noise(buf: &[u8], cfg: &NoiseConfig) -> bool {
             distinct += 1;
         }
     }
-    if distinct > 30 && (distinct as f64 / n as f64) > 0.20 {
-        return true;
-    }
-    false
+    distinct > 30 && (distinct as f64 / n as f64) > 0.20
 }
 
 /// Strings shorter than this (in decoded chars) are judged only on hard

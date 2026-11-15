@@ -279,7 +279,7 @@ fn zip_cd_names(cd: &[u8]) -> Vec<&[u8]> {
 }
 
 fn has_name(names: &[&[u8]], wanted: &[u8]) -> bool {
-    names.iter().any(|n| *n == wanted)
+    names.contains(&wanted)
 }
 
 fn has_prefix(names: &[&[u8]], prefix: &[u8]) -> bool {
@@ -503,7 +503,10 @@ mod tests {
         assert_eq!(pick(CarveKind::Pe, &pe(0x2022, 2)), ("dll", "sniff:pe/dll"));
         // A native-subsystem DLL (ntdll style) is still a dll.
         assert_eq!(pick(CarveKind::Pe, &pe(0x2022, 1)), ("dll", "sniff:pe/dll"));
-        assert_eq!(pick(CarveKind::Pe, &pe(0x0022, 1)), ("sys", "sniff:pe/native"));
+        assert_eq!(
+            pick(CarveKind::Pe, &pe(0x0022, 1)),
+            ("sys", "sniff:pe/native")
+        );
     }
 
     #[test]
@@ -514,7 +517,10 @@ mod tests {
         let mut b = pe(0x2022, 2);
         b[0x80] = b'X';
         assert_eq!(pick(CarveKind::Pe, &b), ("exe", "fallback"));
-        assert_eq!(pick(CarveKind::Pe, &pe(0x2022, 2)[..0x60]), ("exe", "fallback"));
+        assert_eq!(
+            pick(CarveKind::Pe, &pe(0x2022, 2)[..0x60]),
+            ("exe", "fallback")
+        );
     }
 
     #[test]
@@ -540,7 +546,10 @@ mod tests {
 
     #[test]
     fn mp4_brands() {
-        assert_eq!(pick(CarveKind::Mp4, &mp4(b"M4A ")), ("m4a", "sniff:mp4/M4A"));
+        assert_eq!(
+            pick(CarveKind::Mp4, &mp4(b"M4A ")),
+            ("m4a", "sniff:mp4/M4A")
+        );
         assert_eq!(pick(CarveKind::Mp4, &mp4(b"qt  ")), ("mov", "sniff:mp4/qt"));
         assert_eq!(pick(CarveKind::Mp4, &mp4(b"isom")), ("mp4", "kind"));
         assert_eq!(pick(CarveKind::Mp4, &[0u8; 32]), ("mp4", "fallback"));
@@ -593,8 +602,14 @@ mod tests {
         assert_eq!(pick(CarveKind::Zip, &docx), ("docx", "sniff:zip/word"));
         let xlsx = zip(&[("[Content_Types].xml", b"x"), ("xl/workbook.xml", b"x")]);
         assert_eq!(pick(CarveKind::Zip, &xlsx), ("xlsx", "sniff:zip/excel"));
-        let pptx = zip(&[("[Content_Types].xml", b"x"), ("ppt/presentation.xml", b"x")]);
-        assert_eq!(pick(CarveKind::Zip, &pptx), ("pptx", "sniff:zip/powerpoint"));
+        let pptx = zip(&[
+            ("[Content_Types].xml", b"x"),
+            ("ppt/presentation.xml", b"x"),
+        ]);
+        assert_eq!(
+            pick(CarveKind::Zip, &pptx),
+            ("pptx", "sniff:zip/powerpoint")
+        );
         let apk = zip(&[
             ("META-INF/MANIFEST.MF", b"x"),
             ("AndroidManifest.xml", b"x"),
@@ -614,8 +629,14 @@ mod tests {
     fn zip_odf_by_mimetype_even_when_the_tail_is_gone() {
         for (mime, ext) in [
             (&b"application/vnd.oasis.opendocument.text"[..], "odt"),
-            (&b"application/vnd.oasis.opendocument.spreadsheet"[..], "ods"),
-            (&b"application/vnd.oasis.opendocument.presentation"[..], "odp"),
+            (
+                &b"application/vnd.oasis.opendocument.spreadsheet"[..],
+                "ods",
+            ),
+            (
+                &b"application/vnd.oasis.opendocument.presentation"[..],
+                "odp",
+            ),
         ] {
             let z = zip(&[("mimetype", mime), ("content.xml", b"x")]);
             assert_eq!(run(CarveKind::Zip, &z).ext, ext);
@@ -630,7 +651,10 @@ mod tests {
     fn zip_without_a_readable_central_directory_falls_back() {
         let docx = zip(&[("[Content_Types].xml", b"x"), ("word/document.xml", b"x")]);
         // Tail cut off: the central directory is gone.
-        assert_eq!(pick(CarveKind::Zip, &docx[..docx.len() / 2]), ("zip", "fallback"));
+        assert_eq!(
+            pick(CarveKind::Zip, &docx[..docx.len() / 2]),
+            ("zip", "fallback")
+        );
         // End record pointing past the data.
         let mut lie = docx.clone();
         let n = lie.len();
@@ -677,9 +701,18 @@ mod tests {
 
     #[test]
     fn ole_office_outlook_and_installer() {
-        assert_eq!(pick(CarveKind::Ole, &ole(&["WordDocument"], false)), ("doc", "sniff:ole/word"));
-        assert_eq!(pick(CarveKind::Ole, &ole(&["Workbook"], false)), ("xls", "sniff:ole/excel"));
-        assert_eq!(pick(CarveKind::Ole, &ole(&["Book"], false)), ("xls", "sniff:ole/excel"));
+        assert_eq!(
+            pick(CarveKind::Ole, &ole(&["WordDocument"], false)),
+            ("doc", "sniff:ole/word")
+        );
+        assert_eq!(
+            pick(CarveKind::Ole, &ole(&["Workbook"], false)),
+            ("xls", "sniff:ole/excel")
+        );
+        assert_eq!(
+            pick(CarveKind::Ole, &ole(&["Book"], false)),
+            ("xls", "sniff:ole/excel")
+        );
         assert_eq!(
             pick(CarveKind::Ole, &ole(&["PowerPoint Document"], false)),
             ("ppt", "sniff:ole/powerpoint")
@@ -689,7 +722,10 @@ mod tests {
             ("msg", "sniff:ole/msg")
         );
         assert_eq!(
-            pick(CarveKind::Ole, &ole(&["\u{5}SummaryInformation", "\u{4840}\u{3a}x"], false)),
+            pick(
+                CarveKind::Ole,
+                &ole(&["\u{5}SummaryInformation", "\u{4840}\u{3a}x"], false)
+            ),
             ("msi", "sniff:ole/msi")
         );
         // Summary information alone (every Office file has it) is not an MSI.
@@ -714,7 +750,10 @@ mod tests {
         let mut b = ole(&["WordDocument"], false);
         b[0x30..0x34].copy_from_slice(&0x00ff_ffffu32.to_le_bytes()); // dir far outside
         assert_eq!(pick(CarveKind::Ole, &b), ("ole", "fallback"));
-        assert_eq!(pick(CarveKind::Ole, &ole(&["WordDocument"], false)[..300]), ("ole", "fallback"));
+        assert_eq!(
+            pick(CarveKind::Ole, &ole(&["WordDocument"], false)[..300]),
+            ("ole", "fallback")
+        );
     }
 
     // --- ELF ---
@@ -778,12 +817,21 @@ mod tests {
             noise,
             b"PK\x05\x06".to_vec(),
         ];
-        for kind in [CarveKind::Pe, CarveKind::Mp4, CarveKind::Zip, CarveKind::Ole, CarveKind::Elf, CarveKind::Png] {
+        for kind in [
+            CarveKind::Pe,
+            CarveKind::Mp4,
+            CarveKind::Zip,
+            CarveKind::Ole,
+            CarveKind::Elf,
+            CarveKind::Png,
+        ] {
             for input in &inputs {
                 let got = run(kind, input);
                 assert!(valid_ext(got.ext), "{kind:?}: {}", got.ext);
                 assert!(
-                    got.source == "kind" || got.source == "fallback" || got.source.starts_with("sniff:"),
+                    got.source == "kind"
+                        || got.source == "fallback"
+                        || got.source.starts_with("sniff:"),
                     "{kind:?}: {}",
                     got.source
                 );
@@ -822,7 +870,9 @@ mod tests {
         match kind {
             CarveKind::Pe => &["exe", "dll", "sys"],
             CarveKind::Mp4 => &["mp4", "m4a", "mov"],
-            CarveKind::Zip => &["zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "apk", "jar"],
+            CarveKind::Zip => &[
+                "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "apk", "jar",
+            ],
             CarveKind::Ole => &["ole", "doc", "xls", "ppt", "msg", "msi"],
             CarveKind::Elf => &["elf", "so"],
             _ => &[],
@@ -841,11 +891,26 @@ mod tests {
             (CarveKind::Pe, pe(0x0022, 1)),
             (CarveKind::Mp4, mp4(b"M4A ")),
             (CarveKind::Mp4, mp4(b"qt  ")),
-            (CarveKind::Zip, zip(&[("[Content_Types].xml", b"x"), ("word/document.xml", b"x")])),
-            (CarveKind::Zip, zip(&[("mimetype", b"application/vnd.oasis.opendocument.text")])),
-            (CarveKind::Zip, zip(&[("META-INF/MANIFEST.MF", b"x"), ("AndroidManifest.xml", b"x")])),
+            (
+                CarveKind::Zip,
+                zip(&[("[Content_Types].xml", b"x"), ("word/document.xml", b"x")]),
+            ),
+            (
+                CarveKind::Zip,
+                zip(&[("mimetype", b"application/vnd.oasis.opendocument.text")]),
+            ),
+            (
+                CarveKind::Zip,
+                zip(&[
+                    ("META-INF/MANIFEST.MF", b"x"),
+                    ("AndroidManifest.xml", b"x"),
+                ]),
+            ),
             (CarveKind::Ole, ole(&["WordDocument"], false)),
-            (CarveKind::Ole, ole(&["\u{5}SummaryInformation", "\u{4840}\u{3a}x"], false)),
+            (
+                CarveKind::Ole,
+                ole(&["\u{5}SummaryInformation", "\u{4840}\u{3a}x"], false),
+            ),
             (CarveKind::Ole, ole(&["Workbook"], true)),
             (CarveKind::Elf, elf64(3, 1)),
         ];
@@ -858,7 +923,11 @@ mod tests {
             dump.extend_from_slice(bytes);
             dump.extend_from_slice(&[0x5Au8; 4096]);
             for (data, base) in [(bytes.to_vec(), 0u64), (dump, BASE)] {
-                let mut spy = Spy { inner: Cursor::new(data), lo: u64::MAX, hi: 0 };
+                let mut spy = Spy {
+                    inner: Cursor::new(data),
+                    lo: u64::MAX,
+                    hi: 0,
+                };
                 let got = refine_ext(kind, &mut spy, base, bytes.len() as u64);
                 assert!(valid_ext(got.ext), "{kind:?}: {}", got.ext);
                 assert!(
@@ -874,7 +943,11 @@ mod tests {
                     got.source
                 );
                 if spy.hi > 0 {
-                    assert!(spy.lo >= base, "{kind:?} read before the region ({})", spy.lo);
+                    assert!(
+                        spy.lo >= base,
+                        "{kind:?} read before the region ({})",
+                        spy.lo
+                    );
                     assert!(
                         spy.hi <= base + bytes.len() as u64,
                         "{kind:?} read past the region ({})",
@@ -905,8 +978,8 @@ mod tests {
     #[test]
     fn every_refined_extension_is_whitelisted() {
         for ext in [
-            "dll", "sys", "m4a", "mov", "docx", "xlsx", "pptx", "odt", "ods", "odp", "apk",
-            "jar", "doc", "xls", "ppt", "msg", "msi", "so",
+            "dll", "sys", "m4a", "mov", "docx", "xlsx", "pptx", "odt", "ods", "odp", "apk", "jar",
+            "doc", "xls", "ppt", "msg", "msi", "so",
         ] {
             assert!(valid_ext(ext), "{ext}");
         }
