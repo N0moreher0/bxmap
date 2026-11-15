@@ -23,8 +23,26 @@ pub fn write_carve_index(report: &CarveReport, path: &str) -> io::Result<()> {
             .map(|offset| offset.to_string())
             .collect::<Vec<_>>()
             .join(",");
+        // The name on disk when the file was written; otherwise the name the
+        // writer would have used, so the field is present either way.
+        let file_name = match file.path.as_ref().and_then(|path| path.file_name()) {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => bxmap::carve::carved_file_name_with_ext(
+                file.offset,
+                file.kind,
+                &file.ext,
+                file.role,
+                &file.sha256,
+            ),
+        };
+        let evidence = file
+            .evidence
+            .iter()
+            .map(|item| json_escape(item))
+            .collect::<Vec<_>>()
+            .join(",");
         let record = format!(
-            "{{\"offset\":{},\"offset_hex\":\"{:#x}\",\"type\":\"{}\",\"size\":{},\"sha256\":\"{}\",\"entropy\":{:.4},\"complete\":{},\"corrupted_offset\":{},\"entropy_spike_at\":{},\"notes\":{},\"path\":{},\"duplicates\":[{}]}}",
+            "{{\"offset\":{},\"offset_hex\":\"{:#x}\",\"type\":\"{}\",\"size\":{},\"sha256\":\"{}\",\"entropy\":{:.4},\"complete\":{},\"corrupted_offset\":{},\"entropy_spike_at\":{},\"notes\":{},\"path\":{},\"duplicates\":[{}],\"file_name\":{},\"ext\":{},\"ext_source\":{},\"role\":\"{}\",\"tier\":{},\"evidence\":[{}],\"confidence\":\"{}\"}}",
             file.offset,
             file.offset,
             file.kind.as_str(),
@@ -39,7 +57,14 @@ pub fn write_carve_index(report: &CarveReport, path: &str) -> io::Result<()> {
                 Some(path) => json_escape(&path.to_string_lossy()),
                 None => "null".to_string(),
             },
-            duplicates
+            duplicates,
+            json_escape(&file_name),
+            json_escape(&file.ext),
+            json_escape(&file.ext_source),
+            file.role.as_str(),
+            file.tier,
+            evidence,
+            file.confidence.as_str()
         );
         if ndjson {
             writeln!(out, "{record}")?;

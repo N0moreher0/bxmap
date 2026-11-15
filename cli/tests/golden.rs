@@ -1676,7 +1676,20 @@ fn golden_carve_new_formats_gif_and_lnk() {
     assert!(lines[1].contains("\"type\":\"lnk\""), "{records}");
     assert!(lines[0].contains("\"complete\":true"), "{records}");
     assert!(lines[1].contains("\"complete\":true"), "{records}");
-
+    // B3 evidence fields: both are complete, structure-validated files.
+    for (line, ext) in [(lines[0], "gif"), (lines[1], "lnk")] {
+        assert!(line.contains(&format!("\"ext\":\"{ext}\"")), "{line}");
+        assert!(line.contains("\"ext_source\":\"kind\""), "{line}");
+        assert!(line.contains("\"role\":\"whole\""), "{line}");
+        assert!(line.contains("\"tier\":1"), "{line}");
+        assert!(
+            line.contains("\"evidence\":[\"magic\",\"structure_ok\",\"terminator_ok\"]"),
+            "{line}"
+        );
+        assert!(line.contains("\"confidence\":\"high\""), "{line}");
+        assert!(line.contains(&format!(".{ext}.carved\"")), "{line}");
+    }
+    assert!(stderr.contains("tier T1=2; ext gif=1 lnk=1"), "{stderr}");
     // Byte-identical: validator cắt đúng ranh giới file.
     let read_kind = |needle: &str| {
         std::fs::read_dir(&out_dir)
@@ -1983,6 +1996,14 @@ fn golden_carve_splits_partial_files_and_indexes_offsets() {
     let records = std::fs::read_to_string(&index).unwrap();
     assert_eq!(records.lines().count(), 1, "{records}");
     assert!(records.contains("\"complete\":false"), "{records}");
+    assert!(records.contains("\"role\":\"whole\""), "{records}");
+    assert!(records.contains("\"tier\":2"), "{records}");
+    assert!(
+        records.contains("\"evidence\":[\"magic\",\"structure_partial\"]"),
+        "{records}"
+    );
+    assert!(records.contains("\"confidence\":\"medium\""), "{records}");
+    assert!(records.contains("\"file_name\":\""), "{records}");
     assert!(
         records.contains(&format!("\"offset\":{zip_offset}")),
         "{records}"
@@ -2032,7 +2053,11 @@ fn golden_carve_recovers_a_pdf_tail_after_partial_encryption() {
     assert_eq!(records.lines().count(), 1, "{records}");
     assert!(records.contains("\"type\":\"pdf\""), "{records}");
     assert!(records.contains("salvage:tail"), "{records}");
-    assert!(records.contains("\"complete\":false"), "{records}");
+    assert!(records.contains("\"role\":\"tail\""), "{records}");
+    assert!(records.contains("\"tier\":2"), "{records}");
+    assert!(records.contains("\"evidence\":[\"footer\"]"), "{records}");
+    assert!(records.contains("\"confidence\":\"low\""), "{records}");
+    assert!(records.contains(".pdf.tail.carved\""), "{records}");    assert!(records.contains("\"complete\":false"), "{records}");
     assert!(!records.contains("\"corrupted_offset\":null"), "{records}");
     let carved = dir.path().join("dump.bin.bxmap").join("carved");
     let partial = std::fs::read_dir(carved.join("partial")).unwrap().count();

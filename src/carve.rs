@@ -88,6 +88,75 @@ pub enum CarveRole {
     Reassembled,
 }
 
+impl CarveRole {
+    /// Stable id used in the carve index: `whole`, `tail` or `reassembled`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CarveRole::Whole => "whole",
+            CarveRole::Tail => "tail",
+            CarveRole::Reassembled => "reassembled",
+        }
+    }
+}
+
+/// How sure the carver is that a file opens as its extension says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarveConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl CarveConfidence {
+    /// Stable id used in the carve index: `high`, `medium` or `low`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CarveConfidence::High => "high",
+            CarveConfidence::Medium => "medium",
+            CarveConfidence::Low => "low",
+        }
+    }
+}
+
+/// Evidence tier (ROADMAP 8.10.1), the checks that back it and the resulting
+/// confidence. Only facts the carver actually established are listed:
+///
+/// * tier 1: header matched, the validator walked the structure and reached
+///   the terminator (`complete`); plus the sniff rule when one refined `ext`;
+/// * tier 2: header valid but the structure stops early, or a tail found from
+///   its footer (head missing);
+/// * tier 3: no structural evidence, only readable text.
+fn evidence_for(
+    role: CarveRole,
+    kind: CarveKind,
+    complete: bool,
+    ext_source: &'static str,
+) -> (u8, Vec<&'static str>, CarveConfidence) {
+    match role {
+        CarveRole::Tail => (2, vec!["footer"], CarveConfidence::Low),
+        CarveRole::Reassembled => (
+            2,
+            vec!["magic", "reassembled"],
+            CarveConfidence::Medium,
+        ),
+        CarveRole::Whole if kind == CarveKind::Text => {
+            (3, vec!["text_ratio"], CarveConfidence::Low)
+        }
+        CarveRole::Whole if complete => {
+            let mut evidence = vec!["magic", "structure_ok", "terminator_ok"];
+            if ext_source.starts_with("sniff:") {
+                evidence.push(ext_source);
+            }
+            (1, evidence, CarveConfidence::High)
+        }
+        CarveRole::Whole => (
+            2,
+            vec!["magic", "structure_partial"],
+            CarveConfidence::Medium,
+        ),
+    }
+}
+
 /// Builds the one canonical output name: `{offset:08x}-{kind}-{sha8}.{ext}.carved`.
 ///
 /// `.carved` is always the last extension so nothing auto-opens or runs the
@@ -495,6 +564,15 @@ pub struct CarvedFile {
     /// Why `ext` was chosen: `kind`, `sniff:<rule>` or `fallback` (the sniff
     /// could not read enough structure, so the default stays).
     pub ext_source: String,
+    /// Which piece of a file this output holds (whole, tail, reassembled).
+    pub role: CarveRole,
+    /// Evidence tier: 1 = structure validated to the terminator, 2 = header
+    /// valid but incomplete (or a tail), 3 = readable text only.
+    pub tier: u8,
+    /// Checks that back the tier (`magic`, `structure_ok`, `terminator_ok`,
+    /// `structure_partial`, `footer`, `text_ratio`, `sniff:<rule>`).
+    pub evidence: Vec<&'static str>,
+    pub confidence: CarveConfidence,
 }
 
 /// Result of one carving pass.
@@ -551,6 +629,30 @@ impl CarveReport {
         );
         if !kinds.is_empty() {
             line.push_str(&format!(" [{kinds}]"));
+        }
+        if !self.files.is_empty() {
+            let mut tiers = [0usize; 3];
+            let mut exts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for file in &self.files {
+                if let Some(slot) = tiers.get_mut(usize::from(file.tier).wrapping_sub(1)) {
+                    *slot += 1;
+                }
+                *exts.entry(file.ext.as_str()).or_insert(0) += 1;
+            }
+            let tier_text = tiers
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(index, count)| format!("T{}={count}", index + 1))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ext_text = exts
+                .iter()
+                .map(|(ext, count)| format!("{ext}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            line.push_str(&format!(" (tier {tier_text}; ext {ext_text})"));
         }
         if self.duplicates > 0 {
             line.push_str(&format!(
@@ -785,6 +887,8 @@ impl Carver {
                 };
                 by_hash.insert(sha256.clone(), report.files.len());
                 report.bytes_written += size;
+                let (tier, evidence, confidence) =
+                    evidence_for(CarveRole::Whole, kind, notes.is_empty(), choice.source);
                 report.files.push(CarvedFile {
                     offset,
                     kind,
@@ -799,6 +903,10 @@ impl Carver {
                     entropy_spike_at,
                     ext: choice.ext.to_string(),
                     ext_source: choice.source.to_string(),
+                    role: CarveRole::Whole,
+                    tier,
+                    evidence,
+                    confidence,
                 });
                 covered_end = offset + size;
 
@@ -929,6 +1037,8 @@ impl Carver {
                 };
                 by_hash.insert(sha256.clone(), report.files.len());
                 report.bytes_written += size;
+                let (tier, evidence, confidence) =
+                    evidence_for(CarveRole::Tail, kind, false, "kind");
                 report.files.push(CarvedFile {
                     offset: tail.start,
                     kind,
@@ -943,6 +1053,10 @@ impl Carver {
                     entropy_spike_at: tail.spike,
                     ext: kind.default_ext().to_string(),
                     ext_source: "kind".to_string(),
+                    role: CarveRole::Tail,
+                    tier,
+                    evidence,
+                    confidence,
                 });
 
                 if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
@@ -1054,6 +1168,8 @@ impl Carver {
             );
             by_hash.insert(sha256.clone(), report.files.len());
             report.bytes_written += size;
+            let (tier, evidence, confidence) =
+                evidence_for(CarveRole::Whole, CarveKind::Text, false, "kind");
             report.files.push(CarvedFile {
                 offset: start,
                 kind: CarveKind::Text,
@@ -1068,6 +1184,10 @@ impl Carver {
                 entropy_spike_at: None,
                 ext: CarveKind::Text.default_ext().to_string(),
                 ext_source: "kind".to_string(),
+                role: CarveRole::Whole,
+                tier,
+                evidence,
+                confidence,
             });
 
             if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
@@ -6475,5 +6595,87 @@ mod naming_tests {
                 assert!(name.len() < 100, "{name}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    fn file(tier: u8, ext: &str, role: CarveRole) -> CarvedFile {
+        CarvedFile {
+            offset: 0,
+            kind: CarveKind::Zip,
+            size: 1,
+            complete: tier == 1,
+            sha256: "0".repeat(64),
+            entropy: 0.0,
+            notes: String::new(),
+            path: None,
+            duplicates: Vec::new(),
+            corrupted_offset: None,
+            entropy_spike_at: None,
+            ext: ext.to_string(),
+            ext_source: "kind".to_string(),
+            role,
+            tier,
+            evidence: Vec::new(),
+            confidence: CarveConfidence::High,
+        }
+    }
+
+    #[test]
+    fn evidence_tiers_follow_what_was_established() {
+        let (tier, evidence, confidence) =
+            evidence_for(CarveRole::Whole, CarveKind::Pe, true, "kind");
+        assert_eq!(tier, 1);
+        assert_eq!(evidence, ["magic", "structure_ok", "terminator_ok"]);
+        assert_eq!(confidence, CarveConfidence::High);
+
+        // A sniff rule that refined the extension is part of the evidence.
+        let (_, evidence, _) = evidence_for(CarveRole::Whole, CarveKind::Zip, true, "sniff:zip/word");
+        assert_eq!(evidence.last().copied(), Some("sniff:zip/word"));
+
+        let (tier, evidence, confidence) =
+            evidence_for(CarveRole::Whole, CarveKind::Zip, false, "fallback");
+        assert_eq!(tier, 2);
+        assert_eq!(evidence, ["magic", "structure_partial"]);
+        assert_eq!(confidence, CarveConfidence::Medium);
+        // `fallback` is not evidence of anything.
+        assert!(!evidence.contains(&"fallback"));
+
+        let (tier, evidence, confidence) =
+            evidence_for(CarveRole::Tail, CarveKind::Png, false, "kind");
+        assert_eq!((tier, confidence), (2, CarveConfidence::Low));
+        assert_eq!(evidence, ["footer"]);
+
+        let (tier, evidence, confidence) =
+            evidence_for(CarveRole::Whole, CarveKind::Text, false, "kind");
+        assert_eq!((tier, confidence), (3, CarveConfidence::Low));
+        assert_eq!(evidence, ["text_ratio"]);
+    }
+
+    #[test]
+    fn role_and_confidence_ids_are_stable() {
+        assert_eq!(CarveRole::Whole.as_str(), "whole");
+        assert_eq!(CarveRole::Tail.as_str(), "tail");
+        assert_eq!(CarveRole::Reassembled.as_str(), "reassembled");
+        assert_eq!(CarveConfidence::High.as_str(), "high");
+        assert_eq!(CarveConfidence::Medium.as_str(), "medium");
+        assert_eq!(CarveConfidence::Low.as_str(), "low");
+    }
+
+    #[test]
+    fn summary_line_counts_tiers_and_extensions() {
+        let mut report = CarveReport::default();
+        report.files.push(file(1, "docx", CarveRole::Whole));
+        report.files.push(file(1, "docx", CarveRole::Whole));
+        report.files.push(file(2, "png", CarveRole::Tail));
+        report.files.push(file(3, "txt", CarveRole::Whole));
+        let line = report.summary_line();
+        assert!(line.contains("(tier T1=2 T2=1 T3=1; ext docx=2 png=1 txt=1)"), "{line}");
+
+        // No files, no tier/ext clutter.
+        assert!(!CarveReport::default().summary_line().contains("tier"));
     }
 }

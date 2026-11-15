@@ -6,6 +6,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Carve index: every record now also has `file_name`, `ext`, `ext_source`,
+  `role` (`whole|tail|reassembled`), `tier` (1 = structure validated to the
+  terminator, 2 = incomplete header or footer-found tail, 3 = readable text),
+  `evidence` (`magic`, `structure_ok`, `terminator_ok`, `structure_partial`,
+  `footer`, `text_ratio`, `sniff:<rule>`) and `confidence`
+  (`high|medium|low`). Existing fields are unchanged. `--report summary`
+  appends the count per tier and per extension. Library: `CarvedFile` gains
+  `role`, `tier`, `evidence`, `confidence` and the new `CarveConfidence` enum.
 - `--carve text`: new opt-in carve of plaintext regions (notes, logs,
   Markdown, source dumps). `Text` is a `CarveKind` that is NOT in
   `CarveKind::ALL`: `--carve all` is unchanged; ask for it with

@@ -199,6 +199,15 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   `duplicates`. For incomplete files `corrupted_offset` is where structural
   validation stopped and `entropy_spike_at` is the first 4 KiB window that
   jumps to >= 7.8 bits/byte after structured data (both `null` otherwise).
+  Records also carry the evidence behind each file, so scripts do not have to
+  parse the name: `file_name`, `ext` and `ext_source` (`kind`,
+  `sniff:<rule>` or `fallback`), `role` (`whole`, `tail`, `reassembled`),
+  `tier` (1 = structure validated to the terminator, 2 = header valid but
+  incomplete or a footer-found tail, 3 = readable text only), `evidence` (the
+  checks that back it: `magic`, `structure_ok`, `terminator_ok`,
+  `structure_partial`, `footer`, `text_ratio`, `sniff:<rule>`) and
+  `confidence` (`high`, `medium`, `low`). `--report summary` adds the file
+  count per tier and per extension, e.g. `(tier T1=3 T2=1; ext docx=3 png=1)`.
 - Incomplete files (`complete: false`) are always written into a `partial/`
   subfolder of `--carve-out` so repair tools (Untrunc, 7-Zip recovery, manual
   header splicing) can take that folder as input. They carry `corrupted_offset`
