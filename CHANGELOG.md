@@ -5,6 +5,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-15
+
+CLI release aligned with `bxmap` 1.1.0. Highlights:
+- **Carved files are named after the format they contain** (e.g.
+  `0001a2b0-zip-9f3c1e2a.docx.carved`) with content-refined extensions,
+  evidence fields in the index (`ext`, `ext_source`, `role`, `tier`,
+  `evidence`, `confidence`), `.txt.carved` plaintext and `.tail.carved`
+  salvaged tails. `.carved` stays last so nothing auto-opens.
+- **The string scanner no longer effectively hangs on binary-heavy dumps**
+  (the Latin-1/CP1252 fast-skip could leave a run open for the rest of the
+  file); Lab 6 (~1.5 GiB) finishes again.
+- Minor bump per the visible behaviour change of the carve file names.
+
 ### Added
 - `--carved` and its companions (`--carved-out`, `--carved-index`,
   `--carved-min-size`, `--carved-max-size`, `--carved-max-total`,
