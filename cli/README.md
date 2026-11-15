@@ -208,17 +208,25 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   line; anything else = JSON array. The index is a separate channel from
   `--format` so carving never reshapes the string output.
   Each record has `offset`, `offset_hex`, `type`, `size`, `sha256`, `entropy`,
-  `complete`, `corrupted_offset`, `entropy_spike_at`, `notes`, `path`, and
-  `duplicates`. For incomplete files `corrupted_offset` is where structural
-  validation stopped and `entropy_spike_at` is the first 4 KiB window that
-  jumps to >= 7.8 bits/byte after structured data (both `null` otherwise).
+  `complete`, `corrupted_offset`, `entropy_spike_at`, `partial_encryption`,
+  `notes`, `path`, and `duplicates`. For incomplete files `corrupted_offset`
+  is where structural validation stopped and `entropy_spike_at` is the first
+  4 KiB window that jumps to >= 7.8 bits/byte after structured data (both
+  `null` otherwise). `partial_encryption` is `null`, or an object
+  `{ "period": <bytes>, "duty": <0-1>, "threshold": 7.8 }` when the file
+  shows a repeating high-entropy phase (e.g. every 4th 4 KiB window) - the
+  signature of file-system encryption that encrypts a fraction of every
+  file. Heuristic hint, **not** a ransomware verdict: compressed data also
+  scores as high entropy. Fully structured and uniformly high (compressed or
+  encrypted end to end) files produce `null`.
   Records also carry the evidence behind each file, so scripts do not have to
   parse the name: `file_name`, `ext` and `ext_source` (`kind`,
   `sniff:<rule>` or `fallback`), `role` (`whole`, `tail`, `reassembled`),
   `tier` (1 = structure validated to the terminator, 2 = header valid but
   incomplete or a footer-found tail, 3 = readable text only), `evidence` (the
   checks that back it: `magic`, `structure_ok`, `terminator_ok`,
-  `structure_partial`, `footer`, `text_ratio`, `sniff:<rule>`) and
+  `structure_partial`, `footer`, `text_ratio`, `sniff:<rule>`, and
+  `suspected-partial-encryption` when the periodic heuristic matched) and
   `confidence` (`high`, `medium`, `low`). `--report summary` adds the file
   count per tier and per extension, e.g. `(tier T1=3 T2=1; ext docx=3 png=1)`.
 - Incomplete files (`complete: false`) are always written into a `partial/`

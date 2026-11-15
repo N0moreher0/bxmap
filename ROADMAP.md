@@ -328,17 +328,19 @@ Bối cảnh: ransomware kiểu Beast chỉ mã hoá xen kẽ (~25%, chu kỳ 1:
 - [x] **Việc code** (xong 2026-11-14): gỡ token `salvage` + flag `--carve-incomplete` trong `cli/src/args.rs` (kèm 2 test guard: `removed_salvage_token_is_a_clear_error`, `removed_carve_incomplete_flag_is_unknown`); CLI luôn bật `with_salvage(true)` + `with_incomplete_dir(true)`; HELP (`cli/src/helpers.rs`) và `cli/README.md` cập nhật (salvage luôn chạy, `partial/` luôn bật); test args viết lại, golden `golden_carve_splits_partial_files_and_indexes_offsets` và `golden_carve_recovers_a_pdf_tail_after_partial_encryption` (thay `golden_carve_salvage_recovers_a_pdf_tail_only_when_asked`). `cargo test --workspace` xanh (golden carve: 10/10). API thư viện giữ opt-in (`Carver::with_salvage(bool)` mặc định false).
 - Lưu ý: 8.7.0 (bare `--carve` = `--carve all`) và 8.7.2.2 (salvage là tham số) phản ánh thiết kế cũ, được thay bằng mục này.
 
-**8.7.3 Định vị ranh giới mã hoá bằng entropy**
-- [ ] Trên file lớn (SQLite, VMDK, ảnh RAW...), nếu entropy cửa sổ vượt `7.8` theo chu kỳ đều (mẫu xen kẽ như 1:3) thì gắn nhãn `suspected-partial-encryption` kèm `period`, `duty`, `threshold` trong index.
-- [ ] Đây là **heuristic gợi ý**, không phán quyết ransomware; dữ liệu nén cũng có entropy cao nên nhãn luôn ghi rõ mức tin cậy.
-- [ ] Tái dùng cửa sổ/ngưỡng/gộp vùng của entropy scanner, không viết lại.
+**8.7.3 Định vị ranh giới mã hoá bằng entropy · XONG (code 2026-11-15; fuzz/đối chiếu Lab 6 chưa làm)**
+- [x] Trên file lớn (SQLite, VMDK, ảnh RAW...), nếu entropy cửa sổ vượt `7.8` theo chu kỳ đều (mẫu xen kẽ như 1:3) thì gắn nhãn `suspected-partial-encryption` kèm `period`, `duty`, `threshold` trong index. (Detector thuần `detect_periodic_high` + quét streaming `periodic_encryption_scan` trên `src/carve.rs`; mọi file carve ≥ 16 cửa sổ 4 KiB (64 KiB) được phân tích ở cả header-first, tail, bin; period 2..16 cửa sổ, bucket nóng ≥ 0.8 và các bucket còn lại ≤ 0.3, ≥ 8 chu kỳ; duty >= 0.9 (gần như toàn bộ entropy cao) hoặc < 3 cửa sổ cao thì **không** gắn nhãn; index ra `partial_encryption: { period, duty, threshold }` (hoặc `null`) + `evidence[] += suspected-partial-encryption`; tier/confidence không đổi.)
+- [x] Đây là **heuristic gợi ý**, không phán quyết ransomware; dữ liệu nén cũng có entropy cao nên nhãn luôn ghi rõ mức tin cậy. (Ghi rõ trong `PartialEncryption` doc, HELP/README/cli-README và CHANGELOG: heuristic, không phán quyết; không gắn nhãn cho file uniform hay structured; không dùng để phân loại hay loại ứng viên.)
+- [x] Tái dùng cửa sổ/ngưỡng/gộp vùng của entropy scanner, không viết lại. (`SPIKE_WINDOW` = 4096 và `SPIKE_HIGH` = 7.8 dùng chung với `entropy_rise`; chỉ thêm detector, không viết lại entropy.)
+
+**Ghi chú thực hiện 8.7.3 (2026-11-15):** test unit `detect_periodic_high` (1:3 / 1:1 detect, uniform high/low không match, scattered không match, <16 windows không match, hot-bucket phase) + `periodic_high_cycle_is_detected...` + **integration BMP** `a_bmp_with_a_periodic_encrypted_payload_is_labelled_suspected_partial_encryption` (payload 1:3 xen kẽ 0/pseudo-random, header BMP hợp lệ; kiểm nhãn + evidence + period 16384 + duty ~0.25 + threshold 7.8). Index: `partial_encryption` đứng sau `entropy_spike_at`, giữ nguyên các trường cũ; **golden carve 15/15 + lib 208 pass**. Fuzz qua `carve_scan` chưa có fixture chuyên biệt cho detector này (không có panic path — detector thuần, không cấp phát theo input). Đối chiếu Lab 6 (mục 8.7.5) chưa làm.
 
 **8.7.4 Khoanh vùng khoá trong RAM**
 - [ ] Kết hợp `--entropy` với `--find-keys` (module `bxmap::keys`) để khoanh vùng tiến trình/vùng nhớ nghi vấn trong dump.
 - [ ] Quyết định cần chốt: thiết kế 8.5 chỉ báo offset + vân tay, **không xuất byte khoá thuần**. Xuất khoá thô (AES key schedule, hằng số ChaCha20 `expand 32-byte k` + 32 byte kế tiếp) chỉ làm khi có cờ opt-in riêng, mặc định giữ như cũ.
 
 **8.7.5 Test**
-- [ ] Dump tổng hợp: file bị mã hoá xen kẽ 1:3, trường hợp còn header, còn footer, mất cả hai; kiểm `corrupted_offset`, `entropy_spike_at`, nhãn `suspected-partial-encryption`.
+- [ ] Dump tổng hợp: file bị mã hoá xen kẽ 1:3, trường hợp còn header, còn footer, mất cả hai; kiểm `corrupted_offset`, `entropy_spike_at`, nhãn `suspected-partial-encryption`. (2026-11-15: trường hợp "còn header" đã có — test `a_bmp_with_a_periodic_encrypted_payload_is_labelled_suspected_partial_encryption` (BMP, payload xen kẽ 1:3, nhãn + period/duty/threshold + evidence). Còn lại: kiểm `corrupted_offset`/`entropy_spike_at` trong fixture 1:3 và biến thể mất header/footer.)
 - [~] Golden test CLI cho `--carve` trần (đã cover: salvage luôn chạy, `partial/` luôn bật, 2026-11-14); còn fuzz salvage qua `carve_scan` (marker lặp, footer giả, entropy giả).
 - [ ] Đối chiếu số file cứu được so với carve header-first trên Lab 6.
 

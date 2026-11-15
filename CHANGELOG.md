@@ -5,6 +5,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Periodic partial-encryption heuristic** (`ROADMAP 8.7.3`). Carved files
+  whose 4 KiB windows show a repeating high-entropy phase (e.g. every 4th
+  block, 1:3 duty) now carry `suspected-partial-encryption` in the carve
+  index (`partial_encryption: { period, duty, threshold }`, or `null`),
+  labelled as a **heuristic hint, not a ransomware verdict**: compressed
+  data scores as high entropy too. Uniformly high or fully structured files
+  are not flagged (they are not *partial*). Detection: one extra streaming
+  pass over the carved region; files smaller than 16 windows (64 KiB, i.e.
+  8 cycles of the shortest detector period) produce no label. The
+  `evidence` array gains `suspected-partial-encryption` when the label
+  applies. Positioned after `entropy_spike_at` in the index; all existing
+  fields keep their names and order.
+
 ## [1.1.1] - 2026-11-15
 
 Packaging bugfix. The CLI crate lost its `[[bin]]` section in the 1.0.17

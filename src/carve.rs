@@ -62,6 +62,13 @@ const SPIKE_WINDOW: usize = 4096;
 const SPIKE_HIGH: f64 = 7.8;
 /// A window below this entropy is clearly structured data (text, headers, tables).
 const SPIKE_LOW: f64 = 7.0;
+/// Largest periodicity (in windows) scanned by the partial-encryption
+/// heuristic; period is `windows * SPIKE_WINDOW` (64 KiB here).
+const PARTIAL_ENC_MAX_PERIOD: usize = 16;
+/// Minimum number of complete windows needed before the periodic scan reports
+/// anything: 8 full periods of the shortest detectable cycle (period 2).
+/// Larger periods are skipped when the file is too small for 8 periods.
+const PARTIAL_ENC_MIN_WINDOWS: usize = 8 * 2;
 /// Block the text pass scores. Block-granular detection (plus a byte-level
 /// refine at the edges) keeps a stray non-text byte from splitting a long
 /// plaintext run.
@@ -130,6 +137,17 @@ impl CarveConfidence {
 /// * tier 2: header valid but the structure stops early, or a tail found from
 ///   its footer (head missing);
 /// * tier 3: no structural evidence, only readable text.
+/// Attach the partial-encryption hint to the evidence list when present.
+fn with_suspect(
+    mut evidence: Vec<&'static str>,
+    hint: Option<PartialEncryption>,
+) -> Vec<&'static str> {
+    if hint.is_some() {
+        evidence.push("suspected-partial-encryption");
+    }
+    evidence
+}
+
 fn evidence_for(
     role: CarveRole,
     kind: CarveKind,
@@ -628,6 +646,122 @@ impl Default for CarveOptions {
     }
 }
 
+/// Periodic partial-encryption hint (ROADMAP 8.7.3): a repeating phase of
+/// high-entropy windows inside an otherwise structured file, the signature of
+/// file-system encryption that encrypts a fraction of every file (e.g.
+/// every 4th 4 KiB block). This is a *heuristic label*, not a verdict:
+/// compressed data scores as high entropy too, and the threshold alone
+/// cannot tell the two apart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartialEncryption {
+    /// Length of one repeat, in bytes (window size x windows per period).
+    pub period: u64,
+    /// Share of the analysed region covered by high-entropy windows.
+    pub duty: f64,
+    /// Window entropy threshold used to classify a window as encrypted.
+    pub threshold: f64,
+}
+
+impl std::fmt::Display for PartialEncryption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "suspected-partial-encryption (period={} B, duty={:.0}%, threshold={:.1})",
+            self.period,
+            self.duty * 100.0,
+            self.threshold
+        )
+    }
+}
+
+/// Detect a recurring high-entropy phase in a window mask:
+/// `high[i]` is true when window `i` has entropy >= [`SPIKE_HIGH`].
+///
+/// For every candidate period `P` (in windows), the windows are bucketed by
+/// index modulo `P`. A cycle counts as recurring when at least one bucket is
+/// almost always high (>= 80%) and every remaining bucket is almost always
+/// structured (<= 30%). A uniformly high (or uniformly low) file is not
+/// *partial* encryption: it fails the `duty >= 0.9` / `< 3 high windows`
+/// guards. The smallest acceptable period is 2 windows; period 1 is
+/// indistinguishable from uniform encryption and is rejected.
+fn detect_periodic_high(high: &[bool]) -> Option<(u64, f64)> {
+    let n = high.len();
+    if n < PARTIAL_ENC_MIN_WINDOWS {
+        return None;
+    }
+    let total_high = high.iter().filter(|&&flag| flag).count();
+    if total_high < 3 {
+        return None;
+    }
+    let overall_duty = total_high as f64 / n as f64;
+    if overall_duty >= 0.9 {
+        return None; // uniformly high (or almost): not *partial*
+    }
+    for period in 2..=PARTIAL_ENC_MAX_PERIOD {
+        if n < period * 8 {
+            break; // larger periods need more windows than the file holds
+        }
+        let mut per_bucket = [0usize; PARTIAL_ENC_MAX_PERIOD];
+        let mut bucket_total = [0usize; PARTIAL_ENC_MAX_PERIOD];
+        for (index, &flag) in high.iter().enumerate() {
+            let bucket = index % period;
+            bucket_total[bucket] += 1;
+            if flag {
+                per_bucket[bucket] += 1;
+            }
+        }
+        let mut hot = 0usize;
+        let mut cold = 0usize;
+        for bucket in 0..period {
+            let fraction = per_bucket[bucket] as f64 / bucket_total[bucket] as f64;
+            if fraction >= 0.8 {
+                hot += 1;
+            } else if fraction <= 0.3 {
+                cold += 1;
+            }
+        }
+        if hot >= 1 && cold == period - hot {
+            return Some((period as u64 * SPIKE_WINDOW as u64, overall_duty));
+        }
+    }
+    None
+}
+
+/// Scan `[offset, offset + size)` in [`SPIKE_WINDOW`]-byte windows and report
+/// a periodic high-entropy phase when one is found (ROADMAP 8.7.3).
+/// Files too small to hold 8 full periods of any cycle return `None`.
+fn periodic_encryption_scan(
+    file: &mut File,
+    offset: u64,
+    size: u64,
+) -> io::Result<Option<PartialEncryption>> {
+    if size < (PARTIAL_ENC_MIN_WINDOWS * SPIKE_WINDOW) as u64 {
+        return Ok(None);
+    }
+    let mut counts = [0u64; 256];
+    let mut filled = 0usize;
+    let mut mask: Vec<bool> = Vec::with_capacity((size / SPIKE_WINDOW as u64) as usize);
+    stream_region(file, offset, size, |chunk| {
+        for &byte in chunk {
+            counts[byte as usize] += 1;
+            filled += 1;
+            if filled == SPIKE_WINDOW {
+                mask.push(entropy(&counts, SPIKE_WINDOW as u64) >= SPIKE_HIGH);
+                counts = [0u64; 256];
+                filled = 0;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(
+        detect_periodic_high(&mask).map(|(period, duty)| PartialEncryption {
+            period,
+            duty,
+            threshold: SPIKE_HIGH,
+        }),
+    )
+}
+
 /// One recovered file.
 #[derive(Debug, Clone)]
 pub struct CarvedFile {
@@ -657,6 +791,12 @@ pub struct CarvedFile {
     /// encrypted region begins. Heuristic only (compressed data looks the
     /// same). `None` for complete files or when no such jump exists.
     pub entropy_spike_at: Option<u64>,
+    /// Periodic high-entropy phase detected inside the file (ROADMAP
+    /// 8.7.3): heuristic label for file-system encryption that encrypts a
+    /// fraction of every file. `None` when the file is too small, fully
+    /// structured or uniformly high (compressed/encrypted end to end).
+    /// Compressed data also scores high, so this is a hint, not a verdict.
+    pub partial_encryption: Option<PartialEncryption>,
     /// Extension carried before `.carved`: the kind's default, or a more
     /// specific one proven by the content sniff (ROADMAP 8.10.3).
     pub ext: String,
@@ -964,6 +1104,15 @@ impl Carver {
                 } else {
                     None
                 };
+                // Heuristic: periodic high-entropy phase (1 in N blocks kept
+                // encrypted). Cheap no-op for files too small to show one.
+                let partial_encryption = match periodic_encryption_scan(&mut source, offset, size) {
+                    Ok(hint) => hint,
+                    Err(error) => {
+                        failure = Some(error);
+                        return false;
+                    }
+                };
                 // Refine the extension from the bytes just validated (bounded
                 // reads inside this region, no extra pass over the dump).
                 let choice = crate::carve_ext::refine_ext(kind, &mut source, offset, size);
@@ -1018,6 +1167,7 @@ impl Carver {
                 report.bytes_written += size;
                 let (tier, evidence, confidence) =
                     evidence_for(CarveRole::Whole, kind, notes.is_empty(), choice.source);
+                let evidence = with_suspect(evidence, partial_encryption);
                 report.files.push(CarvedFile {
                     offset,
                     kind,
@@ -1030,6 +1180,7 @@ impl Carver {
                     duplicates: Vec::new(),
                     corrupted_offset,
                     entropy_spike_at,
+                    partial_encryption,
                     ext: choice.ext.to_string(),
                     ext_source: choice.source.to_string(),
                     role: CarveRole::Whole,
@@ -1139,6 +1290,14 @@ impl Carver {
                         return false;
                     }
                 };
+                let partial_encryption =
+                    match periodic_encryption_scan(&mut source, tail.start, size) {
+                        Ok(hint) => hint,
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    };
                 covered.push((tail.start, tail.end));
                 if let Some(&index) = by_hash.get(&sha256) {
                     report.duplicates += 1;
@@ -1179,6 +1338,7 @@ impl Carver {
                 report.bytes_written += size;
                 let (tier, evidence, confidence) =
                     evidence_for(CarveRole::Tail, kind, false, "kind");
+                let evidence = with_suspect(evidence, partial_encryption);
                 report.files.push(CarvedFile {
                     offset: tail.start,
                     kind,
@@ -1191,6 +1351,7 @@ impl Carver {
                     duplicates: Vec::new(),
                     corrupted_offset: Some(tail.start),
                     entropy_spike_at: tail.spike,
+                    partial_encryption,
                     ext: kind.default_ext().to_string(),
                     ext_source: "kind".to_string(),
                     role: CarveRole::Tail,
@@ -1321,6 +1482,7 @@ impl Carver {
                 duplicates: Vec::new(),
                 corrupted_offset: None,
                 entropy_spike_at: None,
+                partial_encryption: None,
                 ext: CarveKind::Text.default_ext().to_string(),
                 ext_source: "kind".to_string(),
                 role: CarveRole::Whole,
@@ -1419,6 +1581,7 @@ impl Carver {
                     }
                     None => None,
                 };
+                let partial_encryption = periodic_encryption_scan(&mut source, at, size)?;
                 let notes = format!(
                     "bin:region 0x{at:x}-0x{end:x}; entropy {entropy:.2} bits/byte; unclassified (compressed, encrypted or packed)"
                 );
@@ -1426,6 +1589,7 @@ impl Carver {
                 report.bytes_written += size;
                 let (tier, evidence, confidence) =
                     evidence_for(CarveRole::Whole, CarveKind::Bin, false, "kind");
+                let evidence = with_suspect(evidence, partial_encryption);
                 report.files.push(CarvedFile {
                     offset: at,
                     kind: CarveKind::Bin,
@@ -1438,6 +1602,7 @@ impl Carver {
                     duplicates: Vec::new(),
                     corrupted_offset: None,
                     entropy_spike_at: None,
+                    partial_encryption,
                     ext: CarveKind::Bin.default_ext().to_string(),
                     ext_source: "kind".to_string(),
                     role: CarveRole::Whole,
@@ -6516,6 +6681,51 @@ mod tests {
     }
 
     #[test]
+    fn a_bmp_with_a_periodic_encrypted_payload_is_labelled_suspected_partial_encryption() {
+        // A BMP whose pixel region repeats 3 zero windows + 1 high-entropy
+        // window (1:3 duty cycle) - the signature of file-system encryption
+        // that keeps every 4th 4 KiB block. The header is padded to exactly
+        // one window so the 4 KiB scan windows line up with the cycle.
+        let mut bmp = Vec::new();
+        let pixel_bytes = 64 * SPIKE_WINDOW; // 256 KiB
+        let size = 4096 + pixel_bytes;
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(size as u32).to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        bmp.extend_from_slice(&4096u32.to_le_bytes()); // data offset
+        bmp.extend_from_slice(&40u32.to_le_bytes()); // DIB header
+        bmp.extend_from_slice(&2i32.to_le_bytes()); // width
+        bmp.extend_from_slice(&2i32.to_le_bytes()); // height
+        bmp.extend_from_slice(&[1, 0]); // planes
+        bmp.extend_from_slice(&24u16.to_le_bytes()); // bpp
+        bmp.extend_from_slice(&[0u8; 24]); // colour table size + rest of DIB
+        bmp.resize(4096, 0);
+        for window in 0..16usize {
+            bmp.extend_from_slice(&vec![0u8; SPIKE_WINDOW * 3]);
+            bmp.extend_from_slice(&pseudo_random(SPIKE_WINDOW, 0x1234_5678 + window as u64));
+        }
+        assert_eq!(bmp.len(), size as usize);
+
+        let path = write_dump("periodic-bmp", &bmp);
+        let report = Carver::new(CarveOptions::default())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.kind, CarveKind::Bmp);
+        assert!(file.complete, "{file:?}");
+        let hint = file
+            .partial_encryption
+            .expect("the 1:3 cycle must be detected");
+        assert_eq!(hint.period, 16_384); // 4 windows * 4 KiB
+        assert!(hint.duty > 0.2 && hint.duty < 0.3, "duty {}", hint.duty);
+        assert!(file.evidence.contains(&"suspected-partial-encryption"));
+        assert_eq!(hint.threshold, SPIKE_HIGH);
+    }
+
+    #[test]
     fn bmp_requires_a_consistent_header() {
         // A real 2x2 24-bit BMP.
         let mut bmp = Vec::new();
@@ -7604,6 +7814,7 @@ mod evidence_tests {
             duplicates: Vec::new(),
             corrupted_offset: None,
             entropy_spike_at: None,
+            partial_encryption: None,
             ext: ext.to_string(),
             ext_source: "kind".to_string(),
             role,
@@ -7653,6 +7864,81 @@ mod evidence_tests {
         assert_eq!(CarveConfidence::High.as_str(), "high");
         assert_eq!(CarveConfidence::Medium.as_str(), "medium");
         assert_eq!(CarveConfidence::Low.as_str(), "low");
+    }
+
+    #[test]
+    fn periodic_encryption_hint_is_attached_to_evidence() {
+        let evidence = with_suspect(
+            vec!["magic"],
+            Some(PartialEncryption {
+                period: 16_384,
+                duty: 0.25,
+                threshold: 7.8,
+            }),
+        );
+        assert_eq!(evidence, ["magic", "suspected-partial-encryption"]);
+        assert_eq!(with_suspect(vec!["magic"], None), ["magic"]);
+    }
+
+    #[test]
+    fn periodic_high_cycle_is_detected_at_the_right_period() {
+        // 1 of every 4 windows is high entropy, 64 windows (16 cycles),
+        // starting at residue 3.
+        let mut mask = vec![false; 64];
+        for index in (3..64).step_by(4) {
+            mask[index] = true;
+        }
+        let (period, duty) = detect_periodic_high(&mask).expect("1:3 cycle detected");
+        assert_eq!(period, 16_384); // 4 windows * 4 KiB
+        assert!((duty - 16.0 / 64.0).abs() < 1e-9);
+
+        // Period 2 (every other window), 32 windows = 16 cycles.
+        let mut mask = vec![false; 32];
+        for index in (0..32).step_by(2) {
+            mask[index] = true;
+        }
+        let (period, duty) = detect_periodic_high(&mask).expect("1:1 cycle detected");
+        assert_eq!(period, 8_192);
+        assert!((duty - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn uniformly_high_or_low_data_is_not_partial_encryption() {
+        // All random, no structure: not *partial*.
+        assert_eq!(detect_periodic_high(&[true; 64]), None);
+        // All structured: no high-entropy phase at all.
+        assert_eq!(detect_periodic_high(&[false; 64]), None);
+        // 9 of 10 windows high (uniform encryption / compression) but the
+        // trailing window varies: still uniform-ish, not *partial*.
+        let mut mask = vec![true; 64];
+        mask[1] = false;
+        mask[33] = false;
+        mask[49] = false; // 61/64 = 95% high overall
+        assert_eq!(detect_periodic_high(&mask), None);
+        // Fewer than 3 high windows: nothing to find.
+        let mut mask = vec![false; 64];
+        mask[0] = true;
+        mask[17] = true;
+        assert_eq!(detect_periodic_high(&mask), None);
+        // Not enough windows for 8 full cycles of any period.
+        assert_eq!(detect_periodic_high(&vec![true, false, true, false]), None);
+        // No bucket reaches the 80% hot threshold for any period:
+        // high windows at scattered indices with no common residue class.
+        let mut mask = vec![false; 64];
+        for index in [0usize, 7, 23, 41] {
+            mask[index] = true;
+        }
+        assert_eq!(detect_periodic_high(&mask), None);
+    }
+
+    #[test]
+    fn phase_where_one_bucket_is_hot_and_the_rest_are_cold_is_detected() {
+        // 3 cold, 1 hot buckets, but the hot phase starts at residue 2.
+        let mut mask = vec![false; 64];
+        for index in (2..64).step_by(4) {
+            mask[index] = true;
+        }
+        assert!(detect_periodic_high(&mask).is_some());
     }
 
     #[test]

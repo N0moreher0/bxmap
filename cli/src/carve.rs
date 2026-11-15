@@ -10,6 +10,18 @@ fn json_opt_u64(value: Option<u64>) -> String {
     }
 }
 
+/// `suspected-partial-encryption` object for the index, or `null`.
+/// Heuristic only (ROADMAP 8.7.3): compressed data also scores high entropy.
+fn json_partial_encryption(hint: Option<bxmap::carve::PartialEncryption>) -> String {
+    match hint {
+        Some(hint) => format!(
+            "{{\"period\":{},\"duty\":{:.4},\"threshold\":{:.1}}}",
+            hint.period, hint.duty, hint.threshold
+        ),
+        None => "null".to_string(),
+    }
+}
+
 pub fn write_carve_index(report: &CarveReport, path: &str) -> io::Result<()> {
     let ndjson = path.to_ascii_lowercase().ends_with(".ndjson");
     let mut out = BufWriter::new(File::create(path)?);
@@ -42,7 +54,7 @@ pub fn write_carve_index(report: &CarveReport, path: &str) -> io::Result<()> {
             .collect::<Vec<_>>()
             .join(",");
         let record = format!(
-            "{{\"offset\":{},\"offset_hex\":\"{:#x}\",\"type\":\"{}\",\"size\":{},\"sha256\":\"{}\",\"entropy\":{:.4},\"complete\":{},\"corrupted_offset\":{},\"entropy_spike_at\":{},\"notes\":{},\"path\":{},\"duplicates\":[{}],\"file_name\":{},\"ext\":{},\"ext_source\":{},\"role\":\"{}\",\"tier\":{},\"evidence\":[{}],\"confidence\":\"{}\"}}",
+            "{{\"offset\":{},\"offset_hex\":\"{:#x}\",\"type\":\"{}\",\"size\":{},\"sha256\":\"{}\",\"entropy\":{:.4},\"complete\":{},\"corrupted_offset\":{},\"entropy_spike_at\":{},\"partial_encryption\":{},\"notes\":{},\"path\":{},\"duplicates\":[{}],\"file_name\":{},\"ext\":{},\"ext_source\":{},\"role\":\"{}\",\"tier\":{},\"evidence\":[{}],\"confidence\":\"{}\"}}",
             file.offset,
             file.offset,
             file.kind.as_str(),
@@ -52,6 +64,7 @@ pub fn write_carve_index(report: &CarveReport, path: &str) -> io::Result<()> {
             file.complete,
             json_opt_u64(file.corrupted_offset),
             json_opt_u64(file.entropy_spike_at),
+            json_partial_encryption(file.partial_encryption),
             json_escape(&file.notes),
             match file.path.as_ref() {
                 Some(path) => json_escape(&path.to_string_lossy()),
