@@ -6035,6 +6035,47 @@ mod tests {
         std::fs::remove_dir_all(&out).ok();
     }
 
+    /// ROADMAP 8.10.8: with the new `{offset}-{kind}-{sha8}.{ext}.carved`
+    /// names, a file already sitting at the target name is refused and left
+    /// exactly as it was; nothing else is written into that directory.
+    #[test]
+    fn existing_file_at_the_target_name_is_refused_and_untouched() {
+        let png = png_bytes(b"refuse-me");
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&png);
+        dump.extend_from_slice(&[0u8; 64]);
+        let path = write_dump("refuse", &dump);
+
+        // First run learns the canonical name.
+        let first = temp_dir("refuse-first");
+        let report = Carver::new(CarveOptions::default())
+            .carve_to_dir(path.to_str().unwrap(), &first)
+            .unwrap();
+        let name = report.files[0]
+            .path
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_owned();
+        assert!(name.to_string_lossy().ends_with(".png.carved"), "{name:?}");
+
+        // Second directory already holds something at that exact name.
+        let second = temp_dir("refuse-second");
+        let sentinel = b"do not clobber me".to_vec();
+        std::fs::write(second.join(&name), &sentinel).unwrap();
+        let err = Carver::new(CarveOptions::default())
+            .carve_to_dir(path.to_str().unwrap(), &second)
+            .expect_err("must refuse to overwrite");
+        assert!(err.to_string().contains("refusing to overwrite"), "{err}");
+        assert_eq!(std::fs::read(second.join(&name)).unwrap(), sentinel);
+        assert_eq!(std::fs::read_dir(&second).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&first).ok();
+        std::fs::remove_dir_all(&second).ok();
+    }
+
     #[test]
     fn truncated_png_is_kept_but_marked_incomplete() {
         let mut png = png_bytes(b"payload");
@@ -7078,6 +7119,121 @@ mod naming_tests {
     fn reassembled_files_use_the_extension_and_no_hash() {
         let name = carved_file_name(0x1000, CarveKind::Pdf, CarveRole::Reassembled, "");
         assert_eq!(name, "00001000-pdf-reassembled.pdf.carved");
+    }
+
+    /// ROADMAP 8.10.9: the static table covers every one of the 41 kinds and
+    /// each kind keeps the extension users expect.
+    #[test]
+    fn default_ext_table_covers_all_41_kinds() {
+        use CarveKind::*;
+        let expected: [(CarveKind, &str); 41] = [
+            (Jpeg, "jpg"),
+            (Png, "png"),
+            (Zip, "zip"),
+            (Rar4, "rar"),
+            (Rar5, "rar"),
+            (SevenZip, "7z"),
+            (Pdf, "pdf"),
+            (Gzip, "gz"),
+            (Bmp, "bmp"),
+            (Sqlite, "sqlite"),
+            (Ole, "ole"),
+            (Mp4, "mp4"),
+            (Pe, "exe"),
+            (Elf, "elf"),
+            (Gif, "gif"),
+            (Ico, "ico"),
+            (Tar, "tar"),
+            (Pcap, "pcap"),
+            (Pcapng, "pcapng"),
+            (Lnk, "lnk"),
+            (Wasm, "wasm"),
+            (Dex, "dex"),
+            (Kdbx, "kdbx"),
+            (Pem, "pem"),
+            (Avi, "avi"),
+            (Wav, "wav"),
+            (Webp, "webp"),
+            (Mkv, "mkv"),
+            (Webm, "webm"),
+            (Ogg, "ogg"),
+            (Opus, "opus"),
+            (Flac, "flac"),
+            (Mp3, "mp3"),
+            (Tiff, "tif"),
+            (Vdi, "vdi"),
+            (Vmdk, "vmdk"),
+            (Bz2, "bz2"),
+            (Xz, "xz"),
+            (Class, "class"),
+            (Rtf, "rtf"),
+            (Evtx, "evtx"),
+        ];
+        assert_eq!(CarveKind::ALL.len(), 41);
+        for (kind, ext) in expected {
+            assert_eq!(kind.default_ext(), ext, "{kind:?}");
+            assert!(CarveKind::ALL.contains(&kind), "{kind:?} missing from ALL");
+        }
+        // Only the two RAR generations share an extension.
+        let mut exts: Vec<&str> = CarveKind::ALL.iter().map(|k| k.default_ext()).collect();
+        exts.sort_unstable();
+        exts.dedup();
+        assert_eq!(exts.len(), 40);
+        assert_eq!(CarveKind::Text.default_ext(), "txt");
+        assert_eq!(CarveKind::Bin.default_ext(), "bin");
+    }
+
+    /// An extension that is not `[a-z0-9]{1,8}` never reaches the file name.
+    #[test]
+    fn hostile_or_malformed_ext_falls_back_to_the_kind_default() {
+        for ext in [
+            "", "../x", "..", "DOCX", "docx.exe", "123456789", "a b", "é", "doc\0", "a/b", "a\\b",
+            "c:", " ",
+        ] {
+            let name = carved_file_name_with_ext(1, CarveKind::Zip, ext, CarveRole::Whole, SHA);
+            assert_eq!(name, "00000001-zip-9f3c1e2a.zip.carved", "{ext:?}");
+        }
+        let name = carved_file_name_with_ext(1, CarveKind::Zip, "docx", CarveRole::Whole, SHA);
+        assert_eq!(name, "00000001-zip-9f3c1e2a.docx.carved");
+        let name = carved_file_name_with_ext(1, CarveKind::Zip, "..", CarveRole::Tail, SHA);
+        assert_eq!(name, "00000001-zip-9f3c1e2a.zip.tail.carved");
+    }
+
+    /// Names start with a hex digit and only use `[a-z0-9.-]`, so they can
+    /// never be a Windows device name (`CON`, `NUL`, `COM1`...), end in a dot
+    /// or space, hide a `..`, and stay far below 255 bytes even at the
+    /// largest offset.
+    #[test]
+    fn names_are_never_reserved_windows_names_or_too_long() {
+        const RESERVED: [&str; 8] = ["con", "prn", "aux", "nul", "clock$", "conin$", "conout$", "com1"];
+        let mut kinds: Vec<CarveKind> = CarveKind::ALL.to_vec();
+        kinds.push(CarveKind::Text);
+        kinds.push(CarveKind::Bin);
+        let sha = "e".repeat(64);
+        for kind in kinds {
+            for role in [CarveRole::Whole, CarveRole::Tail, CarveRole::Reassembled] {
+                for offset in [0u64, 0xc0de, u64::MAX] {
+                    let name = carved_file_name(offset, kind, role, &sha);
+                    assert!(name.len() <= 100, "{name}");
+                    assert!(name.as_bytes()[0].is_ascii_hexdigit(), "{name}");
+                    assert!(
+                        name.bytes().all(|b| {
+                            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'
+                        }),
+                        "{name}"
+                    );
+                    assert!(!name.contains(".."), "{name}");
+                    assert!(!name.ends_with('.') && !name.ends_with(' '), "{name}");
+                    // Windows reserves the part before the first dot.
+                    let stem = name.split('.').next().unwrap();
+                    assert!(!RESERVED.contains(&stem), "{name}");
+                    assert!(
+                        !(stem.starts_with("com") || stem.starts_with("lpt")),
+                        "{name}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
