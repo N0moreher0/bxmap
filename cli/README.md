@@ -167,11 +167,15 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   `7z`, `gzip`, `bz2`, `xz`, `tar`, `pdf`, `rtf`, `ole`, `sqlite`, `pe`, `elf`,
   `class`, `dex`, `wasm`, `lnk`, `evtx`, `pcap`, `pcapng`, `kdbx`, `pem`, `mp4`,
   `avi`, `wav`, `mkv`, `webm`, `ogg`, `opus`, `flac`, `mp3`, `vdi`, `vmdk`, `all`,
-  `text` (comma-separated). `text` recovers plaintext (notes, logs, Markdown,
+  `text`, `bin` (comma-separated). `text` recovers plaintext (notes, logs, Markdown,
   source dumps) by content rather than by magic; it is not part of `all` - ask
   for it with `--carve text` or `--carve all,text`. Its boundaries are a
   heuristic, so recovered text lands in `partial/` with `complete: false` and
-  a `text:region` note (region offsets, newline-cut, content sniff). Aliases: `rar` (both RAR versions), `jpg` (jpeg), `7zip`
+  a `text:region` note (region offsets, newline-cut, content sniff). `bin` recovers unclassified high-entropy runs
+  (compressed, encrypted or packed data that no other type claimed, 16 KiB or
+  more) the same opt-in way (`--carve bin` or `--carve all,bin`): each run
+  lands in `partial/` as `...bin.carved` with `complete: false`, `tier` 3 and
+  `entropy` evidence, split into `--carve-max-size` pieces. Aliases: `rar` (both RAR versions), `jpg` (jpeg), `7zip`
   (7z), `office`/`ms-office` (ole), `exe`/`executable` (pe), and file extensions
   that share a container: `docx`/`xlsx`/`pptx`/`odt`/`ods`/`jar`/`apk` (zip),
   `doc`/`xls`/`ppt`/`msi`/`msg` (ole), `dll`/`sys` (pe), `so` (elf),

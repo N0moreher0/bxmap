@@ -6,6 +6,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `--carve bin`: new opt-in carve of unclassified high-entropy data
+  (compressed, encrypted or packed regions no other type claimed). `Bin` is
+  a `CarveKind` that is NOT in `CarveKind::ALL`: `--carve all` is unchanged;
+  ask for it with `--carve bin` (or `all,bin`). It runs after the text pass:
+  4 KiB blocks at or above the entropy threshold (7.2 bits/byte) are merged
+  into runs, already-carved ranges are subtracted and runs under 16 KiB are
+  dropped. Each run is written to `partial/` as
+  `{offset:08x}-bin-{sha8}.bin.carved` (split into `--carve-max-size`
+  pieces) with `complete: false`, `tier` 3, `evidence` `["entropy"]`,
+  `confidence` `low` and a `bin:region` note. Dedupe and the
+  `--carve-max-files`/`--carve-max-total` caps apply. Nothing is decrypted.
 - Carve index: every record now also has `file_name`, `ext`, `ext_source`,
   `role` (`whole|tail|reassembled`), `tier` (1 = structure validated to the
   terminator, 2 = incomplete header or footer-found tail, 3 = readable text),

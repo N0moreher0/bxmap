@@ -2057,11 +2057,89 @@ fn golden_carve_recovers_a_pdf_tail_after_partial_encryption() {
     assert!(records.contains("\"tier\":2"), "{records}");
     assert!(records.contains("\"evidence\":[\"footer\"]"), "{records}");
     assert!(records.contains("\"confidence\":\"low\""), "{records}");
-    assert!(records.contains(".pdf.tail.carved\""), "{records}");    assert!(records.contains("\"complete\":false"), "{records}");
+    assert!(records.contains(".pdf.tail.carved\""), "{records}");
+    assert!(records.contains("\"complete\":false"), "{records}");
     assert!(!records.contains("\"corrupted_offset\":null"), "{records}");
     let carved = dir.path().join("dump.bin.bxmap").join("carved");
     let partial = std::fs::read_dir(carved.join("partial")).unwrap().count();
     assert_eq!(partial, 1, "the salvaged tail belongs in partial/");
+}
+
+#[test]
+fn golden_carve_bin_writes_unclassified_high_entropy_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    // 32 KiB of high-entropy bytes with no magic and no footer, between
+    // zero padding: the shape of an unidentified compressed/encrypted blob.
+    let blob = high_entropy_bytes(32768);
+    let mut dump = vec![0u8; 0x4000];
+    let blob_offset = dump.len();
+    dump.extend_from_slice(&blob);
+    dump.extend_from_slice(&vec![0u8; 0x4000]);
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let index = dir.path().join("bin.ndjson");
+
+    let run = |carve: &str, index: &std::path::Path| {
+        Command::new(bin_path())
+            .args([
+                path.to_str().unwrap(),
+                "--carve",
+                carve,
+                "--carve-index",
+                index.to_str().unwrap(),
+                "--max-strings",
+                "0",
+                "--no-progress",
+                "--report",
+                "none",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    // `all` does not include bin: the same dump carves nothing.
+    let none_index = dir.path().join("none.ndjson");
+    let output = run("all", &none_index);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let none = std::fs::read_to_string(&none_index).unwrap_or_default();
+    assert_eq!(none.lines().count(), 0, "{none}");
+
+    let output = run("bin", &index);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let carved = dir.path().join("dump.bin.bxmap").join("carved");
+    let names = std::fs::read_dir(carved.join("partial"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].ends_with(".bin.carved"), "{names:?}");
+    assert!(names[0].starts_with("00004000-bin-"), "{names:?}");
+    let written = std::fs::read(carved.join("partial").join(&names[0])).unwrap();
+    assert_eq!(written, blob, "the carved file must be byte-identical");
+
+    let records = std::fs::read_to_string(&index).unwrap();
+    assert_eq!(records.lines().count(), 1, "{records}");
+    assert!(records.contains("\"type\":\"bin\""), "{records}");
+    assert!(records.contains("\"ext\":\"bin\""), "{records}");
+    assert!(records.contains("\"role\":\"whole\""), "{records}");
+    assert!(records.contains("\"tier\":3"), "{records}");
+    assert!(records.contains("\"evidence\":[\"entropy\"]"), "{records}");
+    assert!(records.contains("\"confidence\":\"low\""), "{records}");
+    assert!(records.contains("\"complete\":false"), "{records}");
+    assert!(records.contains("bin:region"), "{records}");
+    assert!(
+        records.contains(&format!("\"offset\":{blob_offset}")),
+        "{records}"
+    );
 }
 
 // ---------------------------------------------------------------------------

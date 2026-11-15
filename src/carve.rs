@@ -74,6 +74,10 @@ const TEXT_BLOCK_RATIO: f64 = 0.97;
 const TEXT_BRIDGE_BLOCKS: u64 = 1;
 /// Smallest region the text pass emits. Below this it is noise, not evidence.
 const TEXT_MIN_REGION: u64 = 2048;
+/// Block size of the `--carve bin` pass: one entropy score per block.
+const BIN_BLOCK: usize = 4096;
+/// Smallest unclassified high-entropy run worth writing (4 blocks).
+const BIN_MIN_REGION: u64 = 16 * 1024;
 
 /// Which piece of a file a carved output holds. It decides the file-name
 /// suffix so a name never promises more than the bytes deliver.
@@ -141,6 +145,9 @@ fn evidence_for(
         ),
         CarveRole::Whole if kind == CarveKind::Text => {
             (3, vec!["text_ratio"], CarveConfidence::Low)
+        }
+        CarveRole::Whole if kind == CarveKind::Bin => {
+            (3, vec!["entropy"], CarveConfidence::Low)
         }
         CarveRole::Whole if complete => {
             let mut evidence = vec!["magic", "structure_ok", "terminator_ok"];
@@ -253,6 +260,11 @@ pub enum CarveKind {
     /// text pass finds it by content and it is **not** part of
     /// [`CarveKind::ALL`]: ask for it with `--carve text` (or `all,text`).
     Text,
+    /// Unclassified high-entropy data (compressed, encrypted or packed) that
+    /// no other kind claimed. It has no magic number either, so the bin pass
+    /// finds it by entropy and it is **not** part of [`CarveKind::ALL`]: ask
+    /// for it with `--carve bin` (or `all,bin`).
+    Bin,
 }
 
 impl CarveKind {
@@ -301,6 +313,7 @@ impl CarveKind {
             CarveKind::Rtf => "rtf",
             CarveKind::Evtx => "evtx",
             CarveKind::Text => "text",
+            CarveKind::Bin => "bin",
         }
     }
 
@@ -353,6 +366,7 @@ impl CarveKind {
             CarveKind::Rtf => "rtf",
             CarveKind::Evtx => "evtx",
             CarveKind::Text => "txt",
+            CarveKind::Bin => "bin",
         }
     }
 
@@ -447,6 +461,7 @@ impl CarveKind {
             "rtf" => Some(CarveKind::Rtf),
             "evtx" => Some(CarveKind::Evtx),
             "text" | "txt" => Some(CarveKind::Text),
+            "bin" => Some(CarveKind::Bin),
             _ => None,
         }
     }
@@ -933,6 +948,9 @@ impl Carver {
         if self.options.kinds.contains(&CarveKind::Text) {
             self.text_pass(dump_path, out_dir, file_len, &mut report)?;
         }
+        if self.options.kinds.contains(&CarveKind::Bin) {
+            self.bin_pass(dump_path, out_dir, file_len, &mut report)?;
+        }
         Ok(report)
     }
 
@@ -1203,6 +1221,121 @@ impl Carver {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Fourth pass behind `--carve bin` (it runs only when [`CarveKind::Bin`]
+    /// is in the wanted kinds, after the text pass): cut out runs of
+    /// high-entropy blocks that no carved file already covers. They have no
+    /// structure to check, so each is `complete: false`, tier 3 with the
+    /// `entropy` evidence, written to `partial/` as `...bin.carved`. A run
+    /// longer than `max_size` is split into `max_size` pieces; dedupe and the
+    /// `max_files`/`max_total` caps match the other passes. Nothing is
+    /// decrypted or repaired.
+    fn bin_pass(
+        &self,
+        dump_path: &str,
+        out_dir: Option<&Path>,
+        file_len: u64,
+        report: &mut CarveReport,
+    ) -> io::Result<()> {
+        // A header pass that already hit a cap must not be extended.
+        if report.truncated {
+            return Ok(());
+        }
+        let mut by_hash: HashMap<String, usize> = HashMap::new();
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        for (index, file) in report.files.iter().enumerate() {
+            by_hash.insert(file.sha256.clone(), index);
+            covered.push((file.offset, file.offset + file.size));
+            for &duplicate in &file.duplicates {
+                covered.push((duplicate, duplicate + file.size));
+            }
+        }
+        let mut source = File::open(dump_path)?;
+        let max_chunk = if self.options.max_size == 0 {
+            u64::MAX
+        } else {
+            self.options.max_size
+        };
+        let min_region = self.options.min_size.max(1).max(BIN_MIN_REGION);
+
+        'regions: for (region_start, region_end) in bin_regions(&mut source, file_len, &covered)? {
+            let mut start = region_start;
+            while start < region_end {
+                let end = region_end.min(start.saturating_add(max_chunk));
+                let at = start;
+                start = end;
+                let size = end - at;
+                if size < min_region {
+                    continue;
+                }
+                let (sha256, entropy) = digest_region(&mut source, at, size)?;
+                if let Some(&index) = by_hash.get(&sha256) {
+                    report.duplicates += 1;
+                    report.duplicate_bytes += size;
+                    report.files[index].duplicates.push(at);
+                    continue;
+                }
+                let path = match out_dir {
+                    Some(dir) => {
+                        // Unclassified data has no structure to vouch for it,
+                        // so it always goes beside the other partial files.
+                        let partial = dir.join("partial");
+                        std::fs::create_dir_all(&partial)?;
+                        let name = carved_file_name(at, CarveKind::Bin, CarveRole::Whole, &sha256);
+                        let path = partial.join(name);
+                        if path.exists() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                format!(
+                                    "refusing to overwrite '{}'; use a fresh --carve-out",
+                                    path.display()
+                                ),
+                            ));
+                        }
+                        write_region(&mut source, at, size, &path)?;
+                        Some(path)
+                    }
+                    None => None,
+                };
+                let notes = format!(
+                    "bin:region 0x{at:x}-0x{end:x}; entropy {entropy:.2} bits/byte; unclassified (compressed, encrypted or packed)"
+                );
+                by_hash.insert(sha256.clone(), report.files.len());
+                report.bytes_written += size;
+                let (tier, evidence, confidence) =
+                    evidence_for(CarveRole::Whole, CarveKind::Bin, false, "kind");
+                report.files.push(CarvedFile {
+                    offset: at,
+                    kind: CarveKind::Bin,
+                    size,
+                    complete: false,
+                    sha256,
+                    entropy,
+                    notes,
+                    path,
+                    duplicates: Vec::new(),
+                    corrupted_offset: None,
+                    entropy_spike_at: None,
+                    ext: CarveKind::Bin.default_ext().to_string(),
+                    ext_source: "kind".to_string(),
+                    role: CarveRole::Whole,
+                    tier,
+                    evidence,
+                    confidence,
+                });
+
+                if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
+                    report.truncated = true;
+                    break 'regions;
+                }
+                if self.options.max_total != 0 && report.bytes_written >= self.options.max_total {
+                    report.truncated = true;
+                    break 'regions;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Collect carve fragments without writing them, optionally mapping each
@@ -1922,6 +2055,64 @@ fn text_regions(
     Ok(out)
 }
 
+/// Absolute offsets of the unclassified high-entropy runs in `file`: runs of
+/// consecutive full [`BIN_BLOCK`] blocks whose Shannon entropy is at least
+/// [`crate::ENTROPY_DEFAULT_THRESHOLD`], with already-covered ranges
+/// subtracted and pieces under [`BIN_MIN_REGION`] dropped. Streams the file
+/// once; no block list is held in memory.
+fn bin_regions(
+    file: &mut File,
+    file_len: u64,
+    covered: &[(u64, u64)],
+) -> io::Result<Vec<(u64, u64)>> {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut current: Option<(u64, u64)> = None;
+    file.seek(SeekFrom::Start(0))?;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut abs = 0u64;
+    loop {
+        let mut filled = 0usize;
+        while filled < buffer.len() {
+            let read = file.read(&mut buffer[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+        for block in buffer[..filled].chunks(BIN_BLOCK) {
+            let high = block.len() == BIN_BLOCK
+                && crate::shannon_entropy(block) >= crate::ENTROPY_DEFAULT_THRESHOLD;
+            let end = abs + block.len() as u64;
+            if high {
+                match current.as_mut() {
+                    Some(run) => run.1 = end,
+                    None => current = Some((abs, end)),
+                }
+            } else if let Some(run) = current.take() {
+                runs.push(run);
+            }
+            abs = end;
+        }
+    }
+    if let Some(run) = current.take() {
+        runs.push(run);
+    }
+    debug_assert!(abs <= file_len);
+
+    let mut out = Vec::new();
+    for run in runs {
+        for piece in subtract_covered(run, covered) {
+            if piece.1 - piece.0 >= BIN_MIN_REGION {
+                out.push(piece);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Byte-level refine of one grid piece: walk to the true edges over ASCII
 /// text, drop the fragments of the first and last line (the cut usually
 /// lands mid-line) and apply [`TEXT_MIN_REGION`]. Covered ranges are
@@ -2304,6 +2495,7 @@ fn validate(kind: CarveKind, file: &mut File, offset: u64, end: u64) -> io::Resu
         CarveKind::Rtf => carve_rtf(&mut source)?,
         CarveKind::Evtx => carve_evtx(&mut source)?,
         CarveKind::Text => Verdict::Invalid("text has no header; it is found by the text pass".to_string()),
+        CarveKind::Bin => Verdict::Invalid("bin has no header; it is found by the bin pass".to_string()),
     };
     Ok((verdict, source.produced()))
 }
@@ -6027,6 +6219,109 @@ mod tests {
         );
         assert!(CarveKind::from_list("xyz").is_err());
         assert!(CarveKind::from_list("").is_err());
+    }
+
+    #[test]
+    fn bin_pass_cuts_the_high_entropy_run_and_skips_text_and_zeros() {
+        let mut dump = vec![0u8; 0x4000];
+        dump.extend_from_slice(&pseudo_random(0x10000, 0x5eed_0000_0000_0001));
+        dump.extend_from_slice(&md_text(4));
+        dump.extend_from_slice(&vec![0u8; 0x2000]);
+        let path = write_dump("bin-basic", &dump);
+        let out = path.parent().unwrap().join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Bin],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .carve_to_dir(path.to_str().unwrap(), &out)
+            .unwrap();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.kind, CarveKind::Bin);
+        assert_eq!(file.offset, 0x4000);
+        assert_eq!(file.size, 0x10000);
+        assert!(!file.complete);
+        assert!(file.entropy > 7.5, "{file:?}");
+        assert!(file.notes.starts_with("bin:region"), "{file:?}");
+        assert_eq!(file.ext, "bin");
+        assert_eq!(file.role, CarveRole::Whole);
+        assert_eq!(file.tier, 3);
+        assert_eq!(file.evidence, vec!["entropy"]);
+        assert_eq!(file.confidence.as_str(), "low");
+
+        let on_disk = file.path.as_ref().expect("written to disk");
+        let name = on_disk.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with(".bin.carved"), "{name}");
+        assert!(name.starts_with("00004000-bin-"), "{name}");
+        assert_eq!(on_disk.parent().unwrap().file_name().unwrap(), "partial");
+        assert_eq!(std::fs::read(on_disk).unwrap(), dump[0x4000..0x14000]);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn bin_pass_ignores_runs_below_the_minimum_region() {
+        let mut dump = vec![0u8; 0x4000];
+        dump.extend_from_slice(&pseudo_random(0x2000, 0x5eed_0000_0000_0002));
+        dump.extend_from_slice(&vec![0u8; 0x4000]);
+        let path = write_dump("bin-small", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Bin],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(report.files.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn bin_pass_splits_a_run_longer_than_max_size() {
+        let dump = pseudo_random(0x30000, 0x5eed_0000_0000_0003);
+        let path = write_dump("bin-split", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Bin],
+            min_size: 0,
+            max_size: 0x10000,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        let offsets: Vec<u64> = report.files.iter().map(|file| file.offset).collect();
+        assert_eq!(offsets, vec![0, 0x10000, 0x20000], "{report:?}");
+        assert!(report.files.iter().all(|file| file.size == 0x10000));
+    }
+
+    #[test]
+    fn bin_pass_is_opt_in_and_all_does_not_include_it() {
+        assert!(!CarveKind::ALL.contains(&CarveKind::Bin));
+        assert_eq!(
+            CarveKind::from_list("all").unwrap(),
+            CarveKind::ALL.to_vec()
+        );
+        assert!(CarveKind::from_list("bin").unwrap().contains(&CarveKind::Bin));
+        assert!(CarveKind::from_list("all,bin").unwrap().contains(&CarveKind::Bin));
+        assert_eq!(CarveKind::Bin.default_ext(), "bin");
+
+        let dump = pseudo_random(0x20000, 0x5eed_0000_0000_0004);
+        let path = write_dump("bin-optin", &dump);
+        let report = Carver::new(CarveOptions {
+            kinds: CarveKind::ALL.to_vec(),
+            min_size: 0,
+            ..Default::default()
+        })
+        .scan(path.to_str().unwrap())
+        .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(
+            report.files.iter().all(|file| file.kind != CarveKind::Bin),
+            "{report:?}"
+        );
     }
 
     /// Block-aligned deterministic text fixture: `blocks` blocks of 64-byte
