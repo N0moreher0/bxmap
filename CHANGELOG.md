@@ -290,6 +290,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   opt-in for library callers. Carved files keep the `.carved` extension.
 
 ### Fixed
+- `--carve ole`: the OLE validator read the sector-size power at offset
+  0x1C (the byte-order mark `0xFFFE`) instead of 0x1E, so it rejected every
+  real `.doc`/`.xls`/`.ppt`/`.msi` with `implausible OLE sector size`. Fixed;
+  the test fixture used the same wrong offset and is corrected too. Verified
+  on a real installer (`msi`, `sniff:ole/msi`).
 - `--carve png`: a PNG whose chunk CRC (or chunk length) is damaged after the
   header — e.g. partial encryption or overwrite of the middle/tail — is no
   longer dropped. The chunks that verified are kept, the file ends right before

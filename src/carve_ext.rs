@@ -801,6 +801,21 @@ mod tests {
         }
     }
 
+    /// Manual check against a real installer:
+    /// `BXMAP_REAL_MSI=path\to\file.msi cargo test --lib real_msi -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_msi_is_recognised() {
+        let Ok(path) = std::env::var("BXMAP_REAL_MSI") else {
+            return;
+        };
+        let mut f = std::fs::File::open(&path).unwrap();
+        let len = f.metadata().unwrap().len();
+        let got = refine_ext(CarveKind::Ole, &mut f, 0, len);
+        println!("{path}: {} ({})", got.ext, got.source);
+        assert_eq!((got.ext, got.source), ("msi", "sniff:ole/msi"));
+    }
+
     #[test]
     fn kinds_without_a_rule_keep_their_default() {
         assert_eq!(pick(CarveKind::Png, b"\x89PNG\r\n\x1a\n"), ("png", "kind"));

@@ -3097,7 +3097,7 @@ const MAX_MP4_BOXES: usize = 1000;
 fn carve_ole(source: &mut Source<'_>) -> io::Result<Verdict> {
     // OLE Compound File Binary Format (.doc, .xls, .ppt pre-2007).
     // Signature: D0 CF 11 E0 A1 B1 1A E1.
-    let Some(header) = peek_array::<30>(source)? else {
+    let Some(header) = peek_array::<32>(source)? else {
         return Ok(Verdict::Truncated(
             "dump ended inside the OLE header".to_string(),
         ));
@@ -3105,9 +3105,10 @@ fn carve_ole(source: &mut Source<'_>) -> io::Result<Verdict> {
     if &header[0..8] != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" {
         return Ok(Verdict::Invalid("missing OLE signature".to_string()));
     }
-    // Sector size is stored as a power of two at offset 0x1C (2 bytes LE);
-    // real values are 9 (512 bytes) or 12 (4096 bytes).
-    let sector_pow = u16::from_le_bytes([header[28], header[29]]) as u64;
+    // Sector size is stored as a power of two at offset 0x1E (2 bytes LE);
+    // real values are 9 (512 bytes) or 12 (4096 bytes). Offset 0x1C holds the
+    // byte-order mark (0xFFFE), so reading there rejects every real file.
+    let sector_pow = u16::from_le_bytes([header[30], header[31]]) as u64;
     if !(9..=12).contains(&(sector_pow as i32)) {
         return Ok(Verdict::Invalid(format!(
             "implausible OLE sector size 2^{sector_pow}"
@@ -5749,8 +5750,9 @@ mod tests {
         // OLE Compound File Binary Format header: D0 CF 11 E0 A1 B1 1A E1.
         let mut ole = Vec::new();
         ole.extend_from_slice(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1");
-        // sector size power = 9 (512 bytes) at offset 0x1C (20 bytes after the 8-byte signature)
+        // byte-order mark 0xFFFE at 0x1C, then sector size power = 9 (512 bytes) at 0x1E
         ole.extend_from_slice(&[0u8; 20]);
+        ole.extend_from_slice(&0xFFFEu16.to_le_bytes());
         ole.extend_from_slice(&9u16.to_le_bytes());
         ole.extend_from_slice(&vec![0u8; 512]);
 
