@@ -96,7 +96,28 @@ pub enum CarveRole {
 /// other surprises. A salvaged tail gets `.tail` (`...png.tail.carved`) and a
 /// reassembled file replaces the hash with `reassembled`.
 pub fn carved_file_name(offset: u64, kind: CarveKind, role: CarveRole, sha256: &str) -> String {
-    let ext = kind.default_ext();
+    carved_file_name_with_ext(offset, kind, kind.default_ext(), role, sha256)
+}
+
+/// Like [`carved_file_name`] but with an extension already refined by the
+/// content sniff. An `ext` outside `[a-z0-9]{1,8}` is ignored in favour of
+/// the kind's default, so a name can never carry anything unexpected.
+pub fn carved_file_name_with_ext(
+    offset: u64,
+    kind: CarveKind,
+    ext: &str,
+    role: CarveRole,
+    sha256: &str,
+) -> String {
+    let ext = if (1..=8).contains(&ext.len())
+        && ext
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        ext
+    } else {
+        kind.default_ext()
+    };
     let kind_id = kind.as_str();
     match role {
         CarveRole::Whole => {
@@ -468,6 +489,12 @@ pub struct CarvedFile {
     /// encrypted region begins. Heuristic only (compressed data looks the
     /// same). `None` for complete files or when no such jump exists.
     pub entropy_spike_at: Option<u64>,
+    /// Extension carried before `.carved`: the kind's default, or a more
+    /// specific one proven by the content sniff (ROADMAP 8.10.3).
+    pub ext: String,
+    /// Why `ext` was chosen: `kind`, `sniff:<rule>` or `fallback` (the sniff
+    /// could not read enough structure, so the default stays).
+    pub ext_source: String,
 }
 
 /// Result of one carving pass.
@@ -715,9 +742,18 @@ impl Carver {
                 } else {
                     None
                 };
+                // Refine the extension from the bytes just validated (bounded
+                // reads inside this region, no extra pass over the dump).
+                let choice = crate::carve_ext::refine_ext(kind, &mut source, offset, size);
                 let path = match out_dir {
                     Some(dir) => {
-                        let name = carved_file_name(offset, kind, CarveRole::Whole, &sha256);
+                        let name = carved_file_name_with_ext(
+                            offset,
+                            kind,
+                            choice.ext,
+                            CarveRole::Whole,
+                            &sha256,
+                        );
                         let target_dir = if incomplete && self.incomplete_dir {
                             let partial = dir.join("partial");
                             if let Err(error) = std::fs::create_dir_all(&partial) {
@@ -761,6 +797,8 @@ impl Carver {
                     duplicates: Vec::new(),
                     corrupted_offset,
                     entropy_spike_at,
+                    ext: choice.ext.to_string(),
+                    ext_source: choice.source.to_string(),
                 });
                 covered_end = offset + size;
 
@@ -903,6 +941,8 @@ impl Carver {
                     duplicates: Vec::new(),
                     corrupted_offset: Some(tail.start),
                     entropy_spike_at: tail.spike,
+                    ext: kind.default_ext().to_string(),
+                    ext_source: "kind".to_string(),
                 });
 
                 if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
@@ -1026,6 +1066,8 @@ impl Carver {
                 duplicates: Vec::new(),
                 corrupted_offset: None,
                 entropy_spike_at: None,
+                ext: CarveKind::Text.default_ext().to_string(),
+                ext_source: "kind".to_string(),
             });
 
             if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
@@ -5378,6 +5420,59 @@ mod tests {
         assert_eq!(report.files[1].size, jpeg.len() as u64);
         assert!(report.files[1].complete);
         assert_eq!(report.complete_count(), 2);
+    }
+
+    #[test]
+    fn sniffed_extensions_reach_file_names_and_the_report() {
+        // ODF text document: stored `mimetype` entry first.
+        let odt = zip_bytes("mimetype", b"application/vnd.oasis.opendocument.text");
+        // Same minimal PE as `carves_pe_executable`, with IMAGE_FILE_DLL set.
+        let mut pe = Vec::new();
+        pe.extend_from_slice(b"MZ");
+        pe.extend_from_slice(&[0u8; 0x3a]);
+        pe.extend_from_slice(&0x40u32.to_le_bytes());
+        pe.extend_from_slice(b"PE\0\0");
+        pe.extend_from_slice(&[0u8; 64]);
+        pe[0x40 + 22 + 1] = 0x20; // Characteristics 0x2000
+
+        let mut dump = vec![0u8; 64];
+        let odt_at = dump.len() as u64;
+        dump.extend_from_slice(&odt);
+        dump.extend_from_slice(&[0u8; 64]);
+        let pe_at = dump.len() as u64;
+        dump.extend_from_slice(&pe);
+        dump.extend_from_slice(&[0u8; 64]);
+
+        let path = write_dump("sniff-names", &dump);
+        let out = temp_dir("sniff-names-out");
+        let report = Carver::new(CarveOptions::default())
+            .carve_to_dir(path.to_str().unwrap(), &out)
+            .unwrap();
+
+        let odt_file = report.files.iter().find(|f| f.offset == odt_at).unwrap();
+        assert_eq!(
+            (odt_file.ext.as_str(), odt_file.ext_source.as_str()),
+            ("odt", "sniff:zip/odf-text")
+        );
+        let name = odt_file.path.as_ref().unwrap().file_name().unwrap().to_string_lossy();
+        assert!(name.ends_with(".odt.carved"), "{name}");
+        // The bytes are untouched: only the name changed.
+        assert_eq!(std::fs::read(odt_file.path.as_ref().unwrap()).unwrap(), odt);
+
+        let pe_file = report.files.iter().find(|f| f.offset == pe_at).unwrap();
+        assert_eq!(
+            (pe_file.ext.as_str(), pe_file.ext_source.as_str()),
+            ("dll", "sniff:pe/dll")
+        );
+        let name = pe_file.path.as_ref().unwrap().file_name().unwrap().to_string_lossy();
+        assert!(name.ends_with(".dll.carved"), "{name}");
+        // The PE validator reads past the headers (size is not exact), so the
+        // file may carry trailing padding: it must still start with the PE.
+        let written = std::fs::read(pe_file.path.as_ref().unwrap()).unwrap();
+        assert!(written.starts_with(&pe));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&out).ok();
     }
 
     #[test]

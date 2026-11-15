@@ -239,6 +239,11 @@ salvaged tail without its header is `.{ext}.tail.carved`. `.carved` is always th
 extension so a double-click cannot open or run the file; to use one, remove the trailing
 `.carved` yourself, inside an isolated environment.
 
+When the content proves a more specific type, the extension is refined: a ZIP holding Word parts
+becomes `.docx.carved`, a PE with the DLL flag `.dll.carved`, and so on (`xlsx`, `pptx`, `odt`,
+`ods`, `odp`, `apk`, `jar`, `doc`, `xls`, `ppt`, `msg`, `msi`, `sys`, `m4a`, `mov`, `so`). Without
+proof the default stays (`.zip.carved`, `.ole.carved`, `.exe.carved`). The bytes are never changed.
+
 ### Binary signature scanning (`--signature`)
 
 - `--signature magic` — report executable/document magic-byte signatures

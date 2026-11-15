@@ -53,6 +53,7 @@
 //! what's certainly noise" spirit.
 pub mod artifacts;
 pub mod carve;
+mod carve_ext;
 pub mod chunk;
 pub mod classifier;
 pub use classifier::{
