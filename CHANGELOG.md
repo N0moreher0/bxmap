@@ -214,6 +214,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Raw key bytes are never surfaced and nothing is decrypted.
 
 ### Changed
+
+- **`--carve` file names now keep the format's own extension before `.carved`**: `0001a2b0-zip-9f3c1e2a.zip.carved`, `…-pe-….exe.carved`, `…-jpeg-….jpg.carved`; plaintext from `--carve text` is `….txt.carved`; a footer-first salvaged tail is `….png.tail.carved` (head missing, will not open directly); reassembled files are `…-reassembled.<ext>.carved`. `.carved` stays last so nothing auto-opens or runs. The extension comes from a static per-kind table (`CarveKind::default_ext`), never from file contents; one `carved_file_name()` builds every name. Scripts that parse names should read `path` from the index instead.
 - `--carve` no longer takes a `salvage` token: the parameter selects file
   types only, never a technique. Every carve runs the full recovery stack —
   header-first, incomplete-candidate `partial/` layout and footer-first

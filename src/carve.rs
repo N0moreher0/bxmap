@@ -9,7 +9,8 @@
 //!
 //! Scope is deliberately narrow (see `ROADMAP.md`): carve structured files,
 //! never decrypt, never crack a password, never execute what was carved. Output
-//! files get the neutral `.carved` extension so nothing auto-opens them.
+//! files get the neutral `.carved` extension (after the format's own one, e.g.
+//! `.docx.carved`) so nothing auto-opens them.
 //!
 //! Signatures live in [`crate::magic::SIGNATURES`] so `--signature magic` and
 //! `--carve` cannot drift apart; BMP and OLE are carve-only entries whose
@@ -73,6 +74,46 @@ const TEXT_BLOCK_RATIO: f64 = 0.97;
 const TEXT_BRIDGE_BLOCKS: u64 = 1;
 /// Smallest region the text pass emits. Below this it is noise, not evidence.
 const TEXT_MIN_REGION: u64 = 2048;
+
+/// Which piece of a file a carved output holds. It decides the file-name
+/// suffix so a name never promises more than the bytes deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarveRole {
+    /// Bytes starting at the file's own header.
+    Whole,
+    /// Footer-first salvage: the tail of a file whose head is gone, so it will
+    /// not open directly.
+    Tail,
+    /// Fragments stitched together by `reassemble_fragments`.
+    Reassembled,
+}
+
+/// Builds the one canonical output name: `{offset:08x}-{kind}-{sha8}.{ext}.carved`.
+///
+/// `.carved` is always the last extension so nothing auto-opens or runs the
+/// file; `ext` comes only from the static [`CarveKind::default_ext`] table,
+/// never from file contents, so the name cannot carry path separators or
+/// other surprises. A salvaged tail gets `.tail` (`...png.tail.carved`) and a
+/// reassembled file replaces the hash with `reassembled`.
+pub fn carved_file_name(offset: u64, kind: CarveKind, role: CarveRole, sha256: &str) -> String {
+    let ext = kind.default_ext();
+    let kind_id = kind.as_str();
+    match role {
+        CarveRole::Whole => {
+            format!("{offset:08x}-{kind_id}-{}.{ext}.carved", short_hash(sha256))
+        }
+        CarveRole::Tail => {
+            format!("{offset:08x}-{kind_id}-{}.{ext}.tail.carved", short_hash(sha256))
+        }
+        CarveRole::Reassembled => {
+            format!("{offset:08x}-{kind_id}-reassembled.{ext}.carved")
+        }
+    }
+}
+
+fn short_hash(sha256: &str) -> &str {
+    &sha256[..8.min(sha256.len())]
+}
 
 /// A format the carver understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -170,6 +211,58 @@ impl CarveKind {
             CarveKind::Rtf => "rtf",
             CarveKind::Evtx => "evtx",
             CarveKind::Text => "text",
+        }
+    }
+
+    /// Extension a carved file of this kind carries before `.carved`.
+    ///
+    /// Static whitelist (`[a-z0-9]{1,8}`): it is the format's usual name, not
+    /// something read from the carved bytes. `Pe` defaults to `exe`; telling
+    /// `dll`/`sys` apart needs the content sniff planned in ROADMAP 8.10.3.
+    /// Plaintext is always `txt`: its real kind is only a hint in the index.
+    pub fn default_ext(self) -> &'static str {
+        match self {
+            CarveKind::Jpeg => "jpg",
+            CarveKind::Png => "png",
+            CarveKind::Zip => "zip",
+            CarveKind::Rar4 | CarveKind::Rar5 => "rar",
+            CarveKind::SevenZip => "7z",
+            CarveKind::Pdf => "pdf",
+            CarveKind::Gzip => "gz",
+            CarveKind::Bmp => "bmp",
+            CarveKind::Sqlite => "sqlite",
+            CarveKind::Ole => "ole",
+            CarveKind::Mp4 => "mp4",
+            CarveKind::Pe => "exe",
+            CarveKind::Elf => "elf",
+            CarveKind::Gif => "gif",
+            CarveKind::Ico => "ico",
+            CarveKind::Tar => "tar",
+            CarveKind::Pcap => "pcap",
+            CarveKind::Pcapng => "pcapng",
+            CarveKind::Lnk => "lnk",
+            CarveKind::Wasm => "wasm",
+            CarveKind::Dex => "dex",
+            CarveKind::Kdbx => "kdbx",
+            CarveKind::Pem => "pem",
+            CarveKind::Avi => "avi",
+            CarveKind::Wav => "wav",
+            CarveKind::Webp => "webp",
+            CarveKind::Mkv => "mkv",
+            CarveKind::Webm => "webm",
+            CarveKind::Ogg => "ogg",
+            CarveKind::Opus => "opus",
+            CarveKind::Flac => "flac",
+            CarveKind::Mp3 => "mp3",
+            CarveKind::Tiff => "tif",
+            CarveKind::Vdi => "vdi",
+            CarveKind::Vmdk => "vmdk",
+            CarveKind::Bz2 => "bz2",
+            CarveKind::Xz => "xz",
+            CarveKind::Class => "class",
+            CarveKind::Rtf => "rtf",
+            CarveKind::Evtx => "evtx",
+            CarveKind::Text => "txt",
         }
     }
 
@@ -624,11 +717,7 @@ impl Carver {
                 };
                 let path = match out_dir {
                     Some(dir) => {
-                        let name = format!(
-                            "{offset:08x}-{}-{}.carved",
-                            kind.as_str(),
-                            &sha256[..8.min(sha256.len())]
-                        );
+                        let name = carved_file_name(offset, kind, CarveRole::Whole, &sha256);
                         let target_dir = if incomplete && self.incomplete_dir {
                             let partial = dir.join("partial");
                             if let Err(error) = std::fs::create_dir_all(&partial) {
@@ -780,12 +869,7 @@ impl Carver {
                             failure = Some(error);
                             return false;
                         }
-                        let name = format!(
-                            "{:08x}-{}-{}.carved",
-                            tail.start,
-                            kind.as_str(),
-                            &sha256[..8.min(sha256.len())]
-                        );
+                        let name = carved_file_name(tail.start, kind, CarveRole::Tail, &sha256);
                         let path = partial.join(name);
                         if path.exists() {
                             failure = Some(io::Error::new(
@@ -900,12 +984,8 @@ impl Carver {
                         failure = Some(error);
                         break;
                     }
-                    let name = format!(
-                        "{:08x}-{}-{}.carved",
-                        start,
-                        CarveKind::Text.as_str(),
-                        &sha256[..8.min(sha256.len())]
-                    );
+                    let name =
+                        carved_file_name(start, CarveKind::Text, CarveRole::Whole, &sha256);
                     let path = partial.join(name);
                     if path.exists() {
                         failure = Some(io::Error::new(
@@ -1074,7 +1154,7 @@ pub struct ReassemblyReport {
 /// Fragments are grouped by kind, sorted by VA (or file offset when no VA is
 /// known), and merged when their VA ranges are adjacent (within one 4 KiB
 /// page to tolerate small capture gaps). Each merged group is written as one
-/// `.carved` file named `{va:08x}-{kind}-reassembled.carved`.
+/// `.carved` file named `{va:08x}-{kind}-reassembled.{ext}.carved`.
 pub fn reassemble_fragments(
     fragments: &[CarveFragment],
     dump_path: &str,
@@ -1129,7 +1209,7 @@ pub fn reassemble_fragments(
             let total_size: u64 = group.iter().map(|f| f.size).sum();
             let complete = group.iter().all(|f| f.complete);
 
-            let name = format!("{va_start:08x}-{}-reassembled.carved", kind.as_str());
+            let name = carved_file_name(va_start, kind, CarveRole::Reassembled, "");
             let path = out_dir.join(name);
             if path.exists() {
                 return Err(io::Error::new(
@@ -6234,5 +6314,69 @@ mod new_formats {
         assert_eq!(CarveKind::from_list("docx").unwrap(), vec![CarveKind::Zip]);
         assert_eq!(CarveKind::from_list("msi").unwrap(), vec![CarveKind::Ole]);
         assert_eq!(CarveKind::from_list("db").unwrap(), vec![CarveKind::Sqlite]);
+    }
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+
+    const SHA: &str = "9f3c1e2a77aa00bb11cc22dd33ee44ff";
+
+    #[test]
+    fn whole_file_name_keeps_the_original_extension_before_carved() {
+        let name = carved_file_name(0x1a2b0, CarveKind::Zip, CarveRole::Whole, SHA);
+        assert_eq!(name, "0001a2b0-zip-9f3c1e2a.zip.carved");
+        let name = carved_file_name(0x4f0000, CarveKind::Pe, CarveRole::Whole, SHA);
+        assert_eq!(name, "004f0000-pe-9f3c1e2a.exe.carved");
+        let name = carved_file_name(0, CarveKind::Jpeg, CarveRole::Whole, SHA);
+        assert_eq!(name, "00000000-jpeg-9f3c1e2a.jpg.carved");
+    }
+
+    #[test]
+    fn plaintext_without_evidence_is_txt_carved() {
+        let name = carved_file_name(0x2bc7c, CarveKind::Text, CarveRole::Whole, SHA);
+        assert_eq!(name, "0002bc7c-text-9f3c1e2a.txt.carved");
+    }
+
+    #[test]
+    fn a_salvaged_tail_says_so_in_its_name() {
+        let name = carved_file_name(0x9000, CarveKind::Png, CarveRole::Tail, SHA);
+        assert_eq!(name, "00009000-png-9f3c1e2a.png.tail.carved");
+    }
+
+    #[test]
+    fn reassembled_files_use_the_extension_and_no_hash() {
+        let name = carved_file_name(0x1000, CarveKind::Pdf, CarveRole::Reassembled, "");
+        assert_eq!(name, "00001000-pdf-reassembled.pdf.carved");
+    }
+
+    #[test]
+    fn short_or_empty_hash_never_panics() {
+        let name = carved_file_name(1, CarveKind::Gif, CarveRole::Whole, "ab");
+        assert_eq!(name, "00000001-gif-ab.gif.carved");
+        let name = carved_file_name(1, CarveKind::Gif, CarveRole::Whole, "");
+        assert_eq!(name, "00000001-gif-.gif.carved");
+    }
+
+    #[test]
+    fn every_kind_has_a_safe_whitelisted_extension_and_ends_in_carved() {
+        let mut kinds: Vec<CarveKind> = CarveKind::ALL.to_vec();
+        kinds.push(CarveKind::Text);
+        for kind in kinds {
+            let ext = kind.default_ext();
+            assert!(
+                (1..=8).contains(&ext.len())
+                    && ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+                "{kind:?}: bad extension {ext:?}"
+            );
+            for role in [CarveRole::Whole, CarveRole::Tail, CarveRole::Reassembled] {
+                let name = carved_file_name(0xdead_beef, kind, role, SHA);
+                assert!(name.ends_with(".carved"), "{name}");
+                assert!(name.contains(&format!(".{ext}.")), "{name}");
+                assert!(!name.contains(['/', '\\', ':']), "{name}");
+                assert!(name.len() < 100, "{name}");
+            }
+        }
     }
 }

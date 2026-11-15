@@ -1688,6 +1688,15 @@ fn golden_carve_new_formats_gif_and_lnk() {
     };
     assert_eq!(read_kind("-gif-"), gif, "carved GIF must be byte-identical");
     assert_eq!(read_kind("-lnk-"), lnk, "carved LNK must be byte-identical");
+
+    // Tên file: đuôi gốc rồi mới tới `.carved` (ROADMAP 8.10).
+    let names = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(names.iter().any(|n| n.contains("-gif-") && n.ends_with(".gif.carved")), "{names:?}");
+    assert!(names.iter().any(|n| n.contains("-lnk-") && n.ends_with(".lnk.carved")), "{names:?}");
 }
 
 #[test]

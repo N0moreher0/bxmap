@@ -233,6 +233,12 @@ They may contain malicious code, exploits, or encrypted payloads. Treat every
 `.carved` file as untrusted: inspect in a sandbox/VM, never open on a host
 machine, and do not execute them.
 
+Carved files are named `{offset}-{kind}-{sha8}.{ext}.carved` (for example
+`0001a2b0-zip-9f3c1e2a.zip.carved`, `…exe.carved`); plaintext is `.txt.carved`, and a
+salvaged tail without its header is `.{ext}.tail.carved`. `.carved` is always the last
+extension so a double-click cannot open or run the file; to use one, remove the trailing
+`.carved` yourself, inside an isolated environment.
+
 ### Binary signature scanning (`--signature`)
 
 - `--signature magic` — report executable/document magic-byte signatures
