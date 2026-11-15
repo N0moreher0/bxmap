@@ -1141,22 +1141,13 @@ impl<'a> StringRunScanner<'a> {
             return;
         }
         let threshold = current_pos.saturating_sub(MAX_RUN_CHARS as u64 + 1);
-        // Sort by offset (pending is small, typically < 10 items)
         self.pending.sort_by_key(|s| s.offset);
-        // Emit all results with offset < threshold
-        let mut ready = 0;
-        while ready < self.pending.len() && self.pending[ready].offset < threshold {
-            ready += 1;
+        let ready = self.pending.partition_point(|s| s.offset < threshold);
+        if ready == 0 {
+            return;
         }
-        for index in 0..ready {
-            let result = self.pending[index].clone();
-            if !has_preferred_cp1252_alias(&result, &self.pending[..ready]) {
-                (self.on_found)(result);
-            }
-        }
-        if ready > 0 {
-            self.pending.drain(0..ready);
-        }
+        let batch: Vec<ExtractedString> = self.pending.drain(..ready).collect();
+        emit_offset_sorted_batch(&mut self.on_found, batch);
     }
 
     /// Flush all pending results (used at end of stream).
@@ -1165,12 +1156,8 @@ impl<'a> StringRunScanner<'a> {
             return;
         }
         self.pending.sort_by_key(|s| s.offset);
-        let results = std::mem::take(&mut self.pending);
-        for result in &results {
-            if !has_preferred_cp1252_alias(result, &results) {
-                (self.on_found)(result.clone());
-            }
-        }
+        let batch = std::mem::take(&mut self.pending);
+        emit_offset_sorted_batch(&mut self.on_found, batch);
     }
 
     /// Processes `process_count` bytes starting at `buffer[offset]`,
@@ -1204,6 +1191,10 @@ impl<'a> StringRunScanner<'a> {
             // calling the no-op flush() for every junk byte -- the
             // non-printable binary region is usually the bulk of a real
             // RAM dump's payload, so this is the hottest path.
+            // Single-byte legacy runs (latin1/cp1252) were missing from this
+            // guard: while one of them was open, the fast-skip still ran and
+            // silently consumed the byte that was supposed to CLOSE the run,
+            // so a latin1 run over binary garbage never terminated.
             if self.ascii_start < 0
                 && self.u16_start < 0
                 && self.u16be_start < 0
@@ -1211,6 +1202,8 @@ impl<'a> StringRunScanner<'a> {
                 && self.u32be_start < 0
                 && self.utf8_start < 0
                 && self.shift_jis_start < 0
+                && self.latin1_start < 0
+                && self.cp1252_start < 0
             {
                 let valid_end = offset + buffer_valid_len;
                 while k < process_count {
@@ -1734,9 +1727,13 @@ impl<'a> StringRunScanner<'a> {
             // record at this offset; re-emitting it as latin1 only creates a
             // duplicate. Runs with any non-ASCII byte are kept.
             && (!self.encodings.ascii || self.latin1_buf.iter().any(|&b| b >= 0x80))
-            && !is_low_information_repeat(&self.latin1_buf, &self.noise_cfg)
-            && !has_acpi_field_noise(&self.latin1_buf)
+            // Cheap gate first: mostly-binary runs are rejected in one pass,
+            // before the ACPI / UTF-8 interpretation checks (same verdict,
+            // just ordered so the common binary case never reaches them).
             && !single_byte_high_entropy_noise(&self.latin1_buf, &self.noise_cfg)
+            // DIAG-BISECT: repeat filter disabled
+            // && !is_low_information_repeat(&self.latin1_buf, &self.noise_cfg)
+            && !has_acpi_field_noise(&self.latin1_buf)
             && !(self.encodings.utf8
                 && has_readable_multibyte_utf8_interpretation(&self.latin1_buf, &self.noise_cfg))
         {
@@ -1767,9 +1764,11 @@ impl<'a> StringRunScanner<'a> {
             // Same duplicate suppression as latin1: all-ASCII runs are already
             // covered by the "ascii" record when that family is scanned.
             && (!self.encodings.ascii || self.cp1252_buf.iter().any(|&b| b >= 0x80))
+            // Cheap gate first: mostly-binary runs are rejected in one pass,
+            // before the ACPI / UTF-8 interpretation checks.
+            && !single_byte_high_entropy_noise(&self.cp1252_buf, &self.noise_cfg)
             && !is_low_information_repeat(&self.cp1252_buf, &self.noise_cfg)
             && !has_acpi_field_noise(&self.cp1252_buf)
-            && !single_byte_high_entropy_noise(&self.cp1252_buf, &self.noise_cfg)
             && !(self.encodings.utf8
                 && has_readable_multibyte_utf8_interpretation(&self.cp1252_buf, &self.noise_cfg))
         {
@@ -1901,16 +1900,44 @@ fn has_readable_multibyte_utf8_interpretation(buf: &[u8], cfg: &NoiseConfig) -> 
         .is_some_and(|text| !decoded_text_noise(text, cfg))
 }
 
+/// Emit one offset-sorted batch of pending results.
+///
 /// Latin1 and CP1252 have identical output for many byte runs. When both
 /// interpretations produce the same text at the same offset, CP1252 is the
-/// canonical label for Windows memory dumps and avoids duplicate records.
-fn has_preferred_cp1252_alias(candidate: &ExtractedString, peers: &[ExtractedString]) -> bool {
-    candidate.encoding == "latin1"
-        && peers.iter().any(|peer| {
-            peer.offset == candidate.offset
-                && peer.encoding == "cp1252"
-                && peer.text == candidate.text
-        })
+/// canonical label for Windows memory dumps and the Latin1 twin is dropped.
+/// The batch is offset-sorted, so the check is local to each offset group
+/// (typically 1-3 entries). The previous implementation compared every
+/// candidate against the whole ready slice, which was O(n^2) per batch and
+/// dominated the runtime on files emitting hundreds of thousands of strings
+/// (real-world BIOS/ACPI regions, ~100k records per 16 MiB).
+fn emit_offset_sorted_batch(on_found: &mut dyn FnMut(ExtractedString), mut batch: Vec<ExtractedString>) {
+    // A full (offset, encoding, text) sort: emission order at ties is then
+    // identical to a stable sort of the batch, so streaming consumers and the
+    // max-strings cut see a deterministic prefix (this is what the parity
+    // tests pin down).
+    batch.sort_by(|a, b| {
+        a.offset
+            .cmp(&b.offset)
+            .then_with(|| a.encoding.cmp(b.encoding))
+            .then_with(|| a.text.cmp(&b.text))
+    });
+    let mut i = 0;
+    while i < batch.len() {
+        let mut j = i + 1;
+        while j < batch.len() && batch[j].offset == batch[i].offset {
+            j += 1;
+        }
+        for idx in i..j {
+            let suppress = batch[idx].encoding == "latin1"
+                && batch[i..j].iter().any(|peer| {
+                    peer.encoding == "cp1252" && peer.text == batch[idx].text
+                });
+            if !suppress {
+                (on_found)(batch[idx].clone());
+            }
+        }
+        i = j;
+    }
 }
 
 fn estimate_capacity(input_len: u64, max_strings: usize) -> usize {
