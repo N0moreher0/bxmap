@@ -102,8 +102,8 @@ jobs:
           set -euo pipefail
           cargo install cargo-cyclonedx --locked
           cargo cyclonedx --format json
-          cp bom.json dist/sbom-bxmap.json
-          cp cli/bom.json dist/sbom-bxmap-cli.json
+          cp bxmap.cdx.json dist/sbom-bxmap.json
+          cp cli/bxmap-cli.cdx.json dist/sbom-bxmap-cli.json
           sha256sum dist/sbom-*.json >> dist/SHA256SUMS
 
       - name: Create GitHub release
