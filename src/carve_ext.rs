@@ -791,6 +791,117 @@ mod tests {
         }
     }
 
+    /// Cursor that remembers the span of bytes actually read, so a test can
+    /// prove a sniff never looks outside its region.
+    struct Spy {
+        inner: Cursor<Vec<u8>>,
+        lo: u64,
+        hi: u64,
+    }
+
+    impl Read for Spy {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let at = self.inner.position();
+            let n = self.inner.read(buf)?;
+            if n > 0 {
+                self.lo = self.lo.min(at);
+                self.hi = self.hi.max(at + n as u64);
+            }
+            Ok(n)
+        }
+    }
+
+    impl Seek for Spy {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// Extensions each kind may legally end up with.
+    fn allowed(kind: CarveKind) -> &'static [&'static str] {
+        match kind {
+            CarveKind::Pe => &["exe", "dll", "sys"],
+            CarveKind::Mp4 => &["mp4", "m4a", "mov"],
+            CarveKind::Zip => &["zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "apk", "jar"],
+            CarveKind::Ole => &["ole", "doc", "xls", "ppt", "msg", "msi"],
+            CarveKind::Elf => &["elf", "so"],
+            _ => &[],
+        }
+    }
+
+    /// Deterministic mutation sweep (B7, ROADMAP 8.10.9 "header-offset bugs"):
+    /// every valid fixture is truncated at every length and has each byte
+    /// overwritten with a few hostile values. The sniff must not panic, must
+    /// stay inside its region (also at a non-zero base with junk after it),
+    /// and may only return an extension its kind is allowed to have.
+    #[test]
+    fn mutated_fixtures_never_panic_leave_the_region_or_pick_a_foreign_extension() {
+        let fixtures: Vec<(CarveKind, Vec<u8>)> = vec![
+            (CarveKind::Pe, pe(0x2022, 2)),
+            (CarveKind::Pe, pe(0x0022, 1)),
+            (CarveKind::Mp4, mp4(b"M4A ")),
+            (CarveKind::Mp4, mp4(b"qt  ")),
+            (CarveKind::Zip, zip(&[("[Content_Types].xml", b"x"), ("word/document.xml", b"x")])),
+            (CarveKind::Zip, zip(&[("mimetype", b"application/vnd.oasis.opendocument.text")])),
+            (CarveKind::Zip, zip(&[("META-INF/MANIFEST.MF", b"x"), ("AndroidManifest.xml", b"x")])),
+            (CarveKind::Ole, ole(&["WordDocument"], false)),
+            (CarveKind::Ole, ole(&["\u{5}SummaryInformation", "\u{4840}\u{3a}x"], false)),
+            (CarveKind::Ole, ole(&["Workbook"], true)),
+            (CarveKind::Elf, elf64(3, 1)),
+        ];
+        const HOSTILE: [u8; 4] = [0x00, 0xFF, 0x80, 0x7F];
+        const BASE: u64 = 37;
+
+        let check = |kind: CarveKind, bytes: &[u8]| {
+            // Region at offset 0 and the same region inside a larger dump.
+            let mut dump = vec![0xA5u8; BASE as usize];
+            dump.extend_from_slice(bytes);
+            dump.extend_from_slice(&[0x5Au8; 4096]);
+            for (data, base) in [(bytes.to_vec(), 0u64), (dump, BASE)] {
+                let mut spy = Spy { inner: Cursor::new(data), lo: u64::MAX, hi: 0 };
+                let got = refine_ext(kind, &mut spy, base, bytes.len() as u64);
+                assert!(valid_ext(got.ext), "{kind:?}: {}", got.ext);
+                assert!(
+                    got.ext == kind.default_ext() || allowed(kind).contains(&got.ext),
+                    "{kind:?} -> {}",
+                    got.ext
+                );
+                assert!(
+                    got.source == "kind"
+                        || got.source == "fallback"
+                        || got.source.starts_with("sniff:"),
+                    "{kind:?}: {}",
+                    got.source
+                );
+                if spy.hi > 0 {
+                    assert!(spy.lo >= base, "{kind:?} read before the region ({})", spy.lo);
+                    assert!(
+                        spy.hi <= base + bytes.len() as u64,
+                        "{kind:?} read past the region ({})",
+                        spy.hi
+                    );
+                }
+            }
+        };
+
+        for (kind, original) in &fixtures {
+            check(*kind, original);
+            for cut in 0..original.len() {
+                check(*kind, &original[..cut]);
+            }
+            for pos in 0..original.len() {
+                for v in HOSTILE {
+                    if original[pos] == v {
+                        continue;
+                    }
+                    let mut m = original.clone();
+                    m[pos] = v;
+                    check(*kind, &m);
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_refined_extension_is_whitelisted() {
         for ext in [

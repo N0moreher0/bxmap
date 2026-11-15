@@ -1823,6 +1823,194 @@ fn golden_carve_exact_extension_filter_and_carved_alias() {
     }
 }
 
+/// Bitwise CRC-32 (IEEE), enough for tiny fixtures.
+fn golden_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// Stored-only ZIP with a real central directory: a minimal `.docx` shape.
+fn docx_fixture() -> Vec<u8> {
+    let entries: [(&str, &[u8]); 2] = [
+        ("[Content_Types].xml", b"<Types/>"),
+        ("word/document.xml", b"<w:document/>"),
+    ];
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in entries {
+        let offset = out.len() as u32;
+        let crc = golden_crc32(data);
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+
+        central.extend_from_slice(b"PK\x01\x02");
+        central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&[0u8; 12]);
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let central_offset = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+#[test]
+fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
+    // ROADMAP 8.10.9: docx + exe + jpg + plaintext in one dump. Each file is
+    // named `{offset}-{kind}-{sha8}.{ext}.carved` with the extension the
+    // content proves, and docx/jpg are byte-identical (exe keeps its zero overlay).
+    let dir = tempfile::tempdir().unwrap();
+    let docx = docx_fixture();
+    let exe = bare_pe_fixture(0);
+    let jpeg = jpeg_fixture(&vec![0x5au8; 300]);
+    let mut prose = Vec::new();
+    for i in 0..400u32 {
+        prose.extend_from_slice(
+            format!("line {i}: the quick brown fox jumps over the lazy dog {}\n", i * 7919)
+                .as_bytes(),
+        );
+    }
+
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut noise = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    };
+    let mut dump = noise(4096);
+    let docx_at = dump.len();
+    dump.extend_from_slice(&docx);
+    dump.extend_from_slice(&noise(4096));
+    let exe_at = dump.len();
+    dump.extend_from_slice(&exe);
+    // A header-only PE has no end marker: the carver keeps the overlay that
+    // follows it, so zeros here keep the carved bytes predictable.
+    dump.extend_from_slice(&vec![0u8; 4096]);
+    dump.extend_from_slice(&noise(4096));
+    let jpeg_at = dump.len();
+    dump.extend_from_slice(&jpeg);
+    dump.extend_from_slice(&noise(4096));
+    dump.extend_from_slice(&prose);
+    dump.extend_from_slice(&noise(4096));
+
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let out_dir = dir.path().join("carved");
+    let index = dir.path().join("index.ndjson");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "docx,exe,jpg,text",
+            "--carve-out",
+            out_dir.to_str().unwrap(),
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+
+    let names = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names.len(), 4, "{names:?}\n{stderr}");
+
+    let find = |ext: &str| {
+        let suffix = format!(".{ext}.carved");
+        let hits = names.iter().filter(|n| n.ends_with(&suffix)).collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1, "{ext}: {names:?}");
+        hits[0].clone()
+    };
+    for (ext, offset, original) in [
+        ("docx", docx_at, &docx),
+        ("exe", exe_at, &exe),
+        ("jpg", jpeg_at, &jpeg),
+    ] {
+        let name = find(ext);
+        assert!(name.starts_with(&format!("{offset:08x}-")), "{name}");
+        let carved = std::fs::read(out_dir.join(&name)).unwrap();
+        if ext == "exe" {
+            assert!(carved.starts_with(original), "exe must start with the original bytes");
+            assert!(carved[original.len()..].iter().all(|&b| b == 0), "exe overlay");
+        } else {
+            assert_eq!(&carved, original, "{ext} must be byte-identical");
+        }
+    }
+    // Plaintext is never `complete`, so it lands in `partial/`.
+    let partial = std::fs::read_dir(out_dir.join("partial"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(partial.len(), 1, "{partial:?}");
+    assert!(partial[0].contains("-text-") && partial[0].ends_with(".txt.carved"), "{partial:?}");
+
+    // Every name only uses the whitelist (hex, `-`, lowercase, dots).
+    for name in names.iter().filter(|n| n.as_str() != "partial").chain(partial.iter()) {
+        assert!(
+            name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'),
+            "{name}"
+        );
+        assert!(name.ends_with(".carved") && name.len() < 64, "{name}");
+    }
+
+    let records = std::fs::read_to_string(&index).unwrap();
+    let line_for = |ext: &str| {
+        records
+            .lines()
+            .find(|l| l.contains(&format!("\"ext\":\"{ext}\"")))
+            .unwrap_or_else(|| panic!("no index record for {ext}: {records}"))
+            .to_string()
+    };
+    let docx_line = line_for("docx");
+    assert!(docx_line.contains("\"ext_source\":\"sniff:zip/word\""), "{docx_line}");
+    assert!(docx_line.contains("\"tier\":1"), "{docx_line}");
+    assert!(docx_line.contains("\"complete\":true"), "{docx_line}");
+    let exe_line = line_for("exe");
+    assert!(exe_line.contains("\"ext_source\":\"kind\""), "{exe_line}");
+    assert!(line_for("jpg").contains("\"tier\":1"), "{records}");
+    assert!(line_for("txt").contains("\"complete\":false"), "{records}");
+}
+
 #[test]
 fn golden_carve_writes_validated_files_and_index() {
     let dir = tempfile::tempdir().unwrap();

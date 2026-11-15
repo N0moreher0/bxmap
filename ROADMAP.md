@@ -261,7 +261,7 @@ Thiết kế module (giữ đồng bộ với `bxmap::artifacts`):
 ### 8.3 Đầu ra và an toàn
 - [x] Index JSON/NDJSON: `offset`, `type`, `size`, `sha256`, `entropy`, `complete`, `notes`, đường dẫn file đã ghi.
 - [x] Dedupe theo SHA256; gom các bản trùng thành một dòng kèm danh sách offset.
-- [x] File ghi ra có đuôi trung tính (`.carved`), tên theo `offset-type-hash`; không mở, không chạy, không giải nén.
+- [x] File ghi ra có đuôi trung tính (`.carved`), tên theo `offset-type-hash`; không mở, không chạy, không giải nén. **(Quy tắc tên được 8.10 thay: `offset-type-hash.<ext>.carved`.)**
 - [x] Cảnh báo trong README: file carve có thể là mã độc, chỉ xem trong môi trường cô lập.
 - [x] `--carve-out` là **bắt buộc**: không có thư mục đích thì dừng với lỗi rõ ràng thay vì ghi vào cwd.
 - [x] Ghi đè an toàn: không ghi ra ngoài `--carve-out`, chống path traversal ở tên file, từ chối ghi đè file đã tồn tại.
@@ -313,7 +313,7 @@ Bối cảnh: ransomware kiểu Beast chỉ mã hoá xen kẽ (~25%, chu kỳ 1:
 **8.7.2 ghi chú thực hiện (đã xong, test: 3 unit `salvage_*` trong src/carve.rs, 3 unit args, 1 golden `golden_carve_salvage_recovers_a_pdf_tail_only_when_asked`)**
 - Thiết kế đổi so với kế hoạch: **không có cờ riêng**. `salvage` là tham số của `--carve` (`--carve salvage` = mọi định dạng + salvage; `--carve zip,pdf,salvage`), tự bật layout `partial/` như `--carve-incomplete`. API thư viện: `Carver::with_salvage(bool)`.
 - Phạm vi hiện tại chỉ **ZIP** (end record + central directory, kích thước lấy từ EOCD, kiểm `PK\x01\x02`) và **PDF** (`startxref <digits>` ngay trước `%%EOF`, lùi theo cửa sổ 4 KiB rồi cắt mịn qua các byte text cuối cửa sổ).
-- [ ] Hoãn: PNG `IEND`, JPEG `FF D9`, MP4 `moov` — footer yếu (false positive) hoặc body đã nén nên ranh giới entropy vô nghĩa; cần quy tắc dừng theo cấu trúc riêng trước khi thêm.
+- [ ] Hoãn (MP4 `moov` đã có thiết kế riêng ở 8.11, JPEG `FF D9` ở 8.12): PNG `IEND`, JPEG `FF D9`, MP4 `moov` — footer yếu (false positive) hoặc body đã nén nên ranh giới entropy vô nghĩa; cần quy tắc dừng theo cấu trúc riêng trước khi thêm.
 - Giới hạn đã biết: salvage chạy sau header-first và bỏ qua nếu header-first đã chạm trần (`truncated`); ranh giới PDF là heuristic (dữ liệu nén cũng có entropy cao).
 - [x] **PNG mất đầu (2026-11-15)**: footer-first salvage thêm PNG (`PNG_IEND` 12 byte cố định, `FOOTER_OVERLAP = 11`): đi lùi từ `IEND` qua các chunk `IDAT` liền kề có length + CRC đúng (`salvage_png_tail`, `png_previous_idat`), giữ dải đó vào `partial/` với note `salvage:tail: PNG IDAT run (N chunk(s)) + IEND at 0x...; signature and IHDR are missing`. Đo trên fixture 400x400 (503495 B) mã hoá 25% đầu: cứu 372419 B (6 chunk, đuôi trùng byte với bản gốc). File cứu được **không xem được trực tiếp** (mất signature, IHDR và zlib header); dựng lại IHDR từ filter byte là heuristic, chưa làm. Test: `salvage_recovers_the_idat_run_of_a_png_whose_head_is_gone`.
 
@@ -321,7 +321,7 @@ Bối cảnh: ransomware kiểu Beast chỉ mã hoá xen kẽ (~25%, chu kỳ 1:
 - [x] **Nguyên tắc**: `--carve` bare = chế độ khôi phục tối đa: mọi định dạng + mọi kỹ thuật (header-first, ứng viên hỏng/thiếu đuôi `partial/` 8.7.1, footer-first salvage 8.7.2). Nhãn `suspected-partial-encryption` (8.7.3) vẫn là việc riêng, chưa nằm trong `--carve`. File xuất ra giữ đuôi `.carved` (chốt: requirement `.carve` không đổi, giữ `.carved`).
 - [x] **Tham số chỉ chọn loại file** (`--carve zip,pdf`), tuyệt đối không chọn kỹ thuật: với loại đã chọn, toàn bộ kỹ thuật khôi phục luôn chạy. Token `salvage` đã gỡ khỏi parser (`cli/src/args.rs`): nó xuất hiện ở bất kỳ phần nào của danh sách loại đều báo lỗi rõ ràng; không thêm cờ chọn kỹ thuật.
 - [x] `partial/` luôn bật ở mọi lần chạy `--carve` (bare và có danh sách loại): `Carver::with_incomplete_dir(true)` + `with_salvage(true)` trong `cli/src/main.rs`; `--carve-incomplete` đã **gỡ hẳn** (chốt, không giữ alias deprecated).
-- [x] **Đuôi file** đã chốt: giữ `.carved` (code/README/test giữ nguyên, không đổi).
+- [x] **Đuôi file** đã chốt: giữ `.carved` (code/README/test giữ nguyên, không đổi). **Đảo lại ở 8.10 (2026-11-15)**: giữ đuôi gốc + `.carved` (`.docx.carved`, `.exe.carved`), không đoán được → `.txt.carved`.
 - [ ] **Ranh giới an toàn giữ nguyên**: "khôi phục" = cắt, ghép, gắn nhãn phần còn nguyên; không giải mã, không crack (đầu mục 8.7). Nếu muốn "mọi cách" bao gồm cả dùng khóa tìm được trong RAM để giải mã thì đây là quyết định phạm vi riêng, phải ghi riêng trước khi làm.
 - [ ] **8.7.4 (khóa trong RAM)** vẫn thuộc `--find-keys`/`--entropy`, chưa gộp vào `--carve` trừ khi chốt ở mục trên.
 - [ ] Trần an toàn (`--carve-max-size/-total/-files`) và exit code `3` vẫn áp dụng. Vì chế độ mặc định giờ nặng hơn (2 lượt quét + entropy): đo thời gian/RAM trên dump lớn và cảnh báo rõ khi chạm trần.
@@ -355,6 +355,248 @@ Bối cảnh: ransomware kiểu Beast chỉ mã hoá xen kẽ (~25%, chu kỳ 1:
 - **Tình trạng test (2026-11-15)**: `cargo test --workspace` xanh hết (lib 155 pass; golden 108 pass). Case **lnk** từng fail đã fix: validator và fixture đặt LinkCLSID sai chỗ (8..24 thay vì 4..20 theo spec `ShellLinkHeader`: HeaderSize@0, LinkCLSID@4..20, LinkFlags@0x14), nên `flags` ghi ở 0x14 còn đè lên 4 byte cuối của CLSID. Needle `L\0\0\0\x01\x14\x02\x00` vốn đã đúng. Thêm 2 golden CLI: `golden_carve_new_formats_gif_and_lnk` (gif+lnk, byte-identical) và `golden_carve_extension_alias_selects_the_container_kind` (`jpg` → type jpeg).
 - **Đã xong (2026-11-15)**: HELP (`cli/src/helpers.rs`), `cli/README.md`, `README.md` gốc, `CHANGELOG.md` Unreleased, golden CLI cho gif/lnk + alias. **Hiệu năng (2026-11-15, release build)**: `--carve all` (41 loại) trên Lab 6 (~1.5 GiB) xong phần carve trong ~5 giây (159 file, ~540 MB; png=3 zip=10 sqlite=1 pe=16 ico=54 lnk=1 mp3=74; 57091 header bị loại); `--carve png,zip,pe` cùng dump ~14 giây (chạy sau, có nhiễu cache/đĩa) → thêm loại không làm chậm đáng kể. Lưu ý: bước quét chuỗi chạy SAU carve nên lệnh tổng chạy lâu hơn nhiều (không phải do carve). **Còn lại (tuỳ chọn)**: golden cho thêm vài loại (tar/pcap/...). `--carve all` hiện mở rộng lên 41 loại.
 - Lưu ý git: working tree đang dở (WIP của chủ repo: salvage/incomplete + `cli/src/multi_scan.rs` + `carve-out/`...). Đã commit trên main ("feat(carve): multi-format carving (41 kinds)", gồm cả WIP multi_scan của chủ repo; chưa push); scratch logs đã dọn; `cargo fmt --check` vẫn fail ở các vùng WIP (không đụng). Snapshot `snap-20261115-002223-fd8c2e` có cả 8.8 (trước khi sửa LNK); `snap-20261114-231837-0e573e` chỉ cover 8.7.6.
+
+**8.9 Plaintext carve `--carve text` · XONG (code 2026-11-15; CHƯA commit)**
+- Quyết định 8.8 ("Text thuần không carve, không magic — việc của `--strings`") **đảo lại** theo chỉ đạo của chủ repo (2026-11-15): ưu tiên khôi phục dữ liệu **dùng được**; khi format không mở được thì xả plaintext sạch, lọc cặn, ghép dần. Hướng chốt = phương án A (opt-in): `Text` là `CarveKind` **không nằm trong `ALL`**; `--carve all` không đổi; gọi bằng `--carve text` hoặc `--carve all,text`.
+- Thiết kế (src/carve.rs): block 4 KiB chấm hạng = tỷ lệ byte thuộc "text token" ≥ 0.97 (ASCII in được + `\n \r \t` + form feed + UTF-8 chuẩn: không overlong/surrogate/C1 control/noncharacter); merge block liền kề, **cầu 1 block hỏng** bên trong run; refine biên về byte-exact qua walk ASCII; cắt dòng đầu/cuối bị cụt (ranh giới cắt giữa chừng); trừ các vùng đã carveed (overlap → cắt, piece đủ 2048 B mới giữ); dedupe SHA-256; tôn trọng `--carve-max-size/-total/-files` và `partial/` + `complete: false` như salvage. Note: `text:region 0x..-0x..; boundary cut to newline; looks like json|xml|html|csv|text` (sniff thô bằng prefix).
+- `--carve text` chỉ chạy header pass rỗng (Text không có signature) + text pass; ghi vào `partial/` với `.carved`.
+- **Đã verify (2026-11-15)**: 6 unit test mới trong `carve::tests` (recovery, bridge 1 block hỏng, từ chối pure random, opt-in vs `all`, clip vùng đã carveed, UTF-8 tiếng Việt). Trên fixture tổng hợp `.scratch-enc/md.dump` (455,111 B, 25% đầu random, md thật ở 0x10000, plain từ ~0x2bc52): `--carve text` cứu **một** vùng 341,323 B tại `0x2bc7c` — **341,323/341,323 byte trùng khớp 100% `orig.md`** (kiểm bằng python `.scratch-enc/cmp_text.py`); vùng đầu bị mã hoá không khôi phục được (không có gì để cứu), đúng như kỳ vọng. Build + `cargo test --lib carve` xanh (34 pass).
+- Giới hạn đã biết (v1): ranh giới là heuristic theo block 4 KiB — vùng text kẹp trong block bị trộn với binary có thể mất tới ~4 KiB đầu/cuối (refine byte-exact chỉ kéo back qua ASCII text); UTF-16 không làm (v2 nếu cần); cầu 1 block hỏng có thể nhúng vài KB rác vào giữa file; chưa có golden CLI; chưa đo trên dump thật (Lab 6).
+- Docs: HELP (`cli/src/helpers.rs`), `cli/README.md`, `README.md` gốc, `CHANGELOG.md` Unreleased ghi nhận `--carve text`.
+
+**8.10 Đặt tên file carve theo định dạng gốc `<ext>.carved` + bằng chứng trong index · P1 · B1 + B2 XONG 2026-11-15 (B3–B7 chưa làm)**
+
+Bối cảnh: hiện mọi file ghi ra đều là `{offset:08x}-{kind}-{sha8}.carved` (5 chỗ trong `src/carve.rs`). Chủ repo muốn **đảo lại** quyết định "giữ `.carved`" ở 8.3/8.7.6: file nào khôi phục được ra dạng dùng được (docx, exe, jpg...) thì **giữ đuôi gốc rồi thêm `.carved`** (vd. `0001a2b0-zip-9f3c1e2a.docx.carved`); file không đoán được định dạng hoặc không có bằng chứng cấu trúc thì ghi plaintext `.txt.carved` để khôi phục sau. Mục tiêu: analyst nhìn tên là biết đây là loại gì, bỏ `.carved` là mở được, mà trong lúc còn `.carved` thì hệ điều hành không tự mở/chạy.
+
+Nguyên tắc (giữ nguyên các ranh giới cũ):
+- Đuôi gốc là **khẳng định có bằng chứng**, không phải đoán: chỉ gắn `docx` khi cấu trúc ZIP thật sự có phần OOXML của Word; không chắc thì lùi về loại tổng quát (`zip`), không bao giờ nâng cấp.
+- `.carved` luôn là đuôi **cuối cùng** (lá chắn an toàn: `.exe.carved` không chạy được khi bấm đúp). Vẫn không mở, không chạy, không giải nén, không giải mã.
+- Đuôi lấy từ **bảng tĩnh** trong code (whitelist `[a-z0-9]{1,8}`), tuyệt đối không lấy chuỗi từ nội dung file vào tên (chống path traversal / tên rác).
+- Định dạng từng file do bảng đuôi + bước sniff quyết định, **không phụ thuộc cờ nào được dùng** (`--carve` hay `--carved`, bare hay có danh sách loại).
+
+**8.10.1 Quy tắc tên và bậc bằng chứng**
+- [x] Tên chuẩn (B1, đuôi mặc định theo loại; chưa sniff): `{offset:08x}-{kind}-{sha8}.{ext}.carved` (+ hậu tố vai trò ở 8.10.2). `kind` giữ như cũ (khoá `CarveKind`), `ext` là đuôi suy ra. Vẫn duy nhất theo offset+hash, vẫn từ chối ghi đè.
+- [x] **Bậc 1 — cấu trúc xác thực** (`Verdict::Valid`, `complete: true`): `…{ext}.carved` ở thư mục chính. `ext` = đuôi tinh chỉnh bằng sniff (8.10.3) hoặc đuôi mặc định của loại.
+- [x] **Bậc 2 — header hợp lệ nhưng thiếu đuôi / hỏng giữa chừng** (`Truncated`, `complete: false`): vẫn `…{ext}.carved` nhưng nằm trong `partial/` (như 8.7.1); index ghi `complete:false`, `corrupted_offset`. Đuôi gốc ở đây nghĩa là "phần đầu cấu trúc hợp lệ", không hứa mở được.
+- [x] **Bậc 3 — không có bằng chứng cấu trúc** (không signature): text decode được (ASCII/UTF-8 chuẩn, pass `--carve text` ở 8.9) → **`.txt.carved`** (đúng quy tắc chủ repo). Không bao giờ đoán sang `json/xml/html/csv` trong tên ở v1: loại sniff được chỉ ghi vào `notes`/`text_hint` của index (đã có sniff thô ở 8.9), vì sniff sai thì tên sai; mở rộng sau bằng tuỳ chọn riêng nếu cần.
+- [x] (B4: `--carve bin`, `CarveKind::Bin`) Vùng nhị phân không phân loại được (nếu sau này vùng `high-entropy` ở 8.4 được ghi ra đĩa) → **`.bin.carved`**, không dùng `.txt` để khỏi gây hiểu nhầm nhị phân là văn bản (đề xuất — chờ chốt ở mục "Quyết định đang chờ").
+
+**8.10.2 Hậu tố vai trò cho mảnh không mở trực tiếp được**
+- [x] Mảnh **salvage tail** (8.7.2: mất header, vd. PNG chỉ còn dải IDAT + IEND — đã ghi nhận ở 8.7.2 là *không xem được trực tiếp*) mà gắn `.png.carved` sẽ lừa người dùng. Đề xuất: `…{ext}.tail.carved` (vd. `…png.tail.carved`) để tên nói thật "đây là đuôi file, thiếu đầu". Đuôi `.carved` vẫn ở cuối.
+- [x] File ghép từ `reassemble_fragments` (`{va:08x}-{kind}-reassembled.carved`, ~dòng 1132): thành `{va:08x}-{kind}-reassembled.{ext}.carved`; nếu các mảnh không đủ liền (`complete:false`) thì nằm `partial/` như trên.
+- [x] Vai trò (`whole|tail|reassembled`) cũng ghi vào index (8.10.4) để không phụ thuộc vào việc parse tên.
+
+**8.10.3 Bảng đuôi và bước sniff (tinh chỉnh có bằng chứng)**
+- [x] `CarveKind::default_ext()`: bảng tĩnh cho cả 41 loại (jpeg→`jpg`, png, rar, 7z, pdf, gzip→`gz`, bmp, sqlite, mp4, gif, ico, tar, pcap, pcapng, lnk, wasm, dex, kdbx, pem, avi/wav/webp, mkv/webm, ogg/opus, flac, mp3, tif, vdi, vmdk, bz2, xz, class, rtf, evtx, zip, ole→`ole`, pe→`exe`, elf→`elf`...). Test bảng: mỗi `CarveKind::ALL` có đuôi, hợp lệ theo whitelist, không trùng ý nghĩa.
+- [x] `refine_ext(kind, r, base, size) -> ExtChoice` (`src/carve_ext.rs`, B2 xong) chạy **sau** khi validator đã chấp nhận, chỉ đọc dữ liệu đã có trong bộ nhớ/vùng vừa carve (không thêm lượt quét dump):
+  - **ZIP** (đọc central directory khi `complete`): `[Content_Types].xml` + phần `word/` → `docx`, `xl/` → `xlsx`, `ppt/` → `pptx`; ODF (entry đầu `mimetype`, lưu không nén) → `odt`/`ods`/`odp` theo nội dung `mimetype`; `AndroidManifest.xml` + `classes.dex` → `apk`; `META-INF/MANIFEST.MF` → `jar`; còn lại `zip`. ZIP thiếu central directory (partial): chỉ nhìn tên entry local header đầu tiên; không đủ thì `zip`.
+  - **OLE**: tên stream `WordDocument` → `doc`; `Workbook`/`Book` → `xls`; `PowerPoint Document` → `ppt`; `__properties_version1.0` → `msg`; bảng MSI (`SummaryInformation` + bảng `Property`/`File`) → `msi`; còn lại `ole`.
+  - **PE**: cờ `IMAGE_FILE_DLL` → `dll`; Subsystem `NATIVE` (1) → `sys`; còn lại `exe`.
+  - **MP4**: brand trong `ftyp`: `M4A ` → `m4a`, `qt  ` → `mov`, còn lại `mp4`. **RIFF**: avi/wav/webp theo FourCC. **EBML**: `mkv`/`webm` theo DocType. **OGG**: `ogg`/`opus` theo `OpusHead` (đã có).
+  - **ELF**: `so` chỉ khi `e_type = ET_DYN` và có dấu hiệu thư viện (không có `PT_INTERP`); còn lại `elf`.
+- [x] (B2; ra index ở B3) `ext_source` ghi lại lý do: `kind` (mặc định), `sniff:<luật>` (vd. `sniff:zip/word`), `fallback`. Sniff lỗi/không chắc → mặc định của loại, không panic, không lỗi cứng.
+- [x] Sniff nằm sau các giới hạn `--carve-max-size/-total/-files`: tinh chỉnh đuôi không được kéo thêm cấp phát vượt trần.
+
+**8.10.4 Index/manifest: đưa bằng chứng ra ngoài**
+- [x] Thêm vào `CarvedFile` + `write_carve_index` (JSON/NDJSON): `file_name`, `ext`, `ext_source`, `role` (`whole|tail|reassembled`), `tier` (1/2/3), `evidence` (danh sách: `magic`, `structure_ok`, `footer_ok`, `crc_ok`, `size_exact`, `central_dir`...), `confidence` (`high|medium|low`). Giữ nguyên các trường cũ (`offset`, `type`, `size`, `sha256`, `entropy`, `complete`, `notes`, `path`, `corrupted_offset`, `entropy_spike_at`) để script cũ không vỡ; `path` vẫn là nguồn sự thật thay vì parse tên.
+- [x] Dòng tóm tắt `--report summary`: thêm số file theo bậc (T1/T2/T3) và theo đuôi (vd. `docx=3 exe=2 txt=14`).
+- [x] (B3+B4) Tự động hoá "khôi phục sau": index lọc được file `.txt.carved`/`.bin.carved` + offset để công cụ ngoài (hoặc lượt sau của bxmap) xử lý tiếp mà không phải quét lại dump.
+
+**8.10.5 CLI và alias `--carved`**
+- [x] `--carve` và `--carved` là **một cờ** (alias ở lớp parse, `cli/src/args.rs`); mọi tham số đi kèm có alias chung: `--carve-out` ≡ `--carved-out`, `--carve-index` ≡ `--carved-index`, `--carve-min-size`/`--carve-max-size`/`--carve-max-total`/`--carve-max-files` tương tự. Sau parse chỉ còn **một** cấu hình duy nhất → tên file, index, hành vi giống hệt nhau bất kể dùng tên nào.
+- [x] Nhập lẫn hai dạng cho cùng một tham số (`--carve-out a --carved-out b`) → lỗi "trùng tham số" rõ ràng, không im lặng lấy cái cuối. Test parse: `--carved docx --carved-out x` ≡ `--carve docx --carve-out x`; bare `--carved` = full carve như bare `--carve` (8.7.0/8.7.6).
+- [x] `bxmap.toml`: chấp cả khoá `carve` và `carved` (cùng giá trị chuỗi); HELP + `cli/README.md` ghi rõ alias.
+- [x] Giữ nguyên nguyên tắc 8.7.6: tham số chỉ **chọn loại file**, không chọn kỹ thuật; không thêm cờ kỹ thuật mới cho tính năng này.
+
+**8.10.6 Lọc theo đuôi cụ thể (cải thiện đi kèm)**
+- [x] Hiện `--carve docx` (alias Tier A, 8.8) chọn nguyên loại `Zip` nên ghi **mọi** ZIP. Có `refine_ext` thì làm chính xác: `--carve docx` chỉ ghi file có `ext = docx`; `--carve zip` ghi mọi ZIP kể cả docx/xlsx/jar (tên vẫn là đuôi tinh chỉnh); `--carve docx,xlsx` ghi hai loại. Alias khác tương tự (`doc/xls/ppt/msi/msg` trên OLE, `dll/sys` trên PE, `m4a/mov` trên MP4...).
+- [x] Cẩn thận: quét vẫn đi theo `CarveKind` (một lượt), chỉ **bộ lọc ghi ra** theo đuôi tinh chỉnh → không tốn thêm lượt quét; file bị loại vì khác đuôi vẫn được tính vào thống kê "matched but filtered" (không tính vào `--carve-max-total`).
+- [x] Quyết định cần chủ repo chốt (xem cuối mục): lọc chính xác hay giữ hành vi cũ (alias = cả loại).
+
+**8.10.7 "Bấm xài được": bỏ `.carved` có kiểm soát**
+- [ ] Mặc định giữ `.carved` cuối (an toàn). README (cảnh báo mã độc, mục 8.3) thêm hướng dẫn dùng: PowerShell `Get-ChildItem *.carved | Rename-Item -NewName { $_.Name -replace '\.carved$','' }`, và bash tương đương; nhắc mở trong môi trường cô lập.
+- [ ] P2 (không làm trước): cờ opt-in bỏ hẳn `.carved` cho các loại **không thực thi được** (jpg, png, docx, pdf...); **không bao giờ** áp dụng cho loại thực thi/chạy được (`exe dll sys msi jar apk lnk wasm dex class so elf` và mọi script) dù có cờ. Cân nhắc đánh dấu Mark-of-the-Web (ADS `Zone.Identifier`) trên Windows để Office/SmartScreen mở ở chế độ hạn chế.
+
+**8.10.8 Code: gom về một chỗ**
+- [x] Hàm duy nhất `carved_file_name(offset, kind, role, sha256)` (+ `CarveRole`) thay cho 4 `format!` rải rác (`src/carve.rs` ~628 header-first, ~784 salvage tail, ~904 text, ~1132 reassembled) và cập nhật doc comment (dòng 12, ~1077). Tên chỉ dựng ở hàm này → test một chỗ, hết lệch giữa các đường ghi.
+- [ ] Giữ chống path traversal: ext/role chỉ từ bảng tĩnh; kiểm lại test "từ chối ghi đè" và dedupe SHA-256 với tên mới.
+- [ ] Độ dài tên: `offset(8)+kind+sha8+ext+role+.carved` luôn ≪ 255, bắt đầu bằng hex nên không đụng tên dành riêng của Windows (`CON`, `NUL`...); thêm test.
+
+**8.10.9 Test**
+- [ ] Unit: bảng `default_ext` đủ 41 loại; `refine_ext` với fixture docx/xlsx/pptx/odt/jar/apk (ZIP có đúng entry), doc/xls/ppt/msi/msg (OLE có đúng stream), exe/dll/sys (PE header dựng tay), mp4/m4a/mov (ftyp), avi/wav/webp, mkv/webm; ZIP partial không có central directory; sniff không chắc → đuôi mặc định.
+- [ ] Unit: bậc 3 `.txt.carved` cho kết quả `--carve text`; tail → `.tail.carved`; reassembled có đuôi; không có tên nào chứa ký tự ngoài whitelist.
+- [x] Parse: alias `--carved*` ≡ `--carve*`, lỗi trùng tham số, `bxmap.toml` hai khoá.
+- [x] Golden CLI: dump tổng hợp docx + exe + jpg + text rác ở offset biết trước → kiểm tên (`.docx.carved`, `.exe.carved`, `.jpg.carved`, `.txt.carved`), index có `ext/ext_source/tier/evidence`, nội dung byte-identical với bản gốc; cập nhật các golden đang kiểm tên cũ (gif/lnk, alias jpg, partial/salvage, md.dump ở 8.9). _Xong (B7): `golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match` (docx + exe + jpg + text; docx/jpg byte-identical, exe giữ overlay 0; text vào `partial/` là `.txt.carved`); các golden cũ đã dùng tên mới từ B2/B3._
+- [x] Fuzz: `refine_ext` qua target `carve_scan` (ZIP central directory giả, OLE directory vòng, PE header hỏng): không panic, không vượt trần. _Xong (B7): target `carve_scan` đã đi qua `scan_from_reader` → `refine_ext`; thêm test tất định `mutated_fixtures_never_panic_leave_the_region_or_pick_a_foreign_extension` (cắt mọi độ dài + ghi đè từng byte, base 0 và 37, kiểm không đọc ngoài vùng, đuôi thuộc whitelist của kind); không phát hiện lỗi offset header._
+- [ ] Đo lại trên Lab 4/6 (release): thời gian không tăng đáng kể so với 8.8 (~5 s cho `--carve all` trên Lab 6); số file theo đuôi ghi vào README mục "Case study: real-dump carving".
+
+**8.10.10 Tương thích, tài liệu, phát hành**
+- [ ] Đổi tên file là thay đổi **hành vi nhìn thấy được** (script người dùng đang glob `*.carved` vẫn khớp, nhưng script parse tên sẽ vỡ): ghi mục "Changed" trong `CHANGELOG.md` Unreleased, nêu rõ `path` trong index là nguồn đáng tin; đánh giá bump minor.
+- [ ] Cập nhật HELP (`cli/src/helpers.rs`), `cli/README.md`, `README.md` gốc (quy tắc tên, bảng đuôi, bậc bằng chứng, `.txt.carved`, hướng dẫn bỏ `.carved`), và ghi chú trong 8.3/8.7.6 rằng quyết định "giữ `.carved`" đã được 8.10 thay thế.
+
+**8.10.11 Thứ tự làm (chia batch nhỏ, xong batch nào chắc batch đó)**
+1. B1: `CarveKind::default_ext()` + `carved_file_name()` + đổi 4 chỗ ghi (chưa sniff) + unit test + cập nhật golden tên cũ.
+2. B2 (**XONG 2026-11-15**): `refine_ext` theo thứ tự rủi ro tăng dần: PE → MP4/RIFF/EBML/OGG → ZIP (docx/xlsx/pptx/odf/jar/apk) → OLE → ELF; mỗi loại một test fixture. Ghi chú B2: RIFF/EBML/OGG đã tách theo `CarveKind` nên không cần sniff; msi nhận qua stream `SummaryInformation` + tên stream bảng có tiền tố U+4840 (chưa kiểm chứng trên MSI thật); ZIP thiếu central directory chỉ nhận được ODF (mimetype), còn lại giữ `zip` với `ext_source=fallback`; ELF `so` = `ET_DYN` không có `PT_INTERP` (static-PIE cũng thành `so`); sniff chỉ chạy cho file `Whole` (tail/reassembled/text giữ đuôi mặc định); 15 test trong `carve_ext` + 1 test tích hợp trong `carve::tests`.
+3. B3 (**XONG 2026-11-15**, e1b7e0b): index có `file_name`, `ext`, `ext_source`, `role`, `tier`, `evidence`, `confidence` (giữ trường cũ); `CarveConfidence` + `evidence_for()` đặt tại 3 chỗ tạo `CarvedFile`; dòng tóm tắt thêm số file theo bậc (T1/T2/T3) và theo đuôi; unit test + golden CLI.
+4. B4 (**XONG 2026-11-15**): hậu tố `tail`/`reassembled` xong từ B1 (`CarveRole`, `carved_file_name`). `.bin.carved`: `CarveKind::Bin` (không nằm trong `ALL`, bật bằng `--carve bin` hoặc `all,bin`), pass chạy sau text pass: khối 4 KiB có entropy >= 7,2 gộp thành run, trừ vùng đã carve, bỏ run < 16 KiB, cắt theo `--carve-max-size`; ghi `partial/...bin.carved`, tier 3, evidence `entropy`, confidence `low`; 4 unit test + 1 golden CLI.
+5. B5 (**XONG 2026-11-15**): alias `--carved*` ở lớp parse (`canonical_carve_flag` + `CARVE_FLAGS`, `cli/src/args.rs`): sau parse chỉ còn tên `--carve*`; nhập lẫn hai dạng cho cùng một tham số → lỗi "same option" (cùng một dạng hai lần vẫn last-wins như cũ); `bxmap.toml` nhận `carved`/`carved-out` (`get_string_alias`, trùng khoá → lỗi); completion + HELP + README + CHANGELOG; 5 test parse + 1 test config.
+6. B6 (**XONG 2026-11-15**): lọc chính xác theo đuôi tinh chỉnh: `ExtFilter::from_list` (`src/carve.rs`) + `Carver::with_ext_filter` + `CarveReport::filtered`; lọc sau `refine_ext` ở header pass (file bị lọc vẫn chiếm vùng byte để không sinh hit lồng, nhưng không ghi/dedupe/tính trần) và ở salvage pass (tail mang đuôi mặc định `zip` nên `--carve docx` bỏ qua). Ghi chú B6: `exe`/`executable`/`pe` vẫn là cả loại PE (giữ hành vi cũ; chỉ `dll`/`sys` lọc chính xác); thêm alias `odp`; đường `--reassemble` (minidump) chưa lọc theo đuôi; ZIP không có central directory không sniff được nên `--carve docx` bỏ qua, dùng `--carve zip` để lấy; 3 test unit + 1 golden CLI (`golden_carve_exact_extension_filter_and_carved_alias`).
+7. B7: docs, CHANGELOG, golden, fuzz, đo Lab 4/6. P2 (bỏ `.carved` có kiểm soát, MOTW) để sau.
+
+**Quyết định (chủ repo chốt 2026-11-15: làm theo đề xuất; riêng câu 4 để P2, mặc định luôn giữ `.carved`)**. Ghi chú B1: `.bin.carved` chưa có nơi sinh ra (chỉ vùng `high-entropy` 8.4 mới cần), nên chưa code; text luôn là `.txt.carved`:
+- Vùng nhị phân không phân loại dùng `.bin.carved` thay vì `.txt.carved`? (đề xuất: có — chỉ text decode được mới mang đuôi `.txt`).
+- Mảnh mất header dùng hậu tố `.tail`? (đề xuất: có — để tên không hứa "mở được").
+- `--carve docx` lọc chính xác theo đuôi tinh chỉnh? (đề xuất: có; `--carve zip` vẫn lấy hết).
+- Có muốn cờ bỏ `.carved` cho loại không thực thi (P2) hay luôn để người dùng tự đổi tên?
+- Dump bxmap xử lý chủ yếu là RAM dump hay disk image? (RAM dump: file phân mảnh theo trang → ưu tiên reassembly khi có bảng trang; disk image: ưu tiên footer/size chính xác và cluster liền kề.)
+
+**8.11 Dựng lại container MP4/MOV khi đầu file bị mã hoá (`moov` còn sống) · P1 · CHƯA LÀM (thiết kế 2026-11-15; tham khảo công cụ web DRCLAB "Video Ransomware Repair")**
+
+Bối cảnh: ransomware mã hoá một phần ghi đè phần đầu video, làm mất `ftyp` và header `mdat`, nên carve header-first không thấy chữ ký. Nhưng `moov` (chỉ mục mẫu) của video quay từ điện thoại/camera thường nằm **cuối file** và còn nguyên; sau `moov` thường có một đoạn trailer (ID nạn nhân) do ransomware gắn. Đây là đúng chỗ 8.7.2 đã hoãn ("MP4 `moov` footer-first") vì thiếu quy tắc dừng theo cấu trúc; mục này cho quy tắc đó.
+
+**Công cụ tham khảo làm gì (đọc từ trang mô tả; không thấy mã nguồn)**
+- Quét `moov` (chữ ký + box size hợp lệ nằm gọn trong file) → coi mọi byte **trước** `moov` là payload → ghi `ftyp` mới (20 B, `isom`/`mp42`) + header `mdat` (8 B) → cộng 28 vào mọi chunk offset trong `stco` → ghép: `ftyp + mdat header + payload + moov đã sửa`.
+- Mẹo hay: payload bắt đầu từ byte 0 của file gốc, nên offset tuyệt đối cũ + 28 trúng ngay mà không cần biết header gốc dài bao nhiêu.
+- Giới hạn của nó: chỉ `stco` 32-bit (≤ 4 GB), không `co64`, không fragmented MP4, cần nguyên file (biết đầu file ở byte 0), không cho biết khung nào còn nguyên (chỉ nói chung "frames vẫn mã hoá"), không ghi bằng chứng/độ tin cậy, bỏ phí trailer ID (chỉ nhắc người dùng tự tìm).
+- Ranh giới bxmap giữ nguyên: chỉ **dựng cấu trúc** (cắt, ghép, sửa offset, gắn nhãn), **không giải mã**, không crack, không dùng khoá. Cùng tinh thần 8.7.
+
+**8.11.1 Định vị `moov` bằng cấu trúc, không chỉ chữ ký + size**
+- [ ] Parse `moov` theo ISO/IEC 14496-12: `mvhd` (timescale, duration), ≥ 1 `trak` → `mdia/minf/stbl` đủ `stsd`, `stts`, `stsc`, `stsz` (hoặc `stz2`), `stco` (hoặc `co64`).
+- [ ] Kiểm chéo: tổng mẫu `stts` = số mẫu `stsz`; `stsc` phủ hết chunk; `entry_count` của `stco/co64` = số chunk; mọi offset tăng đơn điệu theo track. Lệch → `Invalid` với `reason` rõ.
+- [ ] Từ chối: box size 0/1 (largesize) không hợp lệ hay vượt phần dump còn lại, lồng quá sâu, `cmov` (moov nén; ghi note), fragmented MP4 (`moof/mfra`; ghi note, chưa hỗ trợ), `moov` còn bị mã hoá (parse hỏng).
+- [ ] Trần cấp phát: `entry_count` và tổng bộ nhớ bị chặn theo `--carve-max-size`/kích thước vùng còn lại; không cấp phát theo số liệu header chưa kiểm (như mọi validator, mục 8.2).
+
+**8.11.2 Tìm đầu file từ chính `moov` (cải thiện chính)**
+- [ ] Với mỗi track, tính độ dài từng chunk từ `stsc` + `stsz`; `E = max(chunk_offset + chunk_len)` qua mọi track = vị trí cuối dữ liệu `mdat` theo toạ độ file gốc.
+- [ ] Nếu `moov` nằm ngay sau `mdat`: `moov_file_offset ≈ E` ⇒ `file_start_trong_dump = moov_offset_trong_dump − E`. Vậy **không cần header còn sống** để biết file bắt đầu ở đâu trong dump/disk image liền khối; giải quyết đúng chỗ carve header-first bó tay.
+- [ ] Nếu giữa `mdat` và `moov` có box đệm (`free`/`skip`) hoặc `E` không khớp: ghi `start_confidence: low` và dùng khoảng lệch làm bằng chứng; không đoán thêm.
+- [ ] Nếu nguồn là **một file lẻ** (người dùng đưa file đã mã hoá) thì `file_start = 0`; có thể kiểm `E ≤ moov_offset`.
+- [ ] Giới hạn đã biết: dump phân mảnh (RAM, trang 4 KB) thì dải trước `moov` có thể không liền; khi đó chỉ báo bằng chứng và để reassembly (8.5, chưa làm) xử lý sau.
+
+**8.11.3 Dựng lại container**
+- [ ] File ra = `ftyp` mới (`isom`, minor 0, compatible `isom`,`mp42`; 20 B) + header `mdat` (8 B; **16 B dạng largesize** nếu payload ≥ 2^32 − 8) + payload `[file_start, moov_start)` nguyên văn + `moov` sao chép với offset đã cộng `shift = len(ftyp) + len(mdat header)` (28 hoặc 36).
+- [ ] `stco` tràn u32 sau khi cộng → đổi sang `co64` (moov dài ra nhưng nằm cuối nên không dịch thêm offset nào; cập nhật size các box cha). `co64` có sẵn thì chỉ cộng. Không có giới hạn 4 GB như công cụ tham khảo.
+- [ ] Kiểm sau cùng: parse lại file dựng, mọi chunk offset nằm trong payload mới, `E + shift` = `moov_start_mới`, tổng độ dài khớp. Không khớp → không ghi, trả `Invalid` kèm lý do.
+- [ ] Brand: mặc định `isom`/`mp42`; tuỳ chọn sau cho `.mov` (`qt  `) nếu nguồn cho biết đuôi gốc (không tự suy ra).
+- [ ] **Trailer sau `moov`** (ID nạn nhân/chân ransomware): cắt khỏi file dựng, nhưng ghi vào index `trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview` (tối đa 64 byte, hex + ASCII) để analyst tra ID Ransomware / NoMoreRansom. Chỉ là dữ liệu trong dump, không lưu thành bí mật.
+
+**8.11.4 Nhận biết khung còn nguyên (công cụ tham khảo không có)**
+- [ ] Track video AVC/HEVC (nhận từ `stsd`: `avc1/avc3/hvc1/hev1`; độ dài trường NAL từ `lengthSizeMinusOne` ở `avcC/hvcC`): mẫu hợp lệ nếu độ dài NAL đầu mẫu (big-endian) ≤ `sample_size − len_field` và byte header NAL có `forbidden_zero_bit = 0`, `nal_unit_type` hợp lệ. Dữ liệu đã mã hoá lọt qua kiểm tra này với xác suất rất thấp.
+- [ ] Kết quả: `intact_ratio` theo track, các dải mẫu nguyên/hỏng, `first_intact_sync_sample` (qua `stss`) kèm mốc thời gian; ví dụ "mẫu 0..N hỏng (~X MB đầu), từ mẫu N+1 nguyên". Audio (AAC...) không có oracle → ghi "không kiểm".
+- [ ] Đây là **heuristic có nhãn tin cậy**, không phán quyết. **Không dùng entropy** để phân biệt (video nén vốn ~7.9 bit/byte như đã chốt ở 8.8); oracle dựa trên cấu trúc.
+- [ ] Ý nghĩa thực tế: nếu chỉ phần đầu bị mã hoá thì phần sau có thể xem được; công cụ tham khảo chỉ nói chung chung là "khung vẫn mã hoá".
+
+**8.11.5 Bản chơi được từ khung nguyên đầu tiên · P2**
+- [ ] Tuỳ chọn ghi thêm bản cắt bảng mẫu bắt đầu từ sync sample nguyên đầu tiên (hoặc dùng `elst` bỏ đoạn đầu); luôn đi kèm bản dựng đầy đủ. Chỉ làm sau khi 8.11.1–8.11.4 vững; cần sửa `stts/stsc/stsz/stco/stss` nhất quán.
+
+**8.11.6 Đầu ra và đặt tên (khớp 8.10)**
+- [ ] Thêm `CarveRole::Rebuilt` → `{offset:08x}-mp4-{sha8}.mp4.rebuilt.carved` (hậu tố như `.tail`: "cấu trúc đã dựng, khung có thể còn mã hoá"); vào `partial/` (`complete:false`), `tier` 2, `confidence` mặc định `medium` (lên `high` khi `intact_ratio` cao và `start_confidence` cao).
+- [ ] `notes`: `rebuild: ftyp+mdat header regenerated; shift=28; head encrypted [0..X) est.`; `evidence`: `moov_ok`, `tables_cross_ok`, `chunk_range_ok`, `nal_oracle`. Dedupe SHA-256 như cũ; không mở, không chạy.
+
+**8.11.7 CLI và phạm vi**
+- [ ] Không thêm cờ kỹ thuật (nguyên tắc 8.7.6): salvage MP4 chạy trong `--carve` khi gặp `moov` hợp lệ không có `ftyp` đi trước; chọn loại bằng `--carve mp4` (alias `mov`, `m4a` đã có). File lẻ: `bxmap <file> --carve mp4` là đủ.
+- [ ] Không làm lệnh con `repair-video` riêng (giữ tool gọn); ghi quyết định ở đây.
+
+**8.11.8 An toàn, fuzz và test**
+- [ ] Fuzz qua `carve_scan`: box size 0/1/khổng lồ, vòng lồng, `entry_count` khổng lồ, tổng `stsz` tràn, offset chồng nhau: không panic, không vượt trần.
+- [ ] Fixture tổng hợp: MP4 nhỏ (ftyp + mdat + moov cuối; track giả có mẫu NAL-length hợp lệ; `stco/stsc/stsz/stts/stss` nhỏ) → ghi đè N byte đầu bằng dữ liệu ngẫu nhiên + gắn trailer ID. Kiểm: định vị `moov`, `file_start` đúng, `stco + 28` và parse lại khớp, trailer vào index, oracle đánh dấu đúng mẫu hỏng/nguyên.
+- [ ] Biến thể: `co64`; tràn u32 bằng test số học (không tạo 4 GB thật); `moov` bị mã hoá → từ chối rõ lý do; fragmented/`cmov` → từ chối + note.
+- [ ] Golden CLI cho `--carve mp4` trên dump tổng hợp (có padding hai đầu); đối chiếu bằng `ffprobe` nếu máy có (tuỳ chọn, không bắt buộc cho CI).
+
+**8.11.9 Thứ tự làm**
+1. M1: parser `moov` + kiểm chéo bảng + fuzz (chưa ghi file).
+2. M2: dựng lại (shift, `co64`, trailer, kiểm sau cùng).
+3. M3: tìm đầu file từ `E`, tích hợp footer-first vào `--carve`, `CarveRole::Rebuilt`.
+4. M4: oracle NAL + trường index.
+5. M5: HELP/README/CHANGELOG/golden.
+6. M6 (P2): bản cắt từ khung nguyên đầu tiên.
+Độc lập với B2–B7 của 8.10 nhưng dùng `CarveRole` (B1, đã xong) và các trường index của B3.
+
+**Quyết định mặc định (đổi nếu chủ repo muốn):** brand `isom`/`mp42`; cắt trailer khỏi file dựng nhưng giữ trong index; không lệnh con riêng; bản cắt chơi được để P2.
+**Lưu ý nguồn tham khảo:** mình chỉ đọc được văn bản trang, không kiểm chứng được mã JavaScript, nên lời hứa "không upload" chưa xác nhận; với file bằng chứng hay dữ liệu nhạy cảm nên dùng bxmap chạy local. Ý tưởng được viết lại độc lập từ đặc tả MP4, không sao chép mã.
+
+**8.12 Dựng lại JPEG khi phần đầu file bị mã hoá (thân scan còn sống) · P1 · CHƯA LÀM (thiết kế 2026-11-15; tham khảo repo DRCRecoveryData/JPEG_Recovery, đã đọc mã nguồn, không chạy mã)**
+
+Bối cảnh: ransomware mã hoá một phần ghi đè N byte đầu của ảnh, làm mất `SOI`/`APPn` và thường cả `DQT`/`SOF`/`DHT`/`SOS`. `carve_jpeg` (header-first, `FF D8 FF`) không thấy chữ ký; footer `FF D9` đã bị hoãn ở 8.7.2 vì footer yếu. Nhưng phần entropy-coded phía sau thường còn nguyên, và nó có một tính chất cấu trúc kiểm được **mà không cần giải mã**: byte stuffing. Mục này cho quy tắc dừng theo cấu trúc còn thiếu đó, rồi dựng lại ảnh nếu làm được.
+
+**Repo tham chiếu làm gì (đọc `jpegmedic/core`)**
+- Thử từng byte × 8 bit × 6 layout (4:2:0, 4:2:2, 4:4:4, gray, 4:1:1, 4:4:0) trong 4096 byte sau `prefix`, thăm dò 48 MCU bằng bảng Huffman Annex K chuẩn (giải mã sai pha gần như chắc chắn lỗi trong vài MCU). Suy số MCU/hàng bằng tương quan Pearson của DC luma (lag 8..1024, nhận khi ≥ 0.30). Cắt `N mod cols` MCU đầu cho đúng ranh giới hàng, dựng header mới, ước lượng quality theo bpp, rồi sửa lệch màu bằng dịch hằng DC đầu tiên (đích Y≈110, Cb/Cr≈128).
+- Ranh giới bxmap giữ nguyên: chỉ **cắt, đóng gói lại, dựng header, gắn nhãn**; không giải mã mật mã, không IDCT, không dùng khoá. Cùng tinh thần 8.7 và 8.11.
+- Điểm yếu cần tránh khi viết lại: (1) phải biết trước `prefix` (danh sách cứng 153605, 65536, 131072...); (2) bắt buộc kết thúc đúng EOI nên bỏ mảnh bị cắt; (3) điểm bắt đầu là offset đầu tiên giải mã được, có thể rơi giữa MCU rồi tự đồng bộ sau vài ký hiệu, khi đó `N` thừa vài MCU rác và ảnh lệch ngang (suy luận từ mã, chưa kiểm chứng vì không chạy); (4) ngưỡng bpp→quality coi mọi ảnh ≥ 0.72 bpp là q100, gần như mọi ảnh chụp thật; (5) Python thuần, chậm trên ảnh lớn; (6) README nhắc `tests/`, `demo/`, `tools/make_demo.py` nhưng repo (3 commit) không có; (7) **không có file LICENSE** nên không sao chép mã: viết lại độc lập từ ITU-T T.81 (Annex K).
+
+**Điểm tựa kỹ thuật chính (bxmap thêm): oracle byte stuffing**
+- Trong scan baseline, mọi byte `FF` bắt buộc theo sau bởi `00` (stuffing); ngoại lệ duy nhất là marker `RSTn` (`FF D0..D7`), `EOI` (`FF D9`) và byte đệm `FF FF` trước marker. Dữ liệu ngẫu nhiên (đã mã hoá) vi phạm với xác suất mỗi byte ≈ (1/256)·(246/256) ≈ 0.375%, tức trung bình ~267 byte có một vi phạm.
+- Hệ quả: (a) chuỗi sạch ≥ 8 KiB trong dữ liệu ngẫu nhiên có xác suất ≈ 4×10⁻¹⁴ mỗi vị trí (~4×10⁻⁵ ứng viên giả/GB; ngưỡng 4 KiB sẽ cho ~200 ứng viên giả/GB nên chọn 8 KiB); (b) **vi phạm cuối cùng nằm trong vùng bị mã hoá**, nên biết điểm bắt đầu scan sống **mà không cần biết kích thước prefix** (xác suất vùng nhiễu sau vi phạm cuối dài hơn 4 KiB ≈ 2×10⁻⁷); (c) một lượt O(n), chạy được trên dump nhiều GB; (d) loại tự nhiên dữ liệu nén khác (zlib/ZIP, PNG, H.264, ...) vì chúng chứa `FF` không stuffing.
+- Hằng số (`JPEG_RUN_MIN`, entropy tối thiểu, cửa sổ dò bit) chỉ chốt sau bước đo M0.
+
+**8.12.1 Quét ngược từ `FF D9` theo byte stuffing (nền tảng)**
+- [ ] Footer-first: từ mỗi `FF D9` (bảng footer 8.7.2.1), đi lùi từng cửa sổ 4 KiB (khuôn 8.7.2.3) tới vi phạm stuffing gần nhất `v`, hoặc `covered_end` của file header-first trước đó, hoặc `--carve-max-size`. Chuỗi sạch là `[v+2, EOI]`; nhận khi dài ≥ `JPEG_RUN_MIN` (đề xuất 8 KiB) và entropy ≥ 7.0 (loại vùng toàn 0x00/lặp).
+- [ ] Trong chuỗi cho phép `FF 00`, `FF D0..D7` (ghi `dri_seen`), `FF FF`. Có `FF DA` ở giữa (đa scan/progressive) thì chuỗi tự dừng ở scan cuối; ghi note `multi-scan?`, không dựng (xem 8.12.4).
+- [ ] Byte sau EOI (ví dụ ID ransomware) cắt khỏi file, ghi vào index như 8.11 (`trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview` ≤ 64 byte).
+- [ ] Kết quả tối thiểu khi chưa dựng được: ghi chuỗi sạch vào `partial/` với role `Tail` (`.jpg.tail.carved`), note `salvage:tail: JPEG entropy run [a..e); SOI/tables missing`. Đây là bằng chứng và là đầu vào cho dựng lại hoặc donor sau này.
+- [ ] Không chồng lấn: chuỗi nằm trong vùng đã carve header-first (`< covered_end`) thì bỏ; dedupe SHA-256 như cũ.
+
+**8.12.2 Header còn sống một phần: dựng chính xác (rẻ nhất, tin cậy nhất)**
+Nhiều ảnh máy ảnh/điện thoại đặt APP1 (EXIF + thumbnail, hàng chục KB) **trước** `DQT`/`SOF`/`DHT`. Nếu ransomware chỉ ghi đè đoạn đầu thì bảng còn nguyên, chỉ mất `SOI`/`APPn`.
+- [ ] Nếu vi phạm cuối cùng là `FF DA` (SOS) với độ dài hợp lệ (`00 08` hoặc `00 0C` khớp số thành phần), scan bắt đầu **chính xác** ở cuối header SOS, không cần dò bit.
+- [ ] Tìm chuỗi đoạn liền kề `DQT`*, `SOF0/1`, `DHT`*, tuỳ chọn `DRI` ngay trước SOS: lấy ứng viên điểm đầu là marker bảng/`SOF` trong ~8 KiB trước SOS, **duyệt xuôi** theo trường độ dài, chuỗi phải dẫn đúng tới `FF DA`. Kiểm tham số: bảng Huffman có tổng count ≤ 256, `SOF` có P=8, X,Y > 0, 1..4 thành phần với h,v ∈ 1..4, mọi bảng được tham chiếu đều có mặt.
+- [ ] Ra file = `SOI` + (APP0 JFIF tối thiểu, tuỳ chọn) + các đoạn tìm thấy nguyên văn + scan nguyên văn đến EOI. Kích thước và số hàng **chính xác** (từ `SOF`), không mất hàng ảnh; chỉ mất EXIF/thumbnail.
+- [ ] Kiểm sau cùng: `carve_jpeg` trên file dựng = `Valid`; bộ duyệt MCU (8.12.3) với đúng bảng đó giải mã hết scan, đủ `mcu_cols × mcu_rows` MCU, kết thúc đúng EOI. Qua cả hai: đề xuất `complete: true`, `confidence: high`, `evidence: tables_exact`, vào thư mục chính; không qua: `partial/`.
+
+**8.12.3 Bộ duyệt MCU không IDCT (nền cho 8.12.2 và 8.12.4)**
+- [ ] Module riêng `src/jpeg_scan.rs` (khuyến nghị tách vì `src/carve.rs` đã ~240 KB): `BitReader` MSB-first nhìn trước 16 bit, bảng tra Huffman 16 bit → (độ dài, symbol), `decode_block` (DC diff, AC run/size, EOB, ZRL; không dequantize, không IDCT), `walk_mcus(layout, tables, start_bit, limit) -> WalkStats {mcus, end_bit, err, dc_luma, first_boundaries}`.
+- [ ] Bảng Annex K (DC/AC, luma/chroma) nhập từ ITU-T T.81 Annex K. Test tự kiểm: số symbol 12/12/162/162, tổng Kraft ≤ 1, vòng encode→decode khớp. Bảng tra dựng một lần (`OnceLock`, ~0.5 MiB cho 4 bảng).
+- [ ] An toàn: mọi vòng lặp bị chặn theo bit còn lại; `invalid code`, `AC index overflow`, hết dữ liệu → `Err`, không panic; `dc_luma` (i32) chỉ lấy ≤ 65 536 MCU đầu, `first_boundaries` ≤ 1 100; không cấp phát theo số liệu header chưa kiểm.
+- [ ] Hết scan phải còn ≤ 7 bit dư và toàn bit 1 (đệm chuẩn của encoder). Điều kiện đầu cuối này cũng loại ứng viên sai pha thành phần.
+
+**8.12.4 Bảng mất: dựng bằng bảng chuẩn Annex K (ước lượng, nhãn rõ)**
+Chỉ chạy khi 8.12.2 không áp dụng được.
+- [ ] Đồng bộ bit: cửa sổ `[v+2, v+2+16 KiB]`, mỗi byte × 8 bit × 6 layout, thăm dò 64 MCU; ứng viên giữ lại phải giải mã đến EOI và kết thúc đúng (≤ 7 bit dư toàn bit 1). Chi phí cố định (~ 10⁵ vị trí × 6 layout, thất bại sớm trên dữ liệu ngẫu nhiên), không cần rayon.
+- [ ] **Ranh giới MCU chuẩn (tránh MCU rác)**: điểm giải mã được đầu tiên có thể rơi giữa MCU rồi tự đồng bộ sau vài ký hiệu, nên đếm MCU từ đó có thể thừa. Quy tắc: giải mã từ hai ứng viên cách nhau ≥ 2 KiB (cùng layout, cùng kết thúc đúng EOI); ranh giới chuẩn là ranh giới **chung đầu tiên** của hai chuỗi, và hai chuỗi phải trùng nhau tiếp ≥ 64 MCU. Mọi MCU đếm từ đó. Không cần tìm ranh giới thật đầu tiên: hàng cuối kết thúc đúng tại EOI, nên một ranh giới chắc chắn cộng số MCU còn lại đến EOI là đủ để biết pha hàng.
+- [ ] Suy số MCU/hàng `cols`: tương quan Pearson DC luma ở lag `c ∈ [8, min(1024, N/5)]` trên ≤ 65 536 MCU đầu sau ranh giới chuẩn (bỏ 32 MCU đầu); ứng viên là đỉnh, ưu tiên lag nhỏ nhất có corr ≥ 0.97× đỉnh (tránh bội 2c, 3c). **Seam test** (repo tham chiếu không có): trung bình |ΔDC| qua đường nối hàng (chỉ số ≡ 0 mod c) phải ≥ 1.5× trong hàng; không đạt thì thử đỉnh kế hoặc từ chối.
+- [ ] Ngưỡng: corr ≥ 0.55 và seam đạt → `medium`; 0.30..0.55 → `low`; < 0.30 hoặc ảnh phẳng/đồ hoạ → **từ chối, không đoán**. Hình học phải hợp lý (mỗi chiều ≥ 64 px, tỉ lệ 0.1..10) và còn ≥ 5 hàng.
+- [ ] Căn hàng: bỏ `skip = N mod cols` MCU đầu (N đếm từ ranh giới chuẩn). Header dựng: `SOI` + JFIF + `DQT` chuẩn IJG **quality 90 cố định** (ghi `quant: assumed q90`; không đoán theo bpp) + `SOF0` (W = cols·mcu_w, H = rows·mcu_h; W thật có thể kém tới mcu_w−1 px) + 4 `DHT` Annex K + `SOS`. Scan: bỏ stuffing → dịch bit về byte → đệm bit 1 → stuffing lại.
+- [ ] Scan có `RSTn`/`DRI`: P1 **không dựng** (ghi note `dri: needs donor`), giữ `Tail`; hỗ trợ ở M6.
+- [ ] Giải mã Annex K thất bại ở mọi layout dù chuỗi sạch: nhiều khả năng bảng Huffman riêng của camera (tối ưu theo ảnh) hoặc progressive. Giữ `Tail` với note `custom-DHT?`, không dựng ảnh rác.
+- [ ] Số hàng mất ước lượng = (kích thước vùng mã hoá ước tính / byte-mỗi-MCU) / cols, ghi `lost_rows_est` (nhãn ước lượng, không phải số đo).
+- [ ] Kiểm sau cùng: `carve_jpeg` = `Valid` trên file dựng và bộ duyệt với bảng dựng cho đúng `cols × rows` MCU, kết thúc đúng EOI. bxmap không có bộ giải mã pixel nên không kiểm được "trông có đúng không"; `confidence` chỉ phản ánh thống kê DC.
+- [ ] Kết quả: `Rebuilt` vào `partial/`; `evidence`: `stuffing_run`, `annexk_walk_ok`, `eoi_aligned`, `cols_corr=0.xx`, `seam=x.x`, `converged_boundary`.
+
+**8.12.5 Dựng chính xác bằng donor cùng máy · P2**
+- [ ] Trong cùng nguồn, tìm JPEG hoàn chỉnh đã carve (`Whole`) có cùng số thành phần/sampling và `DHT` giống: lấy `DQT`/`DHT`/`SOF`/`DRI` ⇒ bỏ suy đoán `cols`, bảng và chiều rộng chính xác; thử lần lượt từng donor bằng bộ duyệt (đủ `cols × rows` MCU, kết thúc đúng EOI).
+- [ ] Donor từ ngoài (`--carve-donor <file|thư mục>`) là quyết định riêng của chủ repo: 8.7.6 cấm cờ chọn kỹ thuật, nhưng donor là dữ liệu đầu vào, không phải kỹ thuật.
+
+**8.12.6 Sửa lệch màu (DC) · P2**
+- [ ] Mất predictor DC đầu làm mọi DC lệch một hằng theo từng thành phần (chi tiết AC nguyên vẹn). Chỉ viết lại DC difference đầu của mỗi thành phần (cắt bit rồi ghép lại, không giải mã lại các MCU khác); đích tính trong miền hệ số (trung bình DC·Q_dc/8 + 128, Cb/Cr ≈ 128), không đo pixel. Là heuristic "xám trung bình" nên luôn là **bản phụ** (`-adjusted`), bản thô luôn giữ; DC sau dịch phải trong ±2047 (category ≤ 11), kẹp nếu vượt.
+- [ ] Ảnh có `RSTn` ít cần vì predictor reset mỗi interval. Tác động thực tế: ảnh thô có thể lệch sáng/màu rõ, nên mục này có thể được nâng ưu tiên nếu chủ repo muốn.
+
+**8.12.7 Đầu ra, đặt tên, CLI (khớp 8.10/8.11)**
+- [ ] `CarveRole::Rebuilt` dùng chung với 8.11 (mục nào làm trước thì thêm): `{offset:08x}-jpeg-{sha8}.jpg.rebuilt.carved`; `offset` là đầu chuỗi scan sống, không phải đầu file gốc. `Tail`: `.jpg.tail.carved`.
+- [ ] Không thêm cờ kỹ thuật (nguyên tắc 8.7.6): chạy trong `--carve` / `--carve jpeg`; file lẻ cũng chạy.
+- [ ] `notes` mẫu: `rebuild: JPEG scan from stuffing-clean run [a..e); tables=annexk-assumed q90; 4:2:0; cols=250 (corr 0.87, seam 2.3x); rows kept 188; lost rows ~60 est; EXIF lost; colour cast possible`.
+
+**8.12.8 An toàn, fuzz và test**
+- [ ] Trần: chuỗi đọc ≤ `--carve-max-size`; MCU ≤ 8 triệu; ngân sách thăm dò cố định, chạm trần báo như 8.1 (exit `3`); không cấp phát theo số liệu chưa kiểm.
+- [ ] Fuzz qua `carve_scan`: chuỗi sạch giả, `SOS`/`SOF` mâu thuẫn, số thành phần/sampling vô lý, `DRI` 0..65535, `DHT` count tràn: không panic, không vượt trần.
+- [ ] Fixture: encoder baseline tối giản **chỉ trong test** (bit writer + Huffman Annex K + hệ số tổng hợp mịn, ghi lại ranh giới MCU thật) cho 6 layout × vài kích thước; thêm 1–2 ảnh nhỏ thật (≤ 40 KB, tự tạo, không bản quyền) để đối chiếu nguyên byte. Ghi đè N byte đầu bằng ngẫu nhiên (quét nhiều N, gồm cắt giữa MCU, giữa byte stuffing), gắn trailer.
+- [ ] Kiểm: (1) vi phạm stuffing cuối nằm trong vùng ghi đè; (2) ranh giới chuẩn thuộc tập ranh giới thật; (3) `skip` đúng nên scan dựng trùng **bit-exact** với scan gốc từ hàng k; (4) từ chối ảnh phẳng; (5) DHT riêng → `Tail` + note; (6) 8.12.2: bảng sống → file dựng bằng gốc trừ EXIF.
+- [ ] Đo (M0 rồi M4) làm điều kiện bật mặc định: ứng viên giả trên dữ liệu ngẫu nhiên/zlib/H.264 ≤ 1 trên 10 GB; tỉ lệ lệch hàng/ngang trên ≥ 10 000 vị trí cắt ngẫu nhiên ≤ 0.1%. Vượt ngưỡng thì siết điều kiện hội tụ hoặc hạ `confidence`, không bật mặc định.
+- [ ] Tuỳ chọn: dev-dependency decoder thuần Rust (ví dụ `jpeg-decoder`) để test file dựng giải mã được; nếu chủ repo không muốn thêm dev-dep thì chỉ dùng bộ duyệt nội bộ + đối chiếu byte.
+- [ ] Golden CLI: `--carve jpeg` trên dump tổng hợp (ảnh mất đầu nằm giữa hai file khác + padding), kiểm tên `.jpg.rebuilt.carved` và index.
+
+**8.12.9 Thứ tự làm**
+1. M0: đo (spike, không code sản phẩm): oracle stuffing + bộ duyệt Annex K trên dữ liệu thật/tổng hợp, chốt hằng số và ngưỡng.
+2. M1: 8.12.1 (quét ngược stuffing, `Tail`, trailer).
+3. M2: 8.12.2 (header sống, dựng chính xác).
+4. M3: 8.12.3 (bộ duyệt MCU + Annex K + test).
+5. M4: 8.12.4 (dựng ước lượng, `Rebuilt`, trường index).
+6. M5: HELP/README/CHANGELOG/golden/fuzz/đo.
+7. M6 (P2): donor, sửa màu DC, `DRI`/`RSTn`, đuôi bị cắt (pha hàng bằng seam test).
+Độc lập với B2–B7 của 8.10; dùng chung `CarveRole::Rebuilt` với 8.11 M3 và các trường index của B3. Ước lượng khối lượng M1–M4: ~800–1000 dòng Rust, 0 dependency mới.
+
+**Giới hạn đã biết:** các hàng đầu đã bị mã hoá mất vĩnh viễn; EXIF/ICC mất (8.12.2 chỉ giữ các đoạn bảng); chỉ baseline/extended Huffman 8-bit interleaved; progressive/arithmetic/lossless không dựng; mã hoá ngắt quãng (nhiều dải) ngoài phạm vi; dữ liệu phân mảnh (RAM, trang 4 KB) chỉ đúng khi chuỗi sạch liền khối.
+**Quyết định mặc định (đổi nếu chủ repo muốn):** quality cố định 90; bản thô luôn giữ, bản `-adjusted` để P2; tách `src/jpeg_scan.rs`; `Rebuilt` có bảng chính xác vào thư mục chính, ước lượng vào `partial/`; chưa có `--carve-donor` ở P1.
+**Nguồn tham khảo:** repo DRCRecoveryData/JPEG_Recovery (không có LICENSE nên ý tưởng được viết lại độc lập từ ITU-T T.81, không sao chép mã); mã chỉ đọc, không chạy.
 
 **Xong khi:** carve được JPEG/PNG/ZIP/RAR hoàn chỉnh từ dump tổng hợp với 0 false negative trên bộ test; không panic và không vượt trần bộ nhớ trên input hỏng; so sánh công khai với foremost/PhotoRec có số liệu.
 
