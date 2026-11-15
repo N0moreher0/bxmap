@@ -5,6 +5,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-15
+
+Packaging bugfix. The CLI crate lost its `[[bin]]` section in the 1.0.17
+restructure, so the binary was installed as `bxmap-cli` and the release
+binary was named `bxmap-cli` instead of `bxmap`; `cargo install bxmap-cli`
+and the GitHub release asset did not match the docs. Restored
+`[[bin]] name = "bxmap"`. `bxmap` (library) is unchanged at 1.1.0.
+
 ## [1.1.0] - 2026-11-15
 
 CLI release aligned with `bxmap` 1.1.0. Highlights:

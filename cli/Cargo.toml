@@ -1,6 +1,6 @@
 [package]
 name = "bxmap-cli"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Command-line frontend for the bxmap memory-dump string extraction library"
@@ -21,6 +21,12 @@ default = ["yara", "shift-jis"]
 # Full build (YARA via yara-x, 64-bit only). Lite: --no-default-features
 yara = ["bxmap/yara"]
 shift-jis = ["bxmap/shift-jis"]
+
+# The installed binary is `bxmap` (matches the release assets,
+# [package.metadata.binstall], and the docs). The crate name stays bxmap-cli.
+[[bin]]
+name = "bxmap"
+path = "src/main.rs"
 
 [dependencies]
 bxmap = { version = "1.1.0", path = "..", default-features = false }
