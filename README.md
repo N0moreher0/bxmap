@@ -11,6 +11,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/bxmap?logo=rust)](https://crates.io/crates/bxmap)
 [![Documentation](https://img.shields.io/docsrs/bxmap?logo=docs.rs)](https://docs.rs/bxmap)
+[![CI](https://img.shields.io/github/actions/workflow/status/N0moreher0/bxmap/ci.yml?branch=main&label=CI)](https://github.com/N0moreher0/bxmap/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/rustc-1.80%2B-blue)](https://github.com/N0moreher0/bxmap)
 [![License](https://img.shields.io/crates/l/bxmap)](https://github.com/N0moreher0/bxmap)
 
 This repository contains two layers:

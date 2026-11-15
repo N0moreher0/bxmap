@@ -18,7 +18,7 @@ Chi phí thấp, hiệu quả cao nhất. Làm trước khi thêm tính năng.
 - [x] Tách `cli/README.md` (cách dùng CLI); README gốc chỉ giữ phần library + link sang CLI.
 - [x] Thêm `CHANGELOG.md`, `SECURITY.md` (cách báo lỗi), `CONTRIBUTING.md`.
 - [x] **Thêm 4 encoding mới: Latin1 (ISO-8859-1), CP1252 (Windows-1252), UTF-8, Shift-JIS** — cập nhật README (benchmark, tips chọn encoding, CLI `--encoding all|ascii|utf16|utf32|latin1|cp1252|utf8|shift_jis`).
-- [ ] Thêm badge: CI, MSRV, crates.io version, docs.rs.
+- [x] Thêm badge: CI, MSRV, crates.io version, docs.rs. (2026-11-15: README thêm badge CI (ci.yml branch=main) và MSRV 1.80; crates.io + docs.rs đã có sẵn.)
 
 **Xong khi:** đọc README từ đầu đến cuối không còn câu nào trái với code hiện tại.
 
@@ -61,7 +61,7 @@ Phát hiện khi chạy bxmap trên `MemoryDump_Lab6.raw` (~1.6 GB). Đã đối
 - [x] **Trùng UTF-16LE/BE.** Đã suppress bản BE mirror khi cùng nội dung và offset lệch 1 byte.
 - [x] **Chuỗi chứa xuống dòng bị in nguyên**: output text escape control chars (\n, \r, \t, ...) thành một dòng.
 - [x] **Chuỗi quá dài**: thêm `--max-str-len` để cắt output.
-- [ ] Số liệu xác nhận thêm trên Lab 4 (dump 1 GiB, `--min-len 8`): 305.742/544.317 (~56%) chuỗi UTF-16BE là bản trùng của LE.
+- [x] Số liệu xác nhận thêm trên Lab 4 (dump 1 GiB, `--min-len 8 --encoding utf16 --format ndjson`): sau bản sửa trùng LE/BE + lọc nhiễu (1.1.x), Lab 4 ra **UTF-16LE 100.402 / UTF-16BE 99.598** bản ghi (trước sửa >300k/544k — tổng giảm mạnh); **77.179 (~77,5%)** chuỗi BE trùng nội dung với một chuỗi LE lệch ≤ 1 byte (gần như toàn bộ khớp offset+1 như quy tắc suppress — phần lọt là các trường hợp ranh giới/độ dài không khớp hoàn toàn). Số ~56% (305.742/544.317) không còn tái hiện do bản 1.1.x đã suppress bản BE mirror; số cũ phản ánh trước khi sửa. Đo lại 2026-11-15 với `bxmap 1.1.1`.
 - [x] **Thứ tự output:** README ghi "sorted by ascending offset" nhưng output thực tế không tăng dần chặt chẽ (BE offset `+1` đôi khi đứng trước LE). **Đã sửa**: scanner giờ buffer kết quả và emit theo thứ tự offset (`emit_pending`/`flush_pending` trong `StringRunScanner`); thêm test `streaming_results_are_sorted_by_offset`.
 - [x] **Chạm `--max-strings` thì dừng im lặng** (Lab 4: đúng 200.000 bản ghi, mới quét ~52 MiB của 1 GiB). Phải in cảnh báo rõ ràng ("đã chạm giới hạn tại offset X / tổng Y, kết quả chưa đầy đủ") và trả exit code khác 0 (hoặc cờ `truncated: true` trong JSON). Đã in cảnh báo + exit code 3; `json-tree` có `metadata.truncated`.
 - [x] Test hồi quy: dump mẫu có text ASCII-in-UTF-16 để chắc chắn bug LE/BE không quay lại.
@@ -154,8 +154,8 @@ Nguồn: review toàn repo + `cargo test --workspace --locked` (245 test pass), 
 - [x] Validate để giảm false positive: checksum Base58Check/Bech32 (ví crypto), Luhn, cấu trúc JWT (decode header/payload), độ dài và prefix theo từng nhà cung cấp. **Đã có (2026-11-10):** `validate_base58check` (BTC), `validate_bech32` (segwit), `validate_luhn`, `validate_credit_card` (mới: 13-19 số + prefix issuer + Luhn), `validate_jwt` (bắt buộc `alg`, `typ` tuỳ chọn, signature phải base64url, kiểm tra `exp`), và prefix+độ dài cho AWS/GitHub/Slack/Azure. `classify()` giờ **bỏ nhãn** khi checksum sai (rule có kiểm tra cấu trúc như JWT/SAS chỉ hạ `confidence` trong `--detect`, không xoá bằng chứng). Thêm rule `CREDIT_CARD` (nhóm `FINANCE`) và `BTC_SEGWIT` + 8 test hồi quy.
 - [x] Output detector giữ cả `text` gốc, `match` và vài byte ngữ cảnh (không chỉ thay bằng token).
 - [x] Dùng `RegexSet` / aho-corasick làm prefilter để 30+ pattern không làm chậm quét. **Đã có (2026-11-10):** bộ `SECRET_PATTERNS` đã có prefilter aho-corasick từ trước; nay bộ rule thứ hai (`RULES`, dùng cho `classify()`) cũng có: `RULE_ANCHORS` (mỗi rule phải chứa ít nhất một literal) + `RULE_MIN_LEN` (độ dài tối thiểu) → một lần quét aho-corasick loại được phần lớn rule, chuỗi ngắn không chạy regex nào. Test `rule_prefilter_is_equivalent_to_running_every_regex` chứng minh kết quả không đổi so với chạy hết rule.
-- [ ] Cho phép chọn nhiều loại: `--detect ip,url,secret`.
-- [ ] Nạp pattern tùy chỉnh từ file (`--detect-rules`).
+- [x] Cho phép chọn nhiều loại: `--detect ip,url,secret`. (`--detect` nhận danh sách comma-separated, parse qua `parse_detector` + `push_detector`, dedupe trùng; HELP ghi rõ `comma-separated`.)
+- [x] Nạp pattern tùy chỉnh từ file (`--detect-rules`). (`cli/src/custom_rules.rs`: TOML `[[rules]]`, regex ≤ 512 ký tự, ≤ 64 alternation, keyword prefilter; giới hạn an toàn; tích hợp vào scan và finding; HELP có dòng `--detect-rules <PATH>`.)
 - [~] **Giảm false positive của generic secret** (thấy rõ trên Lab 6): `Token: GetTokenInformation`, `Token: Malloc`, `Token:DigiCert`, `Password: false,`, `ApiKey=function(a){...}`. Yêu cầu giá trị trông giống secret (entropy, độ dài, không phải identifier/từ tiếng Anh/`true`/`false`/mã JS). Đã lọc identifier/từ khóa/mã JS và publicKeyToken; **thêm (2026-11-10):** loại thêm giá trị là **email/URL**, **ngày-giờ** (`2024-01-15`, `10:30:00`, ISO-8601) và **dãy số ≥ 12 ký tự** (id/bộ đếm/số điện thoại). Còn: wordlist rộng hơn (cần bảng từ, chưa có).
 - [x] Loại hoặc hạ điểm các mẫu biết trước là không phải secret: `publicKeyToken="..."` trong manifest assembly (`6595b64144ccf1df`, `31bf3856ad364e35`, `1122334455667788`).
 - [ ] **Phân loại key công khai phía client**: `AIza...` trong request trình duyệt (vd. tới `*.clients6.google.com`) gắn nhãn `public-client-key`, confidence thấp; khác với secret phía server/người dùng.
@@ -202,7 +202,7 @@ Mục tiêu: từ biển chuỗi, trả ngay "bức tranh" của máy thay vì b
 - [ ] ELF core dump, LiME, `hiberfil.sys`.
 - [ ] Mở rộng `.vmss`/`.vmem`: ánh xạ địa chỉ vật lý, thêm các định dạng VM snapshot khác.
 - [ ] Ánh xạ VA → module/section/export cho thêm kiến trúc; hiển thị cây tiến trình đầy đủ hơn.
-- [ ] **`--magic-bytes` mở rộng:** RAR4/RAR5 (`Rar!\x1a\x07\x00` / `...\x01\x00`), 7z, GZIP, JPEG, SQLite, ngoài PE/ELF/ZIP/PDF/PNG hiện có.
+- [x] **`--magic-bytes` mở rộng:** RAR4/RAR5 (`Rar!\x1a\x07\x00` / `...\x01\x00`), 7z, GZIP, JPEG, SQLite, ngoài PE/ELF/ZIP/PDF/PNG hiện có. (Bảng `SIGNATURES` trong `src/magic.rs` đã có cả 11 chữ ký từ trước, dùng chung cho `--carve`; chưa có golden cho riêng từng kind nhưng bảng được fuzz + test thông qua `--carve`.)
 - [ ] **Carving file theo chữ ký** → xem **Phase 8 — Module `--carve`**.
 - [ ] Xuất báo cáo HTML/Markdown tự đóng gói cho case management.
 - [ ] Binding Python (PyO3) để dùng trong notebook và pipeline.
