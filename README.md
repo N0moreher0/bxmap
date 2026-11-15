@@ -442,31 +442,54 @@ Recover structured files directly from a raw dump. The carver:
   structural validation decides what is written.
 - Deduplicates by SHA-256; identical files found at multiple offsets are recorded
   once with `duplicates: [offsets]` in the index.
-- Writes files with a neutral `.carved` extension (`<offset:08x>-<kind>-<sha8>.carved`)
-  so nothing auto-executes or auto-opens.
+- Writes files as `{offset:08x}-{kind}-{sha8}.{ext}.carved` (e.g.
+  `0001a2b0-zip-9f3c1e2a.docx.carved`): the extension is taken from a static
+  table and refined from content only when the structure is proven (ZIP with
+  Word parts -> `docx`, PE with the DLL flag -> `dll`, ...). Plaintext is
+  `.txt.carved`; a salvaged tail without its header is `.{ext}.tail.carved`.
+  `.carved` is always the last extension so nothing auto-executes or auto-opens.
+  `ext` is a static string, never taken from the file.
+- Refines the extension from content (bounded sniff: ZIP central directory, OLE
+  directory, PE header): `docx`/`xlsx`/`pptx`/`odt`/`ods`/`odp`/`jar`/`apk` (zip),
+  `doc`/`xls`/`ppt`/`msi`/`msg` (ole), `dll`/`sys` (pe), `m4a`/`mov` (mp4),
+  `so` (elf). Unproven keeps the kind's default (`zip`, `ole`, `exe`, `mp4`,
+  `elf`); evidence is recorded as `ext_source` (`kind`, `sniff:<rule>`,
+  `fallback`) in the index. To consume a file, strip the trailing `.carved` in
+  an isolated environment:
+  `Get-ChildItem *.carved | Rename-Item -NewName { $_.Name -replace '\.carved$','' }` (PowerShell) or
+  `for f in *.carved; do mv "$f" "${f%.carved}"; done` (bash).
+- Every record carries the evidence behind the file in the index — `ext`,
+  `ext_source`, `role` (`whole|tail|reassembled`), `tier` (1 = structure
+  validated to the terminator, 2 = incomplete header or salvaged tail, 3 =
+  readable text only), `evidence` (the checks backing it) and `confidence`
+  (`high`/`medium`/`low`) — so scripts do not have to parse names.
 - Refuses to overwrite existing files: re-running into the same `--carve-out`
   directory is an error.
 - Produces a separate `--carve-index` (JSON array or NDJSON) so carving never
   reshapes the string output. Each record has `offset`, `type`, `size`, `sha256`,
-  `entropy`, `complete`, `notes`, `path`, and `duplicates`.
+  `entropy`, `complete`, `notes`, `path`, and `duplicates`. Treat `path` as
+  authoritative rather than parsing file names.
 - Runs before the string scan so a huge cap (`--carve-max-total`, `--carve-max-files`)
   fails fast with exit code 3.
 
 ```powershell
 # Carve everything, write index, don't scan strings
-bxmap dump.bin --with carve --carve-index idx.ndjson --max-strings 0 --report none
+bxmap dump.bin --carve all --carve-out carved --carve-index idx.ndjson --max-strings 0 --report none
 
 # Only JPEG and PNG, limit total output to 100 MiB
-bxmap dump.bin --carve jpeg,png --carve-max-total 104857600
+bxmap dump.bin --carve jpeg,png --carve-out carved --carve-max-total 104857600
 
 # JSON array index instead of NDJSON
-bxmap dump.bin --with carve --carve-index idx.json
+bxmap dump.bin --carve all --carve-out carved --carve-index idx.json
 ```
 
 ⚠️ **Malware handling warning**: Carved files are raw bytes from the dump.
 They may contain malicious code, exploits, or encrypted payloads. Treat every
 `.carved` file as untrusted: inspect in a sandbox/VM, never open on a host
-machine, and do not execute them.
+machine, and do not execute them. To consume one, strip only the trailing
+`.carved` (never the format extension) in an isolated environment:
+`Get-ChildItem *.carved | Rename-Item -NewName { $_.Name -replace '\.carved$','' }` (PowerShell) or
+`for f in *.carved; do mv "$f" "${f%.carved}"; done` (bash).
 
 ## Binary signature scanning (`--signature`, Phase 8.5)
 

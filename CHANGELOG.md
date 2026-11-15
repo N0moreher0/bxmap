@@ -398,6 +398,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   those formats now go through the report writer.
 - The 21-line ASCII logo is only printed by `-h`/`--help`, not on every scan,
   and the leftover `[DEBUG]` lines were removed from the report writer.
+- The single-threaded string scan could appear to hang forever on dumps made
+  mostly of binary noise: the fast-skip ignored `latin1`/`cp1252` runs, so a
+  run stayed open and every byte travelled the full per-byte pipeline (Lab 6,
+  ~1.5 GiB, never finished; 100% CPU). The fast-skip only skips when all
+  enabled runs are closed, the legacy single-byte flushes reject mostly-binary
+  runs with one cheap ASCII-ratio check before the heavier filters, and
+  pending-emission now compares each candidate against its same-offset group
+  instead of the whole batch (O(n^2) -> O(n.k) per batch). Emission order at
+  equal offsets is now a full `(offset, encoding, text)` sort, so a
+  `--max-strings` cut always lands on the same prefix. Lab 6 with
+  `--carve all --max-strings 1` now finishes in seconds.
 
 ## [1.0.18] - 2026-11-10
 CLI release aligned with `bxmap` 1.0.7. No CLI code changes.

@@ -838,6 +838,13 @@ OPTIONS:
     --carve-out <dir>     Destination directory for carved files (default:
                           <input>.bxmap/carved). Existing files are never
                           overwritten.
+                          Output names are {offset:08x}-{kind}-{sha8}.{ext}.carved
+                          (plaintext is .txt.carved, a salvaged tail without its
+                          header is .{ext}.tail.carved). .carved is always the
+                          last extension so a double-click cannot open or run
+                          the file; to use one, strip the trailing .carved in
+                          an isolated environment. Scripts should read `path`
+                          from the index, not parse names.
     --carve-index <file>  Write the carve index (.ndjson = one record per line,
                           anything else = JSON array)
     --carve-min-size <N>  Skip files smaller than N bytes (default 64)
