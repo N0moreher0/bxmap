@@ -6,6 +6,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `--carved` and its companions (`--carved-out`, `--carved-index`,
+  `--carved-min-size`, `--carved-max-size`, `--carved-max-total`,
+  `--carved-max-files`) are aliases of the matching `--carve*` option,
+  resolved in the argument parser, so there is a single configuration and
+  identical behaviour either way. Giving both spellings of one option is a
+  clear "same option" error instead of a silent last-one-wins. `bxmap.toml`
+  accepts `carved` / `carved-out` as aliases of `carve` / `carve-out` (both
+  spellings of one key is an error). Shell completions list the new flags.
+- **Behaviour change:** specific extensions are now exact filters. `--carve
+  docx` writes only files whose sniffed extension is `docx` (it used to write
+  every ZIP); likewise `xlsx pptx odt ods odp jar apk` (zip), `doc xls ppt msi
+  msg` (ole), `dll sys` (pe), `mov m4a` (mp4) and `so` (elf). Whole-format
+  names (`zip`, `ole`, `pe`/`exe`, `mp4`, `elf`, `all`) still write every file
+  of the format, and naming a kind both ways (`docx,zip`) keeps the whole
+  format. The scan still runs once per format; only the written set changes.
+  Skipped files are tallied as `filtered` (`--report summary` appends "N
+  file(s) filtered by extension") and do not count toward
+  `--carve-max-total` / `--carve-max-files`. A ZIP without a central
+  directory (not sniffable) and footer-salvaged tails keep the default `zip`
+  extension, so an exact filter skips them; `--carve zip` still returns them.
+  Library: new `ExtFilter`, `Carver::with_ext_filter` and
+  `CarveReport::filtered`; `odp` is now accepted as a carve type.
 - `--carve bin`: new opt-in carve of unclassified high-entropy data
   (compressed, encrypted or packed regions no other type claimed). `Bin` is
   a `CarveKind` that is NOT in `CarveKind::ALL`: `--carve all` is unchanged;

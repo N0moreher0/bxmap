@@ -176,10 +176,19 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   more) the same opt-in way (`--carve bin` or `--carve all,bin`): each run
   lands in `partial/` as `...bin.carved` with `complete: false`, `tier` 3 and
   `entropy` evidence, split into `--carve-max-size` pieces. Aliases: `rar` (both RAR versions), `jpg` (jpeg), `7zip`
-  (7z), `office`/`ms-office` (ole), `exe`/`executable` (pe), and file extensions
-  that share a container: `docx`/`xlsx`/`pptx`/`odt`/`ods`/`jar`/`apk` (zip),
-  `doc`/`xls`/`ppt`/`msi`/`msg` (ole), `dll`/`sys` (pe), `so` (elf),
-  `db`/`sqlite3` (sqlite), `mov`/`m4a` (mp4), `tiff` (tif). Formats without a
+  (7z), `office`/`ms-office` (ole), `exe`/`executable` (pe), `db`/`sqlite3`
+  (sqlite) and `tiff` (tif). Extensions that share a container are **exact
+  filters** (the dump is still scanned once per format; only what gets written
+  changes): `docx`/`xlsx`/`pptx`/`odt`/`ods`/`odp`/`jar`/`apk` (zip),
+  `doc`/`xls`/`ppt`/`msi`/`msg` (ole), `dll`/`sys` (pe), `mov`/`m4a` (mp4) and
+  `so` (elf). `--carve docx` writes only files whose sniffed extension is
+  `docx`, `--carve docx,xlsx` writes both, and `--carve zip` still writes every
+  ZIP, docx/xlsx/jar included (each named by its sniffed extension). Naming a
+  format both ways (`docx,zip`) keeps the whole format. A ZIP whose central
+  directory is gone cannot be sniffed and stays `zip`, as do footer-salvaged
+  tails, so an exact filter skips them: use `--carve zip` to get those. Skipped
+  files are counted as `filtered` in the summary and do not count toward
+  `--carve-max-total` or `--carve-max-files`. Formats without a
   magic number are not carved, except plaintext via `text` above. Every
   candidate is structurally validated before
   writing; nothing is decrypted, decompressed, or executed.
@@ -223,6 +232,14 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   `0` = no limit). Hitting it exits with code 3.
 - `--carve-max-files <N>` — stop after N files (default 1000). Hitting it exits
   with code 3.
+- `--carved`, `--carved-out`, `--carved-index`, `--carved-min-size`,
+  `--carved-max-size`, `--carved-max-total`, `--carved-max-files` — aliases of
+  the matching `--carve*` option. After parsing there is one configuration, so
+  file names, index and behaviour are identical whichever spelling is used
+  (bare `--carved` is a full carve like bare `--carve`). Giving both spellings
+  of one option (`--carve-out a --carved-out b`) is an error. In `bxmap.toml`
+  the keys `carved` and `carved-out` are accepted as aliases of `carve` and
+  `carve-out` (both spellings of one key is an error).
 
 ```powershell
 # Full carve: bare --carve = every format, whole dump, default output dir

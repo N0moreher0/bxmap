@@ -419,7 +419,7 @@ impl CarveKind {
         match id {
             "jpeg" | "jpg" => Some(CarveKind::Jpeg),
             "png" => Some(CarveKind::Png),
-            "zip" | "docx" | "xlsx" | "pptx" | "odt" | "ods" | "jar" | "apk" => {
+            "zip" | "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "jar" | "apk" => {
                 Some(CarveKind::Zip)
             }
             "rar4" => Some(CarveKind::Rar4),
@@ -517,6 +517,93 @@ impl fmt::Display for CarveKind {
     }
 }
 
+/// Exact-extension restriction derived from a `--carve` list (ROADMAP 8.10.6).
+///
+/// The dump is still scanned once per [`CarveKind`]; this only decides which
+/// finished files are kept. A list token is either a whole format (`zip`,
+/// `ole`, `pe`, `mp4`, `elf`, `jpg`, ...), which keeps every file of that
+/// kind, or a specific extension that shares a container (`docx`, `xlsx`,
+/// `pptx`, `odt`, `ods`, `odp`, `jar`, `apk`, `doc`, `xls`, `ppt`, `msi`,
+/// `msg`, `dll`, `sys`, `mov`, `m4a`, `so`), which keeps only files whose
+/// refined extension matches. Naming a kind both ways (`docx,zip`) keeps the
+/// whole kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtFilter {
+    exact: Vec<(CarveKind, Vec<String>)>,
+}
+
+impl ExtFilter {
+    /// Specific-extension aliases: the kind that carries them and the
+    /// extension `refine_ext` gives such a file.
+    fn specific(name: &str) -> Option<(CarveKind, &'static str)> {
+        Some(match name {
+            "docx" => (CarveKind::Zip, "docx"),
+            "xlsx" => (CarveKind::Zip, "xlsx"),
+            "pptx" => (CarveKind::Zip, "pptx"),
+            "odt" => (CarveKind::Zip, "odt"),
+            "ods" => (CarveKind::Zip, "ods"),
+            "odp" => (CarveKind::Zip, "odp"),
+            "jar" => (CarveKind::Zip, "jar"),
+            "apk" => (CarveKind::Zip, "apk"),
+            "doc" => (CarveKind::Ole, "doc"),
+            "xls" => (CarveKind::Ole, "xls"),
+            "ppt" => (CarveKind::Ole, "ppt"),
+            "msi" => (CarveKind::Ole, "msi"),
+            "msg" => (CarveKind::Ole, "msg"),
+            "dll" => (CarveKind::Pe, "dll"),
+            "sys" => (CarveKind::Pe, "sys"),
+            "mov" => (CarveKind::Mp4, "mov"),
+            "m4a" => (CarveKind::Mp4, "m4a"),
+            "so" => (CarveKind::Elf, "so"),
+            _ => return None,
+        })
+    }
+
+    /// Build the filter from the same list `CarveKind::from_list` reads.
+    pub fn from_list(list: &str) -> Result<Self, String> {
+        let mut whole: Vec<CarveKind> = Vec::new();
+        let mut exact: Vec<(CarveKind, Vec<String>)> = Vec::new();
+        for raw in list.split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace()) {
+            let name = raw.trim().to_ascii_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            match Self::specific(&name) {
+                Some((kind, ext)) => match exact.iter_mut().find(|(known, _)| *known == kind) {
+                    Some((_, exts)) => {
+                        if !exts.iter().any(|known| known == ext) {
+                            exts.push(ext.to_string());
+                        }
+                    }
+                    None => exact.push((kind, vec![ext.to_string()])),
+                },
+                None => {
+                    for kind in CarveKind::from_list(&name)? {
+                        if !whole.contains(&kind) {
+                            whole.push(kind);
+                        }
+                    }
+                }
+            }
+        }
+        exact.retain(|(kind, _)| !whole.contains(kind));
+        Ok(Self { exact })
+    }
+
+    /// True when no kind is restricted (every file is kept).
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+    }
+
+    /// Whether a finished file of `kind` with refined extension `ext` is kept.
+    pub fn allows(&self, kind: CarveKind, ext: &str) -> bool {
+        match self.exact.iter().find(|(known, _)| *known == kind) {
+            Some((_, exts)) => exts.iter().any(|known| known == ext),
+            None => true,
+        }
+    }
+}
+
 /// Carving policy.
 #[derive(Debug, Clone)]
 pub struct CarveOptions {
@@ -611,6 +698,9 @@ pub struct CarveReport {
     pub nested: usize,
     /// Duplicates collapsed into an existing file.
     pub duplicates: usize,
+    /// Valid files left out because their extension did not match an exact
+    /// extension filter (`--carve docx` skips a plain ZIP).
+    pub filtered: usize,
 }
 
 impl CarveReport {
@@ -675,6 +765,12 @@ impl CarveReport {
                 self.duplicates, self.duplicate_bytes
             ));
         }
+        if self.filtered > 0 {
+            line.push_str(&format!(
+                ", {} file(s) filtered by extension",
+                self.filtered
+            ));
+        }
         if self.rejected > 0 {
             line.push_str(&format!(", {} header(s) rejected", self.rejected));
         }
@@ -698,6 +794,7 @@ pub struct Carver {
     options: CarveOptions,
     incomplete_dir: bool,
     salvage: bool,
+    ext_filter: ExtFilter,
 }
 
 impl Carver {
@@ -706,6 +803,7 @@ impl Carver {
             options,
             incomplete_dir: false,
             salvage: false,
+            ext_filter: ExtFilter::default(),
         }
     }
 
@@ -729,6 +827,16 @@ impl Carver {
     /// decrypted or repaired; the tail is only cut out and labelled.
     pub fn with_salvage(mut self, enabled: bool) -> Self {
         self.salvage = enabled;
+        self
+    }
+
+    /// Keep only files whose refined extension passes `filter` (ROADMAP
+    /// 8.10.6): `--carve docx` writes docx files, not every ZIP. The scan
+    /// itself is unchanged; a filtered file still owns its bytes (nested hits
+    /// stay suppressed) but is not written, deduplicated or counted against
+    /// `max_files`/`max_total`, and is tallied in [`CarveReport::filtered`].
+    pub fn with_ext_filter(mut self, filter: ExtFilter) -> Self {
+        self.ext_filter = filter;
         self
     }
 
@@ -862,6 +970,15 @@ impl Carver {
                 // Refine the extension from the bytes just validated (bounded
                 // reads inside this region, no extra pass over the dump).
                 let choice = crate::carve_ext::refine_ext(kind, &mut source, offset, size);
+                // `--carve docx` keeps only files whose refined extension is
+                // `docx` (ROADMAP 8.10.6). The file still owns its bytes, so
+                // nested signatures stay suppressed, but it is not written,
+                // hashed for dedupe or counted against the caps.
+                if !self.ext_filter.allows(kind, choice.ext) {
+                    report.filtered += 1;
+                    covered_end = offset + size;
+                    continue;
+                }
                 let path = match out_dir {
                     Some(dir) => {
                         let name = carved_file_name_with_ext(
@@ -1008,6 +1125,14 @@ impl Carver {
                 let size = tail.end - tail.start;
                 if size < self.options.min_size {
                     report.rejected += 1;
+                    continue;
+                }
+                // A salvaged tail keeps the kind's default extension (its
+                // header is gone, so nothing can be sniffed): an exact
+                // extension filter cannot vouch for it and skips it.
+                if !self.ext_filter.allows(kind, kind.default_ext()) {
+                    covered.push((tail.start, tail.end));
+                    report.filtered += 1;
                     continue;
                 }
                 let (sha256, entropy) = match digest_region(&mut source, tail.start, size) {
@@ -5786,6 +5911,98 @@ mod tests {
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
         std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn ext_filter_separates_whole_formats_from_specific_extensions() {
+        let filter = ExtFilter::from_list("docx,xlsx").unwrap();
+        assert!(filter.allows(CarveKind::Zip, "docx"));
+        assert!(filter.allows(CarveKind::Zip, "xlsx"));
+        assert!(!filter.allows(CarveKind::Zip, "zip"));
+        assert!(!filter.allows(CarveKind::Zip, "jar"));
+        // Kinds the list does not restrict are untouched.
+        assert!(filter.allows(CarveKind::Pdf, "pdf"));
+
+        for list in ["zip", "docx,zip", "all,docx", "jpg,pdf,exe,office", "text,bin"] {
+            assert!(ExtFilter::from_list(list).unwrap().is_empty(), "{list}");
+        }
+        // `exe` stays a whole-format alias (every PE), as before 8.10.6.
+        assert!(ExtFilter::from_list("exe").unwrap().allows(CarveKind::Pe, "dll"));
+        assert!(!ExtFilter::from_list("dll").unwrap().allows(CarveKind::Pe, "exe"));
+        assert!(ExtFilter::from_list("nope").is_err());
+    }
+
+    #[test]
+    fn every_specific_extension_alias_names_its_container_kind() {
+        for name in [
+            "docx", "xlsx", "pptx", "odt", "ods", "odp", "jar", "apk", "doc", "xls", "ppt",
+            "msi", "msg", "dll", "sys", "mov", "m4a", "so",
+        ] {
+            let (kind, ext) = ExtFilter::specific(name).expect(name);
+            assert_eq!(ext, name);
+            assert_eq!(CarveKind::from_list(name).unwrap(), vec![kind], "{name}");
+        }
+    }
+
+    #[test]
+    fn exact_extension_filter_writes_only_the_named_extension() {
+        let odt = zip_bytes("mimetype", b"application/vnd.oasis.opendocument.text");
+        // Same minimal PE as `sniffed_extensions_reach_file_names_and_the_report`.
+        let mut pe = Vec::new();
+        pe.extend_from_slice(b"MZ");
+        pe.extend_from_slice(&[0u8; 0x3a]);
+        pe.extend_from_slice(&0x40u32.to_le_bytes());
+        pe.extend_from_slice(b"PE\0\0");
+        pe.extend_from_slice(&[0u8; 64]);
+        pe[0x40 + 22 + 1] = 0x20; // IMAGE_FILE_DLL
+
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&odt);
+        dump.extend_from_slice(&[0u8; 64]);
+        dump.extend_from_slice(&pe);
+        dump.extend_from_slice(&[0u8; 64]);
+        let path = write_dump("ext-filter", &dump);
+
+        let run = |list: &str| {
+            let options = CarveOptions {
+                kinds: CarveKind::from_list(list).unwrap(),
+                ..Default::default()
+            };
+            Carver::new(options)
+                .with_ext_filter(ExtFilter::from_list(list).unwrap())
+                .scan(path.to_str().unwrap())
+                .unwrap()
+        };
+        let exts = |report: &CarveReport| {
+            let mut exts: Vec<String> = report.files.iter().map(|f| f.ext.clone()).collect();
+            exts.sort();
+            exts
+        };
+
+        // Both named exactly: both kept.
+        let report = run("odt,dll");
+        assert_eq!(exts(&report), ["dll", "odt"], "{report:?}");
+        assert_eq!(report.filtered, 0);
+
+        // docx does not match an odt: it is skipped, the dll stays.
+        let report = run("docx,dll");
+        assert_eq!(exts(&report), ["dll"], "{report:?}");
+        assert_eq!(report.filtered, 1);
+        assert!(report.summary_line().contains("1 file(s) filtered by extension"));
+
+        // sys does not match a dll; the whole-format zip keeps the odt.
+        let report = run("zip,sys");
+        assert_eq!(exts(&report), ["odt"], "{report:?}");
+        assert_eq!(report.filtered, 1);
+
+        // Whole formats (and a kind named both ways) keep everything.
+        for list in ["zip,pe", "docx,zip,dll", "all"] {
+            let report = run(list);
+            assert_eq!(exts(&report), ["dll", "odt"], "{list}: {report:?}");
+            assert_eq!(report.filtered, 0, "{list}");
+        }
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]

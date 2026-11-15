@@ -39,7 +39,10 @@ mod multi_scan;
 
 use bxmap::{
     artifacts::{Artifact, ArtifactCollector, ArtifactKind, ArtifactKinds},
-    carve::{reassemble_fragments, CarveKind, CarveOptions, CarveReport, Carver, ReassemblyReport},
+    carve::{
+        reassemble_fragments, CarveKind, CarveOptions, CarveReport, Carver, ExtFilter,
+        ReassemblyReport,
+    },
     extract_strings_from_file_parallel_streaming_with_encodings_progress,
     extract_strings_from_file_parallel_with_encodings,
     extract_strings_from_file_streaming_range_with_encodings,
@@ -308,9 +311,14 @@ fn run_single_scan(mut args: Args) -> Result<(), String> {
                 .map_err(|error| format!("reassemble failed: {error}"))?;
             print_reassembly_summary(&report);
         } else {
+            // Specific extensions (`docx`, `dll`, ...) are exact filters on top
+            // of the one scan per format; whole formats keep everything.
+            let ext_filter =
+                ExtFilter::from_list(types).map_err(|error| format!("--carve: {error}"))?;
             let report = Carver::new(options)
                 .with_incomplete_dir(true)
                 .with_salvage(true)
+                .with_ext_filter(ext_filter)
                 .carve_to_dir(&args.path, Path::new(out_dir))
                 .map_err(|error| format!("carve failed: {error}"))?;
             if let Some(index_path) = args.carve_index.as_deref() {

@@ -351,6 +351,13 @@ pub fn completions_for(shell: &str) -> String {
         "--carve-max-size",
         "--carve-max-total",
         "--carve-max-files",
+        "--carved",
+        "--carved-out",
+        "--carved-index",
+        "--carved-min-size",
+        "--carved-max-size",
+        "--carved-max-total",
+        "--carved-max-files",
         "--mode",
         "--with",
         "-o",
@@ -457,6 +464,32 @@ pub fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
+/// The `--carve` family: the flag and its companion parameters.
+const CARVE_FLAGS: [&str; 7] = [
+    "--carve",
+    "--carve-out",
+    "--carve-index",
+    "--carve-min-size",
+    "--carve-max-size",
+    "--carve-max-total",
+    "--carve-max-files",
+];
+
+/// `--carved*` is an alias of `--carve*` (ROADMAP 8.10.5): the canonical
+/// spelling of an alias, or `None` when `flag` is not one.
+fn canonical_carve_flag(flag: &str) -> Option<&'static str> {
+    Some(match flag {
+        "--carved" => "--carve",
+        "--carved-out" => "--carve-out",
+        "--carved-index" => "--carve-index",
+        "--carved-min-size" => "--carve-min-size",
+        "--carved-max-size" => "--carve-max-size",
+        "--carved-max-total" => "--carve-max-total",
+        "--carved-max-files" => "--carve-max-files",
+        _ => return None,
+    })
+}
+
 /// Parse the argument list (without the program name). The dump path may
 /// appear anywhere: `bxmap dump.bin --carve jpeg` and
 /// `bxmap --carve jpeg dump.bin` are equivalent.
@@ -530,14 +563,31 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
     let mut mode: Option<Mode> = None;
     let mut with_tokens: Vec<String> = Vec::new();
     let mut explicit = ExplicitFlags::default();
+    // First spelling seen of each `--carve*` option, so `--carve-out a
+    // --carved-out b` is an error instead of a silent last-one-wins.
+    let mut carve_spellings: Vec<(&str, &str)> = Vec::new();
     while i < values.len() {
-        let flag = values[i].as_str();
+        let spelled = values[i].as_str();
+        // `--carved*` is an alias: from here on only the canonical name
+        // exists, so both spellings configure and behave identically.
+        let flag = canonical_carve_flag(spelled).unwrap_or(spelled);
+        if CARVE_FLAGS.contains(&flag) {
+            match carve_spellings.iter().find(|(name, _)| *name == flag) {
+                Some((_, first)) if *first != spelled => {
+                    return Err(format!(
+                        "'{first}' and '{spelled}' are the same option (--carved* is an alias of --carve*); give it once"
+                    ));
+                }
+                Some(_) => {}
+                None => carve_spellings.push((flag, spelled)),
+            }
+        }
         let next = |i: &mut usize| -> Result<String, String> {
             *i += 1;
             values
                 .get(*i)
                 .cloned()
-                .ok_or_else(|| format!("missing value after '{flag}'"))
+                .ok_or_else(|| format!("missing value after '{spelled}'"))
         };
         match flag {
             "--mode" => mode = Some(parse_mode(&next(&mut i)?)?),
@@ -1017,6 +1067,107 @@ mod tests {
         let args = parse(&["--carve", "dump.bin"]).unwrap();
         let expected = format!("dump.bin.bxmap{}carved", std::path::MAIN_SEPARATOR);
         assert_eq!(args.carve_out.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn carved_is_an_alias_of_carve_for_every_carve_option() {
+        let canonical = parse(&[
+            "--carve",
+            "docx",
+            "--carve-out",
+            "out",
+            "--carve-index",
+            "i.json",
+            "--carve-min-size",
+            "1",
+            "--carve-max-size",
+            "2",
+            "--carve-max-total",
+            "3",
+            "--carve-max-files",
+            "4",
+            "dump.bin",
+        ])
+        .unwrap();
+        let aliased = parse(&[
+            "--carved",
+            "docx",
+            "--carved-out",
+            "out",
+            "--carved-index",
+            "i.json",
+            "--carved-min-size",
+            "1",
+            "--carved-max-size",
+            "2",
+            "--carved-max-total",
+            "3",
+            "--carved-max-files",
+            "4",
+            "dump.bin",
+        ])
+        .unwrap();
+        assert_eq!(aliased.path, canonical.path);
+        assert_eq!(aliased.carve.as_deref(), Some("docx"));
+        assert_eq!(aliased.carve, canonical.carve);
+        assert_eq!(aliased.carve_out.as_deref(), Some("out"));
+        assert_eq!(aliased.carve_out, canonical.carve_out);
+        assert_eq!(aliased.carve_index, canonical.carve_index);
+        assert_eq!(aliased.carve_min_size, 1);
+        assert_eq!(aliased.carve_min_size, canonical.carve_min_size);
+        assert_eq!(aliased.carve_max_size, 2);
+        assert_eq!(aliased.carve_max_size, canonical.carve_max_size);
+        assert_eq!(aliased.carve_max_total, 3);
+        assert_eq!(aliased.carve_max_total, canonical.carve_max_total);
+        assert_eq!(aliased.carve_max_files, 4);
+        assert_eq!(aliased.carve_max_files, canonical.carve_max_files);
+    }
+
+    #[test]
+    fn carved_mixes_with_carve_options_of_other_parameters() {
+        // Different options may use different spellings.
+        let mixed = parse(&["--carved", "docx", "--carve-out", "x", "dump.bin"]).unwrap();
+        let plain = parse(&["--carve", "docx", "--carve-out", "x", "dump.bin"]).unwrap();
+        assert_eq!(mixed.carve, plain.carve);
+        assert_eq!(mixed.carve_out, plain.carve_out);
+        // Same spelling twice keeps the old last-one-wins behaviour.
+        let twice = parse(&["--carve-out", "a", "--carve-out", "b", "dump.bin"]).unwrap();
+        assert_eq!(twice.carve_out.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn bare_carved_is_a_full_carve_like_bare_carve() {
+        for argv in [
+            vec!["--carved", "dump.bin"],
+            vec!["dump.bin", "--carved"],
+            vec!["dump.bin", "--carved", "--carved-out", "out"],
+        ] {
+            let args = parse(&argv).unwrap();
+            assert_eq!(args.path, "dump.bin", "{argv:?}");
+            assert_eq!(args.carve.as_deref(), Some("all"), "{argv:?}");
+        }
+        let expected = format!("dump.bin.bxmap{}carved", std::path::MAIN_SEPARATOR);
+        let args = parse(&["--carved", "dump.bin"]).unwrap();
+        assert_eq!(args.carve_out.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn both_spellings_of_one_carve_option_are_an_error() {
+        for argv in [
+            vec!["--carve-out", "a", "--carved-out", "b", "dump.bin"],
+            vec!["--carved-out", "a", "--carve-out", "b", "dump.bin"],
+            vec!["--carve", "zip", "--carved", "zip", "dump.bin"],
+            vec!["--carve-max-files", "1", "--carved-max-files", "1", "dump.bin"],
+        ] {
+            let error = parse(&argv).map(|_| ()).unwrap_err();
+            assert!(error.contains("same option"), "{argv:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_carved_option_without_a_value_names_the_spelling_the_user_typed() {
+        let error = parse(&["dump.bin", "--carved-out"]).map(|_| ()).unwrap_err();
+        assert!(error.contains("--carved-out"), "{error}");
     }
 
     #[test]

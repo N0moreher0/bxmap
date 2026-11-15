@@ -1751,6 +1751,78 @@ fn golden_carve_extension_alias_selects_the_container_kind() {
     assert!(records.contains("\"type\":\"jpeg\""), "{records}");
 }
 
+fn bare_pe_fixture(characteristics: u16) -> Vec<u8> {
+    let mut pe = Vec::new();
+    pe.extend_from_slice(b"MZ");
+    pe.extend_from_slice(&[0u8; 0x3a]);
+    pe.extend_from_slice(&0x40u32.to_le_bytes());
+    pe.extend_from_slice(b"PE\0\0");
+    pe.extend_from_slice(&[0u8; 64]);
+    pe[0x40 + 22..0x40 + 24].copy_from_slice(&characteristics.to_le_bytes());
+    pe
+}
+
+#[test]
+fn golden_carve_exact_extension_filter_and_carved_alias() {
+    // `--carved dll` (alias of --carve) writes only files that really are
+    // dll: a PE that sniffs as exe is counted as filtered, not written.
+    // Whole formats (`exe`, `pe`) still write every PE (ROADMAP 8.10.5/8.10.6).
+    let dir = tempfile::tempdir().unwrap();
+    let exe = bare_pe_fixture(0);
+    let mut dump = vec![0u8; 256];
+    dump.extend_from_slice(&exe);
+    dump.extend_from_slice(&[0u8; 256]);
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+
+    let run = |carve: &str, carve_out: &str, kinds: &str, name: &str| {
+        let out_dir = dir.path().join(name);
+        let index = dir.path().join(format!("{name}.ndjson"));
+        let output = Command::new(bin_path())
+            .args([
+                path.to_str().unwrap(),
+                carve,
+                kinds,
+                carve_out,
+                out_dir.to_str().unwrap(),
+                "--carve-index",
+                index.to_str().unwrap(),
+                "--max-strings",
+                "0",
+                "--no-progress",
+                "--report",
+                "none",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "stderr: {stderr}");
+        let names = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let records = std::fs::read_to_string(&index).unwrap();
+        (stderr, names, records)
+    };
+
+    let (stderr, names, records) = run("--carved", "--carved-out", "dll", "only-dll");
+    assert!(names.is_empty(), "{names:?}");
+    assert!(records.trim().is_empty(), "{records}");
+    assert!(stderr.contains("1 file(s) filtered by extension"), "{stderr}");
+
+    for (carve, carve_out, kinds, name) in [
+        ("--carve", "--carve-out", "exe", "exe"),
+        ("--carved", "--carved-out", "pe", "pe"),
+    ] {
+        let (stderr, names, records) = run(carve, carve_out, kinds, name);
+        assert_eq!(names.len(), 1, "{name}: {names:?}");
+        assert!(names[0].ends_with(".exe.carved"), "{names:?}");
+        assert!(records.contains("\"ext\":\"exe\""), "{records}");
+        assert!(!stderr.contains("filtered by extension"), "{stderr}");
+    }
+}
+
 #[test]
 fn golden_carve_writes_validated_files_and_index() {
     let dir = tempfile::tempdir().unwrap();

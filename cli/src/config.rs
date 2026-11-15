@@ -92,7 +92,9 @@ pub fn load_config(path: &Path) -> Result<FileConfig, String> {
         "detect-strict",
         "extract",
         "carve",
+        "carved",
         "carve-out",
+        "carved-out",
         "entropy",
         "signature",
         "stats",
@@ -117,8 +119,8 @@ pub fn load_config(path: &Path) -> Result<FileConfig, String> {
         detect_format: get_string(table, "detect-format")?,
         detect_strict: get_bool(table, "detect-strict")?,
         extract: get_string(table, "extract")?,
-        carve: get_string(table, "carve")?,
-        carve_out: get_string(table, "carve-out")?,
+        carve: get_string_alias(table, "carve", "carved")?,
+        carve_out: get_string_alias(table, "carve-out", "carved-out")?,
         entropy: get_bool(table, "entropy")?,
         signature: get_string(table, "signature")?,
         stats: get_bool(table, "stats")?,
@@ -316,6 +318,21 @@ fn get_bool(
     }
 }
 
+/// A string option that also has an alias spelling (`carve` / `carved`).
+/// Setting both spellings in one file is an error, like on the command line.
+fn get_string_alias(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    alias: &str,
+) -> Result<Option<String>, String> {
+    match (get_string(table, key)?, get_string(table, alias)?) {
+        (Some(_), Some(_)) => Err(format!(
+            "config options '{key}' and '{alias}' are the same option; set only one"
+        )),
+        (first, second) => Ok(first.or(second)),
+    }
+}
+
 fn get_string(
     table: &toml::map::Map<String, toml::Value>,
     key: &str,
@@ -403,6 +420,26 @@ mod tests {
         args.min_len = 4;
         apply_config(&mut args, &mut explicit, &config).unwrap();
         assert_eq!(args.min_len, 4);
+    }
+
+    #[test]
+    fn carved_keys_are_aliases_of_the_carve_keys() {
+        let (_dir, path) = write_config("carved = \"docx\"\ncarved-out = \"out\"\n");
+        let config = load_config(&path).unwrap();
+        assert_eq!(config.carve.as_deref(), Some("docx"));
+        assert_eq!(config.carve_out.as_deref(), Some("out"));
+
+        let (_dir, path) = write_config("carve = \"docx\"\ncarve-out = \"out\"\n");
+        let plain = load_config(&path).unwrap();
+        assert_eq!(plain.carve, config.carve);
+        assert_eq!(plain.carve_out, config.carve_out);
+
+        // Both spellings of one key is an error, not a silent pick.
+        let (_dir, path) = write_config("carve = \"docx\"\ncarved = \"zip\"\n");
+        let err = load_config(&path).unwrap_err();
+        assert!(err.contains("carve") && err.contains("carved"), "{err}");
+        let (_dir, path) = write_config("carve-out = \"a\"\ncarved-out = \"b\"\n");
+        assert!(load_config(&path).is_err());
     }
 
     #[test]

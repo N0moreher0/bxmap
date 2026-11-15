@@ -812,12 +812,15 @@ OPTIONS:
                           unclassified high-entropy runs (compressed, encrypted
                           or packed data no other type claimed, 16 KiB or more)
                           as ...bin.carved in partial/; also opt-in: --carve bin
-                          or all,bin. Extensions
-                          work as aliases:
-                          docx/xlsx/pptx/odt/jar/apk=zip, doc/xls/ppt/msi/msg=
-                          ole, dll/sys=pe, so=elf, db/sqlite3=sqlite, jpg=jpeg,
-                          mov/m4a=mp4, tiff=tif. Types select file
-                          formats only, never a technique: every carve runs
+                          or all,bin. Extensions that share a container
+                          are exact filters: --carve docx writes only real
+                          docx files. docx/xlsx/pptx/odt/ods/odp/jar/apk (zip),
+                          doc/xls/ppt/msi/msg (ole), dll/sys (pe), mov/m4a
+                          (mp4) and so (elf) work this way, while --carve zip,
+                          ole, pe, mp4 or elf writes every file of the format
+                          (named by its sniffed extension). Other aliases:
+                          db/sqlite3=sqlite, jpg=jpeg, tiff=tif. Types select
+                          file formats only, never a technique: every carve runs
                           the full recovery stack, including a footer-first
                           second pass for ZIP (central directory + end
                           record) and PDF (startxref + %%EOF) files whose
@@ -843,6 +846,9 @@ OPTIONS:
     --carve-max-total <N> Stop after writing N bytes (default 512 MiB, 0 = no
                           limit). Hitting it exits with code 3.
     --carve-max-files <N> Stop after N files (default 1000)
+    --carved[-out|-index|-min-size|-max-size|-max-total|-max-files]
+                          Aliases of the matching --carve option (one option
+                          each: giving both spellings is an error).
     --reassemble          Reassemble carved fragments in page order (requires
                           --carve and a minidump input). Merges adjacent
                           fragments back into whole files using the minidump's
