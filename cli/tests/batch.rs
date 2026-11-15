@@ -1,15 +1,15 @@
 use std::process::Command;
 
 fn bin_path() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_bxmap-cli") {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_bxmap") {
         return path.into();
     }
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // deps
     if cfg!(windows) {
-        path.push("bxmap-cli.exe");
+        path.push("bxmap.exe");
     } else {
-        path.push("bxmap-cli");
+        path.push("bxmap");
     }
     path
 }
