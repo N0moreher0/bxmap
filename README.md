@@ -499,31 +499,48 @@ offline. A `KEY` record is a heuristic signal, not proof the key fits.
 Both labs were carved through the same public entry point:
 
 ```powershell
-bxmap <dump>.raw --with carve --carve-index <idx>
+bxmap <dump>.raw --carve all --carve-out <dir> --carve-index <idx> [--max-strings N]
 ```
 
 The carved files land in `<dump>.raw.bxmap/carved` by default; add
 `--carve-out <dir>` to choose a different directory.
 
-**Lab 6** (`MemoryDump_Lab6.raw`, ~1.53 GiB): 102 carve candidates → **95 complete**
-files written (552,898,327 bytes): jpeg=4, png=31, zip=13, pdf=2, gzip=45,
-sqlite=7. The remaining candidates were incomplete and reported, not written as
-complete: 4 ZIPs had no end-of-central-directory record and 1 PDF had no `%%EOF`
-marker before the validator size limit.
+Carved file names are `{offset:08x}-{kind}-{sha256[:8]}.{ext}.carved` (see
+ROADMAP 8.10 B1/B2): `{offset}` is hex, `{ext}` is the kind's default or the
+content-refined extension (`refine_ext`, e.g. `dll`/`sys` for PE, `docx` for
+OOXML ZIPs), tails get `.tail.carved` and reassembled files keep their
+extension. The index (`--carve-index`, NDJSON) records `file_name`, `offset`,
+`type`, `size`, `sha256`, `entropy`, `complete`, `ext`, `ext_source`, `role`
+(`whole|tail|reassembled`), `tier` (1/2/3), `evidence`, `confidence` and `path`
+(`path` is the source of truth; parse names only as a fallback).
 
-**Lab 4** (`MemoryDump_Lab4.raw`, ~1 GiB): **534 candidates → 534 complete** files
-written (750,855 bytes: jpeg=4, png=509, bmp=21), 61 duplicates skipped, 2,652
-headers rejected as invalid (for example BMP candidates whose reserved header
-fields were not zero).
+Measured on the release build (`bxmap-cli.exe`, 2026-11-15, carve stage only,
+string scan capped with `--max-strings 1`):
+
+- **Lab 6** (`dump-memlabs/MemoryDump_Lab6.raw`, ~1.53 GiB): carve stage
+  **~5.6 s** (unchanged vs the ~5 s of the 8.8 measurement). 161 files written
+  (157 complete, 1 duplicate skipped, 57,087 headers rejected), 540,139,014
+  bytes: `ico=54` (288.5 MB), `mp3=74`, `zip=10` (226.4 MB), `dll=12`,
+  `png=5`, `sys=3`, `exe=1`, `lnk=1`, `sqlite=1`. Two ZIPs had no
+  end-of-central-directory record; two PNGs failed an IDAT CRC check.
+- **Lab 4** (`MemLabs-Lab4/MemoryDump_Lab4.raw`, ~1 GiB): carve stage
+  **~7 s**. 283 files written (274 complete, 8 duplicates skipped, 167,130
+  headers rejected), 539,335,707 bytes: `ico=79` (449.9 MB), `mp3=110`,
+  `dll=59` (0.2 MB), `sys=14`, `lnk=5`, `png=8`, `bmp=5`, `exe=1`, `ole=1`,
+  `tif=1` (64 MB). The run exited with code `3` (scan truncated by the
+  deliberately tiny `--max-strings 1`).
 
 Honest caveats from the runs:
 
-- Both scans stopped at the `--max-strings 200000` result cap and exited with
-  code `3` (scan truncated, warning names the offset). The carve stage itself
-  completed; re-run with `--max-strings 0` for full coverage.
-- Carved file names are `<offset:08x>-<kind>-<sha8>.carved`; the index
-  (`--carve-index`) holds the offset, kind, size, sha256, entropy, `complete`
-  flag and notes per file.
+- The huge `.ico` volumes (449.9 MB Lab 4 / 288.5 MB Lab 6) are what the
+  current ICO carver emits for real candidates; they are structurally valid
+  but worth eyeballing before opening. The old README numbers (750,855 bytes
+  across jpeg=4/png=509/bmp=21) predate the ICO/PE/MP3 carvers and are kept
+  here only for history — current `--carve all` output differs.
+- Both scans exited early on purpose (`--max-strings 1`); the carve stage
+  itself ran to completion. Use `--max-strings 0` for full string coverage.
+- Carved files are evidence, not “safe to open”; open only in an isolated
+  environment. Nothing is decrypted or executed.
 
 The carver's robustness on real dumps is covered by the fuzz target
 `fuzz/fuzz_targets/carve_scan.rs` (corrupt deflate candidates are rejected, not
