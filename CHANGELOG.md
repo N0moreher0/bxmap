@@ -52,12 +52,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (EXIF `APP1` ~20 KB ahead of the tables, 4 KiB of head overwritten
   with random data): rebuilt, decoded with PIL to exactly 640×480,
   **pixel-identical** to the intact original (0/921,600 channel
-  differences), `complete: true`, tier 1, `confidence: high`. Bench
-  (388 MB) and Lab 6 (1.61 GiB) both unchanged vs 8.12.1 — the bench
-  corpus contains no APP0-loss-only camera-like JPEG (its single ruined
-  JPEG is an APP0-only file whose tables all die with a 4 KiB head
-  loss; the 8.12.1 tail salvage still applies, COVERAGE 96%); see
-  ROADMAP 8.12.2 for details.
+  differences), `complete: true`, tier 1, `confidence: high`. The bench
+  corpus gained `img_camera.jpg` (PIL-built camera-like JPEG, 640×480,
+  EXIF `APP1` 12,268 B ahead of the table chain at `0x3002`): on the new
+  412,713,446-byte, 63-item image the `head4k` scenario carves it as
+  `REBUILT` on all four `--carve all` variants (default/raised/text/
+  headloss) and the rebuilt file decodes **pixel-identical** to the
+  corpus original; `intact` and `trunc` score `EXACT`. Recovered totals
+  went 27→30 (default/raised), 33→36 (text), 39→42 (headloss);
+  `img_photo.jpg head4k` (APP0-only, tables die with the head) still
+  scores `COVERAGE 96%` via the 8.12.1 tail path — recorded, not a
+  regression. The bench numbers from before this change refer to the
+  previous 388 MB / 60-item image. Lab 6 (1.61 GiB) unchanged vs
+  8.12.1; see ROADMAP 8.12.2 for details.
 
 - **JPEG entropy-coded scan survives while the head is destroyed: `--carve`
   now salvages a JPEG tail (ROADMAP 8.12.1, P1)**. A bare `FF D9` footer is
