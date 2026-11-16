@@ -1901,6 +1901,49 @@ fn docx_fixture() -> Vec<u8> {
     out
 }
 
+/// Multi-member stored ZIP with a real central directory. Used to model the
+/// ruined-head case where one member is destroyed outright and the rest must
+/// be reconstructed.
+fn zip_multi_fixture(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut local_offsets = Vec::with_capacity(members.len());
+    for (name, data) in members {
+        local_offsets.push(out.len() as u32);
+        let crc = golden_crc32(data);
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+    }
+    let central_offset = out.len() as u32;
+    for ((name, data), &lho) in members.iter().zip(&local_offsets) {
+        let crc = golden_crc32(data);
+        out.extend_from_slice(b"PK\x01\x02");
+        out.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0u8; 12]);
+        out.extend_from_slice(&lho.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+    }
+    let central_size = out.len() as u32 - central_offset;
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+    out.extend_from_slice(&central_size.to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
 #[test]
 fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
     // ROADMAP 8.10.9: docx + exe + jpg + plaintext in one dump. Each file is
@@ -2544,6 +2587,85 @@ fn golden_carve_mp4_rebuilds_a_ruined_head_and_records_the_trailer() {
     let moov_in_rebuilt = 32 + 8224;
     assert_eq!(&bytes[moov_in_rebuilt + 4..moov_in_rebuilt + 8], b"moov");
     let _ = (moov_offset, moov_len);
+}
+
+#[test]
+fn golden_carve_zip_rebuilds_the_surviving_members_after_a_ruined_head() {
+    let dir = tempfile::tempdir().unwrap();
+    // The partial-encryption shape: the first member ("doomed.bin", 9 KiB)
+    // is inside the overwritten head and cannot come back; the two OOXML
+    // members survive. The reconstruction must drop exactly the first
+    // member and produce a docx.
+    let zip = zip_multi_fixture(&[
+        ("doomed.bin", &vec![b'A'; 9000]),
+        ("[Content_Types].xml", b"<Types/>"),
+        ("word/document.xml", b"<w:document/>"),
+    ]);
+    let archive_at = 64usize;
+    let mut dump = vec![0u8; 64];
+    dump.extend_from_slice(&zip);
+    dump.extend_from_slice(b"VICTIM-ID-777");
+    let overwrite = [0x5au8; 4096];
+    dump[archive_at..archive_at + overwrite.len()].copy_from_slice(&overwrite);
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let index = dir.path().join("zip.ndjson");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "zip",
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    let records = std::fs::read_to_string(&index).unwrap();
+    assert_eq!(records.lines().count(), 1, "{records}");
+    assert!(records.contains("\"role\":\"rebuilt\""), "{records}");
+    assert!(records.contains("\"complete\":false"), "{records}");
+    assert!(records.contains("\"ext\":\"docx\""), "{records}");
+    assert!(
+        records.contains("\"ext_source\":\"sniff:zip/word\""),
+        "{records}"
+    );
+    assert!(records.contains("dropped 1 member"), "{records}");
+    assert!(records.contains("doomed.bin"), "{records}");
+    assert!(records.contains("\"tier\":2"), "{records}");
+    assert!(records.contains("\"corrupted_offset\":9104"), "{records}");
+    assert!(records.contains("\"offset\":9104"), "{records}");
+
+    let carved = dir
+        .path()
+        .join("dump.bin.bxmap")
+        .join("carved")
+        .join("partial");
+    let entries: Vec<_> = std::fs::read_dir(&carved)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{carved:?}");
+    let name = entries[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(name.ends_with(".docx.rebuilt.carved"), "{name}");
+    let bytes = std::fs::read(&entries[0]).unwrap();
+    let needle = |n: &[u8]| bytes.windows(n.len()).any(|w| w == n);
+    assert!(needle(b"[Content_Types].xml"), "CD must keep [Content_Types].xml");
+    assert!(needle(b"word/document.xml"), "CD must keep word/document.xml");
+    assert!(!needle(b"doomed.bin"));
+    assert!(!needle(b"VICTIM-ID-777"), "victim trailer must be cut");
 }
 
 #[test]

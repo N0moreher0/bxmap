@@ -290,6 +290,21 @@ fn check_carved_mp4(path: &Path) -> io::Result<CarvedCheck> {
     })
 }
 
+/// End-to-end post-check: the written rebuilt ZIP must pass our own ZIP
+/// validator before we hand it out. On rejection the file is removed.
+fn check_carved_zip(path: &Path) -> io::Result<CarvedCheck> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut check = Source::new(&mut file, 0, len);
+    Ok(match carve_zip(&mut check)? {
+        Verdict::Valid => CarvedCheck::Ok,
+        Verdict::Truncated(reason) | Verdict::Invalid(reason) => {
+            std::fs::remove_file(path).ok();
+            CarvedCheck::Rejected(reason)
+        }
+    })
+}
+
 /// One record for a rebuilt/cut MP4 pair (ROADMAP 8.11.5): evidence,
 /// confidence, dedupe and the size/file-count limits. Returns `false`
 /// when a limit was reached (the caller stops the salvage pass).
@@ -1693,6 +1708,156 @@ impl Carver {
                         }
                     }
                     continue;
+                }
+                // ROADMAP 8.13.1: a ZIP with a surviving central directory
+                // is rebuilt instead of only tail-salvaged; fall back to
+                // the tail path when it cannot be reconstructed.
+                if kind == CarveKind::Zip {
+                    // The header pass already owns an intact archive.
+                    if covered
+                        .iter()
+                        .any(|&(start, end)| start <= position && position < end)
+                    {
+                        continue;
+                    }
+                    match zip_rebuild(&mut source, position, file_len, self.options.max_size) {
+                        Ok(Ok(rebuilt)) => {
+                            let size = rebuilt.bytes.len() as u64;
+                            if size >= self.options.min_size {
+                                let sha256 = rebuilt.sha256.clone();
+                                let entropy = rebuilt.entropy;
+                                let notes = rebuilt.notes.clone();
+                                // The kept directory names say everything,
+                                // even when [Content_Types].xml was dropped
+                                // with the destroyed head.
+                                let choice = crate::carve_ext::refine_ext(
+                                    CarveKind::Zip,
+                                    &mut std::io::Cursor::new(rebuilt.bytes.as_slice()),
+                                    0,
+                                    rebuilt.bytes.len() as u64,
+                                );
+                                let ext = choice.ext;
+                                let ext_source = choice.source.to_string();
+                                if !self.ext_filter.allows(CarveKind::Zip, ext) {
+                                    covered.push((rebuilt.archive_start, rebuilt.archive_end));
+                                    report.filtered += 1;
+                                    continue;
+                                }
+                                covered.push((rebuilt.archive_start, rebuilt.archive_end));
+                                if let Some(&index) = by_hash.get(&sha256) {
+                                    report.duplicates += 1;
+                                    report.duplicate_bytes += size;
+                                    report.files[index].duplicates.push(rebuilt.payload_start);
+                                    continue;
+                                }
+                                let path = match out_dir {
+                                    Some(dir) => {
+                                        // A rebuilt ZIP is incomplete by
+                                        // definition, so it always goes
+                                        // beside the other partial files.
+                                        let partial = dir.join("partial");
+                                        if let Err(error) = std::fs::create_dir_all(&partial) {
+                                            failure = Some(error);
+                                            return false;
+                                        }
+                                        let name = carved_file_name_with_ext(
+                                            rebuilt.payload_start,
+                                            CarveKind::Zip,
+                                            ext,
+                                            CarveRole::Rebuilt,
+                                            &sha256,
+                                        );
+                                        let path = partial.join(name);
+                                        if path.exists() {
+                                            failure = Some(io::Error::new(
+                                                io::ErrorKind::AlreadyExists,
+                                                format!(
+                                                    "refusing to overwrite '{}'; use a fresh --carve-out",
+                                                    path.display()
+                                                ),
+                                            ));
+                                            return false;
+                                        }
+                                        if let Err(error) = std::fs::write(&path, &rebuilt.bytes) {
+                                            failure = Some(error);
+                                            return false;
+                                        }
+                                        match check_carved_zip(&path) {
+                                            Ok(CarvedCheck::Ok) => Some(path),
+                                            Ok(CarvedCheck::Rejected(reason)) => {
+                                                report.rejected += 1;
+                                                if report.rejected_details.len() < 16 {
+                                                    report.rejected_details.push(format!(
+                                                        "{:#x} zip: rebuilt file invalid at own validator: {reason}",
+                                                        rebuilt.payload_start
+                                                    ));
+                                                }
+                                                covered.pop();
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                failure = Some(error);
+                                                return false;
+                                            }
+                                        }
+                                    }
+                                    None => None,
+                                };
+                                by_hash.insert(sha256.clone(), report.files.len());
+                                report.bytes_written += size;
+                                let evidence = vec!["eocd_ok", "cd_ok", "local_headers_ok"];
+                                report.files.push(CarvedFile {
+                                    offset: rebuilt.payload_start,
+                                    kind: CarveKind::Zip,
+                                    size,
+                                    complete: false,
+                                    sha256,
+                                    entropy,
+                                    notes,
+                                    path,
+                                    duplicates: Vec::new(),
+                                    corrupted_offset: Some(rebuilt.payload_start),
+                                    entropy_spike_at: None,
+                                    partial_encryption: None,
+                                    trailer_offset: None,
+                                    trailer_len: None,
+                                    trailer_sha256: None,
+                                    trailer_preview: None,
+                                    tracks_intact: None,
+                                    ext: ext.to_string(),
+                                    ext_source,
+                                    role: CarveRole::Rebuilt,
+                                    tier: 2,
+                                    evidence,
+                                    confidence: CarveConfidence::Medium,
+                                });
+                                if self.options.max_files != 0
+                                    && report.files.len() >= self.options.max_files
+                                {
+                                    report.truncated = true;
+                                    stop = true;
+                                    return false;
+                                }
+                                if self.options.max_total != 0
+                                    && report.bytes_written >= self.options.max_total
+                                {
+                                    report.truncated = true;
+                                    stop = true;
+                                    return false;
+                                }
+                                continue;
+                            }
+                            // Too small to be of use: fall through to the
+                            // tail salvage.
+                        }
+                        Ok(Err(_reason)) => {
+                            // Not reconstructable: fall back to the tail path.
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    }
                 }
                 let tail = match salvage_tail(
                     kind,
@@ -3418,6 +3583,375 @@ fn salvage_zip_tail(
         note: format!(
             "salvage:tail: ZIP central directory ({entries} entries) + end record at {position:#x}; local headers and data are missing"
         ),
+    }))
+}
+
+/// Strictly verify the central directory chain of an intact-looking archive
+/// whose end record sits at `eocd_abs`. A `PK\x03\x04` walk that reaches the
+/// end of the *file* proves nothing about *members*: a ruined head leaves a
+/// valid-looking tail whose central directory offsets point before/inside
+/// the wrong bytes, which no reader can open (ROADMAP 8.13.1 bench case).
+/// Returns `Some(reason)` when the archive cannot be read, or `None` when it
+/// is consistent. ZIP64 sentinels and absurd sizes are given the benefit of
+/// the doubt.
+fn verify_zip_central_directory(
+    file: &mut File,
+    eocd_abs: u64,
+    file_len: u64,
+    record: &[u8; 22],
+) -> io::Result<Option<String>> {
+    let entries_eocd = u64::from(u16::from_le_bytes([record[10], record[11]]));
+    let cd_size = u64::from(u32::from_le_bytes([
+        record[12], record[13], record[14], record[15],
+    ]));
+    let cd_offset = u64::from(u32::from_le_bytes([
+        record[16], record[17], record[18], record[19],
+    ]));
+    if entries_eocd == 0xFFFF || cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF {
+        return Ok(None); // ZIP64: give the format the benefit of the doubt
+    }
+    if cd_size == 0 || cd_offset == 0 {
+        // Empty archive or a bogus self-check; the caller keeps the verdict.
+        return Ok(None);
+    }
+    if cd_size > 32 * 1024 * 1024 {
+        return Ok(None); // larger than any plausible CD: keep the verdict
+    }
+    let Some(cd_abs) = eocd_abs.checked_sub(cd_size) else {
+        return Ok(Some(
+            "ZIP central directory size underflows the end record".to_string(),
+        ));
+    };
+    let Some(start) = cd_abs.checked_sub(cd_offset) else {
+        return Ok(Some(
+            "ZIP central directory offset underflows the archive start".to_string(),
+        ));
+    };
+    let cd_len = cd_size as usize;
+    let Some(cd) = salvage_read(file, cd_abs, cd_len, file_len)? else {
+        return Ok(Some(
+            "dump ended inside the ZIP central directory".to_string(),
+        ));
+    };
+    let Some(entries) = parse_zip_central_directory(&cd, entries_eocd) else {
+        return Ok(Some("ZIP central directory does not parse".to_string()));
+    };
+    for entry in &entries {
+        let Some(m_abs) = start.checked_add(entry.lho) else {
+            return Ok(Some("ZIP member offset wraps".to_string()));
+        };
+        if m_abs >= cd_abs {
+            return Ok(Some(
+                "ZIP member lies past its central directory".to_string(),
+            ));
+        }
+        let Some(local) = salvage_read(file, m_abs, 30, file_len)? else {
+            return Ok(Some(
+                "dump ended inside a ZIP member local header".to_string(),
+            ));
+        };
+        if &local[..4] != b"PK\x03\x04" {
+            return Ok(Some("ZIP member local header is missing".to_string()));
+        }
+        let name_len = u64::from(u16::from_le_bytes([local[26], local[27]]));
+        if name_len > 4096 {
+            return Ok(Some("ZIP member declares an absurd name".to_string()));
+        }
+        let Some(local_name) = salvage_read(file, m_abs + 30, name_len as usize, file_len)? else {
+            return Ok(Some("dump ended inside a ZIP member name".to_string()));
+        };
+        if local_name != entry.name {
+            // Local and central directory names must agree byte for byte.
+            return Ok(Some(
+                "ZIP member local header disagrees with its central directory".to_string(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// A ZIP bought back to life from its surviving central directory
+/// (ROADMAP 8.13.1).
+///
+/// The first 4 KiB of an archive are the ones the overwrite takes out
+/// (the partial-encryption ransomware shape the bench models), so every
+/// local header near the start is garbage and the header-first pass sees
+/// nothing. The central directory and the end record always live at the
+/// end of the archive, so the archive's logical start is computed, not
+/// guessed: `start = cd_abs - cd_offset`.
+///
+/// Every member whose local header cannot be verified against the central
+/// directory is dropped; their names are recorded in the notes so the loss
+/// is explicit, never silent. Surviving members keep their byte ranges; the
+/// central directory and the end record are rewritten with adjusted
+/// offsets. The result is a smaller, fully valid archive.
+struct ZipRebuilt {
+    /// The rebuilt archive, complete and self-consistent.
+    bytes: Vec<u8>,
+    /// Dump offset where the original archive started (`cd_abs - cd_offset`).
+    archive_start: u64,
+    /// Dump offset of the first surviving member's local header — where the
+    /// rebuilt archive's bytes start in the dump.
+    payload_start: u64,
+    /// Dump offset where the original archive ended (end record + comment).
+    archive_end: u64,
+    sha256: String,
+    entropy: f64,
+    notes: String,
+}
+
+/// One central-directory record, sliced out of the raw CD bytes.
+struct ZipCdEntry {
+    /// Byte range of the record inside the CD buffer (46-byte fixed part
+    /// plus name, extra and comment), used to rewrite the local-header
+    /// offset.
+    rec_start: usize,
+    rec_end: usize,
+    /// Local-header offset relative to the archive start (`lho`).
+    lho: u64,
+    name: Vec<u8>,
+}
+
+/// Parse the central directory buffer. Bails on multi-disk fields, on a
+/// count mismatch with the end record, on records that overrun the
+/// buffer, and on non-increasing local-header offsets — anything a real
+/// single-disk archive never produces.
+fn parse_zip_central_directory(cd: &[u8], entries_eocd: u64) -> Option<Vec<ZipCdEntry>> {
+    let mut entries = Vec::new();
+    let mut pos = 0usize;
+    while pos + 46 <= cd.len() {
+        let rec = &cd[pos..];
+        if &rec[..4] != b"PK\x01\x02" {
+            return None;
+        }
+        let name_len = usize::from(u16::from_le_bytes([rec[28], rec[29]]));
+        let extra_len = usize::from(u16::from_le_bytes([rec[30], rec[31]]));
+        let comment_len = usize::from(u16::from_le_bytes([rec[32], rec[33]]));
+        let disk_start = u16::from_le_bytes([rec[34], rec[35]]);
+        let lho = u64::from(u32::from_le_bytes([rec[42], rec[43], rec[44], rec[45]]));
+        let rec_len = 46usize
+            .checked_add(name_len)?
+            .checked_add(extra_len)?
+            .checked_add(comment_len)?;
+        if rec.len() < rec_len {
+            return None;
+        }
+        if disk_start != 0 {
+            return None; // multi-disk archives are out of scope
+        }
+        let name = rec[46..46 + name_len].to_vec();
+        entries.push(ZipCdEntry {
+            rec_start: pos,
+            rec_end: pos + rec_len,
+            lho,
+            name,
+        });
+        pos += rec_len;
+        if entries.len() > 200_000 {
+            return None;
+        }
+    }
+    if pos != cd.len() {
+        return None;
+    }
+    if entries.len() as u64 != entries_eocd {
+        return None;
+    }
+    for window in entries.windows(2) {
+        if window[0].lho >= window[1].lho {
+            return None;
+        }
+    }
+    Some(entries)
+}
+
+/// Build the rebuilt archive from the dump at `position` (the `PK\x05\x06`
+/// signature). Returns `Ok(Err(reason))` when the archive cannot be
+/// reconstructed (the caller falls back to the tail salvage) and `Err`
+/// only for I/O failures.
+fn zip_rebuild(
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+) -> io::Result<Result<ZipRebuilt, String>> {
+    let bail = |msg: &str| Ok(Err(msg.to_string()));
+    // End record: signature(4) disk(2) cd_disk(2) entries_disk(2)
+    // entries_total(2) cd_size(4) cd_offset(4) comment_len(2).
+    let Some(eocd) = salvage_read(file, position, 22, file_len)? else {
+        return bail("dump ended inside the ZIP end record");
+    };
+    let entries_eocd = u64::from(u16::from_le_bytes([eocd[10], eocd[11]]));
+    let cd_size = u64::from(u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]));
+    let cd_offset = u64::from(u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]));
+    let comment_len = u64::from(u16::from_le_bytes([eocd[20], eocd[21]]));
+    if eocd[4..8] != [0, 0, 0, 0] {
+        return bail("ZIP claims to continue on another disk");
+    }
+    if entries_eocd == 0 || entries_eocd == 0xFFFF {
+        return bail("end record declares no entries (or is a ZIP64 sentinel)");
+    }
+    if cd_offset == 0xFFFF_FFFF || cd_size == 0xFFFF_FFFF {
+        return bail("ZIP64 offsets are out of scope");
+    }
+    let archive_end = position + 22 + comment_len;
+    if archive_end > file_len {
+        return bail("dump ended before the ZIP comment");
+    }
+    if cd_size < 46 || cd_size > max_size || cd_size > position {
+        return bail("implausible central-directory size");
+    }
+    let cd_abs = position - cd_size;
+    let start = match cd_abs.checked_sub(cd_offset) {
+        Some(start) => start,
+        None => return bail("central-directory offset underflows the start"),
+    };
+    // Everything is relative to the (possibly overwritten) dump head but
+    // the CD and end record are exact, so `start` is exact too.
+    let cd_len = cd_size as usize;
+    let Some(cd) = salvage_read(file, cd_abs, cd_len, file_len)? else {
+        return bail("dump ended inside the central directory");
+    };
+    let Some(entries) = parse_zip_central_directory(&cd, entries_eocd) else {
+        return bail("central directory does not parse");
+    };
+    // Verify every member's local header against the CD. The destroyed
+    // head takes out whole members in a prefix; any member whose header
+    // (or name) does not match is dropped.
+    let mut kept: Vec<(u64, usize)> = Vec::with_capacity(entries.len());
+    let mut dropped_names: Vec<String> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let m_abs = match start.checked_add(entry.lho) {
+            Some(m_abs) => m_abs,
+            None => {
+                dropped_names.push(String::from_utf8_lossy(&entry.name).into_owned());
+                continue;
+            }
+        };
+        if m_abs >= cd_abs {
+            dropped_names.push(String::from_utf8_lossy(&entry.name).into_owned());
+            continue;
+        }
+        let Some(local) = salvage_read(file, m_abs, 30, file_len)? else {
+            dropped_names.push(String::from_utf8_lossy(&entry.name).into_owned());
+            continue;
+        };
+        if &local[..4] != b"PK\x03\x04" {
+            dropped_names.push(String::from_utf8_lossy(&entry.name).into_owned());
+            continue;
+        }
+        let name_len = u64::from(u16::from_le_bytes([local[26], local[27]]));
+        if name_len > 4096 {
+            dropped_names.push(String::from_utf8_lossy(&entry.name).into_owned());
+            continue;
+        }
+        let Some(local_name) = salvage_read(file, m_abs + 30, name_len as usize, file_len)? else {
+            dropped_names.push(String::from_utf8_lossy(&entry.name).into_owned());
+            continue;
+        };
+        if local_name != entry.name {
+            // Local and CD names must agree byte for byte; a random hit on
+            // `PK\x03\x04` almost never does.
+            dropped_names.push(String::from_utf8_lossy(&entry.name).into_owned());
+            continue;
+        }
+        kept.push((m_abs, i));
+    }
+    if kept.len() == entries.len() {
+        // Nothing was dropped: the header-first pass owns this file and
+        // already carved it, so there is nothing to rebuild.
+        return bail("the archive parses end to end; header-first owns it");
+    }
+    if kept.is_empty() {
+        return bail("no member's local header survived");
+    }
+    // Assemble the rebuilt archive. A member's span runs from its local
+    // header up to the next surviving member's local header (or to the
+    // central directory for the last one), which also swallows any data
+    // descriptor the member carries.
+    let mut bytes = Vec::new();
+    let mut new_lho: Vec<(usize, u64)> = Vec::with_capacity(kept.len());
+    let mut total: u64 = 0;
+    for (pos, &(m_abs, index)) in kept.iter().enumerate() {
+        let end_span = kept.get(pos + 1).map(|&(next, _)| next).unwrap_or(cd_abs);
+        let span = end_span.saturating_sub(m_abs);
+        if span == 0 {
+            return bail("member spans overlap");
+        }
+        total = match total.checked_add(span) {
+            Some(total) => total,
+            None => return bail("rebuilt size overflow"),
+        };
+        if total > max_size {
+            return bail("rebuilt archive exceeds the size cap");
+        }
+        let Some(segment) = salvage_read(file, m_abs, span as usize, file_len)? else {
+            return bail("dump ended inside a member's data");
+        };
+        new_lho.push((index, bytes.len() as u64));
+        bytes.extend_from_slice(&segment);
+    }
+    // Rewrite the central directory with the new local-header offsets.
+    let new_lho: std::collections::HashMap<usize, u64> = new_lho.into_iter().collect();
+    let cd_start = bytes.len() as u64;
+    for &(_, index) in &kept {
+        let entry = &entries[index];
+        let Some(&lho32) = new_lho.get(&index) else {
+            return bail("missing rewritten member offset");
+        };
+        if lho32 > u64::from(u32::MAX) {
+            return bail("rebuilt offsets outgrow the 32-bit ZIP format");
+        }
+        let mut rec = cd[entry.rec_start..entry.rec_end].to_vec();
+        rec[42..46].copy_from_slice(&(lho32 as u32).to_le_bytes());
+        bytes.extend_from_slice(&rec);
+    }
+    let new_cd_size = bytes.len() as u64 - cd_start;
+    if cd_start > u64::from(u32::MAX) || new_cd_size > u64::from(u32::MAX) {
+        return bail("rebuilt central directory outgrows the 32-bit ZIP format");
+    }
+    // Rewrite the end record; the archive comment is copied verbatim.
+    let mut new_eocd = eocd;
+    let kept_count = kept.len() as u16;
+    new_eocd[4..6].copy_from_slice(&0u16.to_le_bytes());
+    new_eocd[6..8].copy_from_slice(&0u16.to_le_bytes());
+    new_eocd[8..10].copy_from_slice(&kept_count.to_le_bytes());
+    new_eocd[10..12].copy_from_slice(&kept_count.to_le_bytes());
+    new_eocd[12..16].copy_from_slice(&(new_cd_size as u32).to_le_bytes());
+    new_eocd[16..20].copy_from_slice(&(cd_start as u32).to_le_bytes());
+    bytes.extend_from_slice(&new_eocd);
+    if comment_len > 0 {
+        let Some(comment) = salvage_read(file, position + 22, comment_len as usize, file_len)?
+        else {
+            return bail("dump ended inside the ZIP comment");
+        };
+        bytes.extend_from_slice(&comment);
+    }
+    // Hash and entropy of the rebuilt bytes.
+    let bytes_len = bytes.len() as u64;
+    let mut hasher = Sha256::new();
+    let mut counts = [0u64; 256];
+    hasher.update(&bytes);
+    for &byte in &bytes {
+        counts[byte as usize] += 1;
+    }
+    let kept_len = kept.len();
+    let payload_start = kept[0].0;
+    let dropped_count = dropped_names.len();
+    let shown: Vec<&str> = dropped_names.iter().map(String::as_str).take(8).collect();
+    let suffix = if dropped_names.len() > 8 { ", ..." } else { "" };
+    let names = shown.join(", ");
+    let notes = format!(
+        "rebuild: ZIP from surviving central directory; dropped {dropped_count} member(s) with overwritten head/local header ({names}{suffix}); {kept_len} member(s) survive"
+    );
+    Ok(Ok(ZipRebuilt {
+        archive_start: start,
+        bytes,
+        payload_start,
+        archive_end,
+        sha256: hex(&hasher.finalize()),
+        entropy: entropy(&counts, bytes_len),
+        notes,
     }))
 }
 
@@ -5549,6 +6083,12 @@ fn carve_zip(source: &mut Source<'_>) -> io::Result<Verdict> {
         return Ok(Verdict::Truncated(
             "dump ended inside the ZIP archive comment".to_string(),
         ));
+    }
+    // The local-header walk that got us here proves only byte syntax; the
+    // central directory carries the true member offsets. Verify them, or an
+    // archive with a ruined head would come out "complete" yet unusable.
+    if let Some(reason) = verify_zip_central_directory(source.file, eocd, source.end, &record)? {
+        return Ok(Verdict::Invalid(reason));
     }
     Ok(Verdict::Valid)
 }
@@ -8496,6 +9036,58 @@ mod tests {
         out
     }
 
+    /// A ZIP with several stored members, for the head-loss rebuild test
+    /// (ROADMAP 8.13.1). Returns the archive bytes.
+    fn zip_multi(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut local_offsets = Vec::with_capacity(members.len());
+        for (name, payload) in members {
+            local_offsets.push(out.len() as u32);
+            let name_bytes = name.as_bytes();
+            let crc = crc32(0xffff_ffff, payload) ^ 0xffff_ffff;
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // stored
+            out.extend_from_slice(&0u16.to_le_bytes()); // time
+            out.extend_from_slice(&0u16.to_le_bytes()); // date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(payload);
+        }
+        let cd_start = out.len() as u32;
+        for ((name, payload), &lho) in members.iter().zip(&local_offsets) {
+            let name_bytes = name.as_bytes();
+            let crc = crc32(0xffff_ffff, payload) ^ 0xffff_ffff;
+            out.extend_from_slice(b"PK\x01\x02");
+            out.extend_from_slice(&20u16.to_le_bytes()); // made by
+            out.extend_from_slice(&20u16.to_le_bytes()); // needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // stored
+            out.extend_from_slice(&[0u8; 4]); // time + date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&[0u8; 12]); // extra, comment, disk, attrs
+            out.extend_from_slice(&lho.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+        }
+        let cd_size = out.len() as u32 - cd_start;
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&[0u8; 4]); // this disk + central disk
+        out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        out
+    }
+
     /// Deterministic high-entropy bytes standing in for ciphertext.
     fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
         let mut state = seed | 1;
@@ -8659,6 +9251,125 @@ mod tests {
         assert_eq!(tail.offset, tail_at as u64);
         assert_eq!(tail.size, (dump.len() - 64 - tail_at) as u64);
         assert_eq!(tail.corrupted_offset, Some(tail.offset));
+    }
+
+    #[test]
+    fn salvage_rebuilds_a_zip_lost_to_an_overwritten_head() {
+        // A multi-member archive whose first member is destroyed entirely:
+        // the reconstruction must drop exactly that member and ship a valid
+        // archive holding the two survivors (ROADMAP 8.13.1).
+        let zip = zip_multi(&[
+            ("doomed.txt", &vec![b'A'; 9000]),
+            (
+                "b.txt",
+                b"second member survives the overwritten head intact",
+            ),
+            ("c.txt", b"third member too"),
+        ]);
+        let archive_at = 64usize;
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&zip);
+        dump.extend_from_slice(&[0u8; 64]);
+        let overwrite = pseudo_random(4096, 0x1357_9bdf_2468_ace1);
+        dump[archive_at..archive_at + overwrite.len()].copy_from_slice(&overwrite);
+
+        let path = write_dump("zip-headloss", &dump);
+        let out_dir = path.parent().unwrap().join("out");
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_incomplete_dir(true)
+            .with_salvage(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        let root = path.parent().unwrap().to_path_buf();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.kind, CarveKind::Zip);
+        assert_eq!(file.role, CarveRole::Rebuilt);
+        assert!(!file.complete);
+        assert_eq!(file.tier, 2);
+        assert_eq!(file.evidence, vec!["eocd_ok", "cd_ok", "local_headers_ok"]);
+        assert!(file.notes.starts_with("rebuild: ZIP"), "{:?}", file.notes);
+        assert!(file.notes.contains("dropped 1 member"), "{:?}", file.notes);
+        assert!(file.notes.contains("doomed.txt"), "{:?}", file.notes);
+        assert_eq!(file.offset, (archive_at + 30 + 10 + 9000) as u64); // first surviving local header
+        assert_eq!(file.corrupted_offset, Some(file.offset));
+
+        let carved = std::fs::read(file.path.as_ref().unwrap()).unwrap();
+        assert!(carved.windows(5).any(|w| w == b"b.txt"));
+        assert!(carved.windows(5).any(|w| w == b"c.txt"));
+        assert!(!carved.windows(5).any(|w| w == b"doomed.txt"));
+        // The rewritten archive re-passes our own ZIP validator.
+        let mut source = File::open(file.path.as_ref().unwrap()).unwrap();
+        let len = carved.len() as u64;
+        let mut check = Source::new(&mut source, 0, len);
+        assert!(matches!(carve_zip(&mut check).unwrap(), Verdict::Valid));
+
+        // The trailer after the end record (ransomware victim ID) is cut.
+        let mut dumped = vec![0u8; 64];
+        dumped.extend_from_slice(&zip);
+        dumped.extend_from_slice(b"VICTIM-ID-777");
+        // Ruin the head exactly as before: this keeps the rebuild path on,
+        // with a ransomware trailer after the end record.
+        let overwrite = pseudo_random(4096, 0x9e37_79b9_7f4a_7c15);
+        dumped[64..64 + overwrite.len()].copy_from_slice(&overwrite);
+        let dump2 = write_dump("zip-headloss-trailer", &dumped);
+        let out2 = dump2.parent().unwrap().join("out");
+        let options2 = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report2 = Carver::new(options2)
+            .with_incomplete_dir(true)
+            .with_salvage(true)
+            .carve_to_dir(dump2.to_str().unwrap(), &out2)
+            .unwrap();
+        assert_eq!(report2.files.len(), 1, "{report2:?}");
+        assert_eq!(report2.files[0].role, CarveRole::Rebuilt);
+        let bytes = std::fs::read(report2.files[0].path.as_ref().unwrap()).unwrap();
+        assert!(!bytes.windows(13).any(|w| w == b"VICTIM-ID-777"));
+        std::fs::remove_dir_all(dump2.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn salvage_falls_back_to_tail_when_every_member_is_lost() {
+        // One member whose local header is destroyed but whose tail bytes
+        // survive past the overwritten head; the central directory survives,
+        // nothing survives to reconstruct, so the reconstruction gives up and
+        // the tail salvage takes over.
+        let zip = zip_multi(&[("only.txt", &vec![b'O'; 5000])]);
+        let archive_at = 64usize;
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&zip);
+        dump.extend_from_slice(&[0u8; 64]);
+        let overwrite = pseudo_random(4096, 0x1357_9bdf_2468_ace1);
+        dump[archive_at..archive_at + overwrite.len()].copy_from_slice(&overwrite);
+
+        let path = write_dump("zip-headloss-lost", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|file| file.role != CarveRole::Rebuilt),
+            "nothing may be rebuilt: {report:?}"
+        );
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert!(report.files[0].notes.starts_with("salvage:tail"));
     }
 
     #[test]

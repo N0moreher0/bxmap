@@ -6,6 +6,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **ZIP with a surviving central directory is rebuilt instead of only
+  tail-salvaged (ROADMAP 8.13.1, ZIP part, P1)**. When the first 4 KiB of an
+  archive were overwritten, the header pass sees nothing, but the central
+  directory and end record (always at the end) survive: the archive's logical
+  start is computed exactly (`cd_abs - cd_offset`) and the reconstruction
+  drops only the member(s) whose local headers are inside the destroyed
+  head, keeps every surviving member's byte range, and rewrites the central
+  directory and end record with adjusted local-header offsets. The result is
+  a smaller, fully valid archive that opens in real tools (Python `zipfile`
+  `testzip` passes on the bench's real files: 5/6 members recovered from a
+  head-destroyed `archive_notes.zip`, all ZIPs named in this entry unwrap
+  clean). Members dropped are recorded by name in the notes (never silent);
+  the rebuilt file re-passes bxmap's own ZIP validator before it is handed
+  out, otherwise it is rejected with a reason. Named
+  `.zip.rebuilt.carved` (or `.docx.rebuilt.carved` when the kept directory
+  names sniff to OOXML), role `rebuilt`, `complete: false`, tier 2,
+  `confidence: medium`, evidence `eocd_ok`/`cd_ok`/`local_headers_ok`,
+  `corrupted_offset` at the first surviving member. Runs inside the salvage
+  pass (part of `--carve`), no new flag; when the archive cannot be
+  reconstructed (no surviving member, no parseable CD), it falls back to the
+  existing `salvage:tail` behavior unchanged.
 - **`--carve headloss`: clean tail of a file whose head was overwritten
   (ROADMAP 8.13.3)**. New opt-in kind (`CarveKind::HeadLoss`, not part of
   `all`; ask for it with `--carve headloss` or `--carve all,headloss`).
@@ -129,6 +150,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   validated. `carves_mp4_file` only passed by accident of the
   `size == 0` branch. MP4 files now validate at the correct box
   boundaries.
+- **`carve_zip` accepted un-openable archives as `complete`** (found by the
+  Lab 6 forensic dump and the real-file bench): the validator walked local
+  headers and required a `PK\x05\x06` to exist, but never checked the
+  central directory's member offsets against them. Measured: all eight
+  `complete` ZIPs bxmap previously carved from the Lab 6 dump cannot be
+  opened by Python `zipfile` (`Bad magic number for central directory`; one
+  of them structurally opens with a corrupt `background.js` member), so
+  every Lab 6 "complete ZIP" it ever reported was a false positive. The
+  validator now strictly verifies the CD chain (EOCD count matches CD
+  records, records bounded and in order, each member's local header exists,
+  and local and CD names agree byte for byte). Archives that pass stay
+  `complete`; everything else is rejected or fixed by the rebuild below.
+  ZIP64 sentinels and absurdly large directories are given the benefit of
+  the doubt (kept `complete`).
 - **XZ validator rejected every real-world XZ file** (found by the real-file
   carve bench): the stream-header CRC-32 was computed over `magic + flags`
   instead of the two stream-flag bytes only, and with the wrong (unconditioned)
