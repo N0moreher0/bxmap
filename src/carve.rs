@@ -6210,7 +6210,8 @@ fn carve_gif(source: &mut Source<'_>) -> io::Result<Verdict> {
     let packed = lsd[4];
     source.skip(7)?;
     if packed & 0x80 != 0 {
-        let gct = 3u64 << (u32::from(packed & 0x07));
+        // Global color table: 3 * 2^(bits+1) bytes (6 << bits).
+        let gct = 3u64 << (u32::from(packed & 0x07) + 1);
         if !room_left(source, gct) {
             return Ok(Verdict::Truncated(
                 "dump ended inside the GIF global color table".to_string(),
@@ -6251,7 +6252,8 @@ fn carve_gif(source: &mut Source<'_>) -> io::Result<Verdict> {
                 let image_packed = desc[8];
                 source.skip(9)?;
                 if image_packed & 0x80 != 0 {
-                    let lct = 3u64 << (u32::from(image_packed & 0x07));
+                    // Local color table: 3 * 2^(bits+1) bytes (6 << bits).
+                    let lct = 3u64 << (u32::from(image_packed & 0x07) + 1);
                     if !room_left(source, lct) {
                         return Ok(Verdict::Truncated(
                             "dump ended inside a GIF local color table".to_string(),
@@ -7200,8 +7202,15 @@ fn carve_mp3(source: &mut Source<'_>) -> io::Result<Verdict> {
         }
     }
     let _ = frames_start;
-    if frames == 0 {
-        return Ok(Verdict::Invalid("no MPEG audio frames found".to_string()));
+    if frames < 2 {
+        // A single noise-matching frame is not a file (measured on the
+        // carver bench: random data matches the frame-sync predicate
+        // often enough to fill an entire output directory). A real MP3
+        // has many consecutive frames; require the stream to resync at
+        // least once.
+        return Ok(Verdict::Invalid(
+            "MP3 stream has fewer than two consecutive frames".to_string(),
+        ));
     }
     Ok(Verdict::Valid)
 }
@@ -7246,7 +7255,9 @@ fn carve_xz(source: &mut Source<'_>) -> io::Result<Verdict> {
         ));
     }
     let expected_crc = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-    if crc32(0, &header[..8]) != expected_crc {
+    // XZ stream-header CRC32 covers only the two stream-flag bytes,
+    // conditioned the zlib way (init 0xffffffff, final xor 0xffffffff).
+    if crc32(0xffff_ffff, &header[6..8]) ^ 0xffff_ffff != expected_crc {
         return Ok(Verdict::Invalid(
             "XZ header CRC-32 does not match".to_string(),
         ));
@@ -10244,9 +10255,14 @@ mod new_formats {
     }
 
     fn minimal_mp3_frame() -> Vec<u8> {
-        // MPEG1 Layer III, 128 kbps, 44100 Hz. bitrate idx 9, sr idx 0.
+        // MPEG1 Layer III, 128 kbps, 44100 Hz: frame length is
+        // 144 * 128000 / 44100 = 417 bytes INCLUDING the 4-byte header
+        // (so 413 bytes of payload per frame). Two consecutive frames:
+        // a lone frame is (correctly) not a file.
         let mut out = vec![0xff, 0xfb, 0x90, 0x00];
-        out.extend(std::iter::repeat(0u8).take(417));
+        out.extend(std::iter::repeat(0u8).take(413));
+        out.extend_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+        out.extend(std::iter::repeat(0u8).take(413));
         out
     }
 
@@ -10255,6 +10271,39 @@ mod new_formats {
         out.extend_from_slice(b"ID3");
         out.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0]); // ver 3, syncsafe size 0
         out.extend_from_slice(&minimal_mp3_frame());
+        out
+    }
+
+    /// Minimal but structurally valid XZ: magic + stream flags 0x0000 +
+    /// CRC32 of the two flag bytes (which is all the spec covers).
+    fn minimal_xz() -> Vec<u8> {
+        vec![
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, // magic
+            0x00, 0x00, // stream flags (check = 0x00)
+            0xff, 0x12, 0xd9, 0x41, // CRC32 of the stream flags, little-endian
+        ]
+    }
+
+    /// A GIF whose global color table is exactly 2 entries (packed
+    /// 0b1000_0000): the table is 6 bytes, so any off-by-one in the size
+    /// check lands the walker in the middle of the table.
+    fn minimal_gif_gct() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GIF89a");
+        out.extend_from_slice(&1u16.to_le_bytes()); // width
+        out.extend_from_slice(&1u16.to_le_bytes()); // height
+        out.push(0x80); // packed: GCT present, size bits = 0 (2 entries)
+        out.push(0); // background
+        out.push(0); // aspect
+        out.extend_from_slice(&[0u8; 6]); // GCT (2 entries * 3 bytes)
+        out.push(0x2c); // image descriptor
+        out.extend_from_slice(&[0u8; 8]); // left/top/width/height
+        out.push(0x00); // packed: no local color table
+        out.push(2); // LZW minimum code size
+        out.push(2); // sub-block size
+        out.extend_from_slice(&[0x44, 0x01]); // data
+        out.push(0x00); // block terminator
+        out.push(0x3b); // trailer
         out
     }
 
@@ -10329,6 +10378,22 @@ mod new_formats {
             assert_eq!(report.files[0].kind, kind, "{name}");
             assert!(report.files[0].complete, "{name}: {:?}", report.files[0]);
         }
+    }
+
+    #[test]
+    fn xz_and_gif_with_a_global_color_table_are_carved() {
+        // XZ validates magic + stream flags + their CRC, then carves to the
+        // candidate window: it is *never* complete (the body is a Huffman
+        // bit stream we do not decode).
+        let report = carve_one("xz", CarveKind::Xz, &minimal_xz());
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert!(!report.files[0].complete, "{:?}", report.files[0]);
+        assert_eq!(report.files[0].kind, CarveKind::Xz);
+        // A GIF with a 2-entry global color table (6 bytes) must walk out of
+        // the table cleanly; before the fix the walker desynced inside it.
+        let report = carve_one("gif-gct", CarveKind::Gif, &minimal_gif_gct());
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert!(report.files[0].complete, "{:?}", report.files[0]);
     }
 
     #[test]

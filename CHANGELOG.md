@@ -72,6 +72,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   validated. `carves_mp4_file` only passed by accident of the
   `size == 0` branch. MP4 files now validate at the correct box
   boundaries.
+- **XZ validator rejected every real-world XZ file** (found by the real-file
+  carve bench): the stream-header CRC-32 was computed over `magic + flags`
+  instead of the two stream-flag bytes only, and with the wrong (unconditioned)
+  CRC32. Every `.xz` produced by `lzma.compress` failed the header check.
+  The CRC now covers `header[6..8]` with the standard zlib conditioning.
+- **GIF validator desynced inside any GIF with a color table** (found by the
+  same bench): the global/local color table was skipped with `3 << bits`
+  instead of `3 * 2^(bits+1)` (6 << bits), so every GIF with a GCT/LCT was
+  rejected (or silently misparsed). The walker now skips the correct table
+  size for both tables.
+- **MP3 validator accepted a single noise-matching frame as a complete T1
+  MP3** (found by the same bench, 992–3127 false positives per image,
+  starving `--carve-max-files`): a file is now complete only when the stream
+  resyncs at least once more, i.e. at least two consecutive frames. This
+  eliminates the random-data MP3 false positives seen on the bench image
+  (spurious carves dropped from 2458 to 5).
 
 ### Added
 - **Periodic partial-encryption heuristic** (`ROADMAP 8.7.3`). Carved files
