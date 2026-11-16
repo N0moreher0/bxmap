@@ -6,6 +6,47 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **JPEG entropy-coded scan survives while the head is destroyed: `--carve`
+  now salvages a JPEG tail (ROADMAP 8.12.1, P1)**. A bare `FF D9` footer is
+  not a trustworthy footer, so the salvage pass only accepts one when the
+  bytes behind it are stuffing-clean: every `FF` must be followed by `00`
+  (stuffed literal), `D0..D7` (RSTn) or another `FF` (padding). Random data
+  violates ~every 267 bytes, so an 8 KiB stuffing-clean run behind an
+  `FF D9` cannot happen by chance (measured: 0 candidate tails in 8 MiB of
+  noise; `--carve jpeg` on the 388 MB bench image finds exactly the ruined
+  `img_photo.jpg` tail). The walk is **footer-first, backwards, in 16 KiB
+  windows** and stops at the last stuffing violation. Guard rails: run
+  length >= 8 KiB; a run that is > 90% NUL bytes is rejected (zero padding
+  is not scan data); the coding process is read from the header when it
+  survives — SOF0/SOF1 (baseline/extended sequential Huffman) is accepted,
+  SOF2..SOF15 and `DAC` (arithmetic) are refused; an unreadable header
+  (the normal ruined-head case) is accepted and labelled `sof:unreadable`.
+  `RST` markers are legal in the run (`dri_seen`); an `SOS` boundary stops
+  the run at the last scan (`multi-scan?`, progressive). Output: the scan
+  goes to `partial/` as `<offset>-jpeg-<hash>.jpg.tail.carved` with
+  `role: tail`, `complete: false`, tier 2, `confidence: low`, evidence
+  `footer`/`stuffing_run` (plus `sof:…`, optionally `dri_seen`,
+  `multi-scan?`); `corrupted_offset` = tail start. Ransomware trailer
+  bytes after the EOI are cut from the file and recorded in the index
+  (`trailer_offset`, `trailer_len` (<= 1 MiB), `trailer_sha256`,
+  `trailer_preview` <= 64-byte `hex | ascii` preview), exactly like the
+  MP4 path. No new flag; runs as part of `--carve` (all/jpeg), and
+  `--carve-out` refuses to overwrite an existing file. Unit tests cover
+  the ruined-head salvage, RST handling, the SOS boundary, the NUL gate,
+  the 8 KiB floor, `prior_end` coverage, and the sequential/progressive/
+  arithmetic SOF gates; the golden CLI fixture covers the whole path
+  (`golden_carve_jpeg_tail_after_partial_encryption`).
+  Bench (388 MB, 60 labelled items): `img_photo.jpg head4k` MISS →
+  **COVERAGE 96%** (tail 105 KB of the 108 KB scan), `img_photo.jpg
+  trunc` MISS → **EXACT 100%** (the last 60% survived and the tail starts
+  at the cut); recovered total 25 → 27 (spurious unchanged: 3);
+  `all,text` 31 → 33, `all,headloss` 37 → 39. Lab 6 dump (1.6 GB, `--carve
+  all`): 128 files, unchanged — no JPEG tails and no regressions.
+  Scoring note: `bench/score.py` now (a) attributes a `role=tail` carve to
+  the item whose range contains its **end** (a backward walk may swallow
+  arbitrarily much clean noise before the damage boundary), and (b) scores
+  such tails by the **longest common suffix** with the corpus (>= 50% =
+  COVERAGE), because a tail necessarily starts inside the destroyed head.
 - **ZIP with a surviving central directory is rebuilt instead of only
   tail-salvaged (ROADMAP 8.13.1, ZIP part, P1)**. When the first 4 KiB of an
   archive were overwritten, the header pass sees nothing, but the central

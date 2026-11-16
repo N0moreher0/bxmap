@@ -1874,7 +1874,15 @@ impl Carver {
                         return false;
                     }
                 };
-                let size = tail.end - tail.start;
+                let SalvageTail {
+                    start: tail_start,
+                    end: tail_end,
+                    spike: tail_spike,
+                    note: tail_note,
+                    extra_evidence,
+                    trailer,
+                } = tail;
+                let size = tail_end - tail_start;
                 if size < self.options.min_size {
                     report.rejected += 1;
                     continue;
@@ -1883,11 +1891,11 @@ impl Carver {
                 // header is gone, so nothing can be sniffed): an exact
                 // extension filter cannot vouch for it and skips it.
                 if !self.ext_filter.allows(kind, kind.default_ext()) {
-                    covered.push((tail.start, tail.end));
+                    covered.push((tail_start, tail_end));
                     report.filtered += 1;
                     continue;
                 }
-                let (sha256, entropy) = match digest_region(&mut source, tail.start, size) {
+                let (sha256, entropy) = match digest_region(&mut source, tail_start, size) {
                     Ok(digest) => digest,
                     Err(error) => {
                         failure = Some(error);
@@ -1895,18 +1903,18 @@ impl Carver {
                     }
                 };
                 let partial_encryption =
-                    match periodic_encryption_scan(&mut source, tail.start, size) {
+                    match periodic_encryption_scan(&mut source, tail_start, size) {
                         Ok(hint) => hint,
                         Err(error) => {
                             failure = Some(error);
                             return false;
                         }
                     };
-                covered.push((tail.start, tail.end));
+                covered.push((tail_start, tail_end));
                 if let Some(&index) = by_hash.get(&sha256) {
                     report.duplicates += 1;
                     report.duplicate_bytes += size;
-                    report.files[index].duplicates.push(tail.start);
+                    report.files[index].duplicates.push(tail_start);
                     continue;
                 }
                 let path = match out_dir {
@@ -1918,7 +1926,7 @@ impl Carver {
                             failure = Some(error);
                             return false;
                         }
-                        let name = carved_file_name(tail.start, kind, CarveRole::Tail, &sha256);
+                        let name = carved_file_name(tail_start, kind, CarveRole::Tail, &sha256);
                         let path = partial.join(name);
                         if path.exists() {
                             failure = Some(io::Error::new(
@@ -1930,7 +1938,7 @@ impl Carver {
                             ));
                             return false;
                         }
-                        if let Err(error) = write_region(&mut source, tail.start, size, &path) {
+                        if let Err(error) = write_region(&mut source, tail_start, size, &path) {
                             failure = Some(error);
                             return false;
                         }
@@ -1942,24 +1950,26 @@ impl Carver {
                 report.bytes_written += size;
                 let (tier, evidence, confidence) =
                     evidence_for(CarveRole::Tail, kind, false, "kind");
+                let mut evidence = evidence;
+                evidence.extend(extra_evidence);
                 let evidence = with_suspect(evidence, partial_encryption);
                 report.files.push(CarvedFile {
-                    offset: tail.start,
+                    offset: tail_start,
                     kind,
                     size,
                     complete: false,
                     sha256,
                     entropy,
-                    notes: tail.note,
+                    notes: tail_note,
                     path,
                     duplicates: Vec::new(),
-                    corrupted_offset: Some(tail.start),
-                    entropy_spike_at: tail.spike,
+                    corrupted_offset: Some(tail_start),
+                    entropy_spike_at: tail_spike,
                     partial_encryption,
-                    trailer_offset: None,
-                    trailer_len: None,
-                    trailer_sha256: None,
-                    trailer_preview: None,
+                    trailer_offset: trailer.0,
+                    trailer_len: trailer.1,
+                    trailer_sha256: trailer.2,
+                    trailer_preview: trailer.3,
                     tracks_intact: None,
                     ext: kind.default_ext().to_string(),
                     ext_source: "kind".to_string(),
@@ -2834,6 +2844,25 @@ const PNG_IEND: &[u8] = b"\x00\x00\x00\x00IEND\xaeB`\x82";
 /// MP4 `moov` box type. Short and common in random data, so the salvage
 /// pass only accepts it after the full `moov` structure validates (8.11).
 const MP4_MOOV: &[u8] = b"moov";
+/// JPEG end-of-image marker. Two bytes, but ROADMAP 8.12.1 shows a false
+/// `FF D9` in random data cannot produce an 8 KiB stuffing-clean run behind
+/// it (8 MiB of noise yields zero candidate tails), and the acceptance
+/// checks below (run length, NUL gate, SOF check) close the gap further.
+const JPEG_EOI: &[u8] = b"\xff\xd9";
+/// Minimum stuffing-clean run behind an `FF D9` for a JPEG tail (ROADMAP
+/// 8.12 M0): 8 KiB, confirmed against 8 MiB of random noise.
+const JPEG_RUN_MIN: u64 = 8 * 1024;
+/// Largest ransomware trailer after an `FF D9` we record in the index
+/// (mirrors `MP4_TRAILER_CAP`).
+const JPEG_TRAILER_CAP: u64 = 1024 * 1024;
+/// How far back from offset 0 we look for SOI + segment headers when
+/// deciding the JPEG coding process (baseline-Huffman vs progressive /
+/// arithmetic).
+const JPEG_SOF_SCAN_CAP: u64 = 256 * 1024;
+/// A JPEG tail whose run is more than 90 % NUL bytes is a zero-filled
+/// region, not scan data. Flat JPEGs still pass (their scans stay >= 6
+/// bits/byte).
+const JPEG_NUL_PERCENT: u64 = 90;
 /// How far back from an IEND the PNG tail salvage reads at most.
 const PNG_SALVAGE_WINDOW: u64 = 64 * 1024 * 1024;
 /// Longest footer minus one: chunk overlap so a footer split across two
@@ -2841,39 +2870,51 @@ const PNG_SALVAGE_WINDOW: u64 = 64 * 1024 * 1024;
 const FOOTER_OVERLAP: usize = 11;
 
 /// Footers the salvage pass understands. Only formats whose footer is long or
-/// can be checked structurally are listed: a bare JPEG `FF D9` would flood the
-/// pass with false positives, and JPEG bodies are compressed already, so an
-/// entropy boundary says nothing about them. PNG is walked back chunk by
-/// chunk (CRC-verified) instead of by entropy. An MP4 `moov` is accepted only
-/// when the whole box parses and its chunk tables cross-check (8.11).
+/// can be checked structurally are listed. JPEG is gated on a stuffing-clean
+/// run of at least [`JPEG_RUN_MIN`] bytes plus an SOF check (baseline Huffman
+/// only) instead of entropy — flat-but-real JPEG scans sit at 6.9-7.2
+/// bits/byte, so entropy is never a rejection condition for them.
 fn has_footer(kind: CarveKind) -> bool {
     matches!(
         kind,
-        CarveKind::Zip | CarveKind::Pdf | CarveKind::Png | CarveKind::Mp4
+        CarveKind::Zip | CarveKind::Pdf | CarveKind::Png | CarveKind::Mp4 | CarveKind::Jpeg
     )
 }
 
 struct FooterMatcher {
     aho: AhoCorasick,
-    kinds: [CarveKind; 4],
+    kinds: [CarveKind; 5],
 }
 
 fn footer_matcher() -> &'static FooterMatcher {
     static MATCHER: OnceLock<FooterMatcher> = OnceLock::new();
     MATCHER.get_or_init(|| FooterMatcher {
         aho: AhoCorasickBuilder::new()
-            .build([ZIP_EOCD, PDF_EOF, PNG_IEND, MP4_MOOV])
+            .build([ZIP_EOCD, PDF_EOF, PNG_IEND, MP4_MOOV, JPEG_EOI])
             .expect("footer patterns are valid"),
         kinds: [
             CarveKind::Zip,
             CarveKind::Pdf,
             CarveKind::Png,
             CarveKind::Mp4,
+            CarveKind::Jpeg,
         ],
     })
 }
 
+/// Ransomware trailer recorded in the index: `(offset, len, sha256,
+/// preview)` cut from the carved file. All `None` when there is no trailer.
+type TrailerMeta = (Option<u64>, Option<u64>, Option<String>, Option<String>);
+
+/// Backward scan window for the JPEG EOI oracle. Every footer candidate
+/// costs at most one window unless the data really is stuffing-clean,
+/// which keeps the whole carve O(n) even with thousands of false `FF D9`
+/// in a dump (a full 388 MB image with 5 237 candidates must finish in
+/// seconds, not minutes).
+const JPEG_SCAN_WINDOW: u64 = 16 * 1024;
+
 /// A surviving tail found behind a footer.
+#[derive(Debug)]
 struct SalvageTail {
     start: u64,
     end: u64,
@@ -2881,6 +2922,13 @@ struct SalvageTail {
     /// >= 7.8 bits/byte (where the encrypted region is suspected to end).
     spike: Option<u64>,
     note: String,
+    /// Extra static evidence tokens merged into the record (ROADMAP
+    /// 8.12.1: `stuffing_run`, `sof:sequential`, `dri_seen`, ...).
+    extra_evidence: Vec<&'static str>,
+    /// Ransomware trailer after the file end: `(offset, len, sha256,
+    /// preview)`, cut from the carved file and recorded in the index
+    /// (ROADMAP 8.12.1, mirrors 8.11). All `None` when there is none.
+    trailer: TrailerMeta,
 }
 
 /// Read exactly `len` bytes at `offset`, or `None` when they do not fit in
@@ -3543,6 +3591,7 @@ fn salvage_tail(
         CarveKind::Pdf => salvage_pdf_tail(file, position, file_len, max_size, prior_end),
         CarveKind::Mp4 => Ok(None), // handled by mp4_rebuild() in the salvage pass
         CarveKind::Png => salvage_png_tail(file, position, file_len, max_size, prior_end),
+        CarveKind::Jpeg => salvage_jpeg_tail(file, position, file_len, max_size, prior_end),
         _ => Ok(None),
     }
 }
@@ -3583,6 +3632,8 @@ fn salvage_zip_tail(
         note: format!(
             "salvage:tail: ZIP central directory ({entries} entries) + end record at {position:#x}; local headers and data are missing"
         ),
+        extra_evidence: Vec::new(),
+        trailer: (None, None, None, None),
     }))
 }
 
@@ -4000,8 +4051,8 @@ fn salvage_pdf_tail(
     let look = tail_len.min(4096);
     let tail_at = end - look as u64;
     if let Some(window) = salvage_read(file, tail_at, look, file_len)? {
-        let has_struct = window.windows(4).any(|w| w == b" obj")
-            || window.windows(7).any(|w| w == b"trailer");
+        let has_struct =
+            window.windows(4).any(|w| w == b" obj") || window.windows(7).any(|w| w == b"trailer");
         if !has_struct {
             return Ok(None);
         }
@@ -4015,6 +4066,8 @@ fn salvage_pdf_tail(
         note: format!(
             "salvage:tail: PDF trailer ending at {position:#x} (startxref + EOF); header and body are missing"
         ),
+        extra_evidence: Vec::new(),
+        trailer: (None, None, None, None),
     }))
 }
 
@@ -4060,6 +4113,8 @@ fn salvage_png_tail(
         note: format!(
             "salvage:tail: PNG IDAT run ({chunks} chunk(s)) + IEND at {position:#x}; signature and IHDR are missing"
         ),
+        extra_evidence: Vec::new(),
+        trailer: (None, None, None, None),
     }))
 }
 
@@ -4094,6 +4149,268 @@ fn png_previous_idat(buffer: &[u8], boundary: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// JPEG: the head (`SOI`..`SOS`) is gone but the entropy-coded scan and the
+/// final `FF D9` survived. Byte stuffing guarantees every `FF` inside the
+/// scan is followed by `00` (literal), `D0..D7` (RSTn) or another `FF`
+/// (padding), so a stuffing-clean run behind an `FF D9` has exactly one
+/// possible start: right after the last stuffing violation. Random data
+/// violates roughly every 267 bytes, so a clean run of [`JPEG_RUN_MIN`]
+/// behind an `FF D9` cannot happen by chance (ROADMAP 8.12 M0: 0 candidate
+/// tails in 8 MiB of noise; every real JPEG head4k shows its last
+/// violation inside the damaged region). The run's content is NOT fake
+/// -verified: it is labelled a low-confidence tail, never complete, never
+/// decoded as-is.
+fn salvage_jpeg_tail(
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+    prior_end: u64,
+) -> io::Result<Option<SalvageTail>> {
+    let end = position + 2;
+    if end > file_len {
+        return Ok(None);
+    }
+    let lower = prior_end.max(end.saturating_sub(max_size));
+    // Backward window scan: each window is the closest one to the EOI we
+    // have not classified yet, and we stop at the first window carrying a
+    // stuffing violation (violations closer to the EOI dominate). Random
+    // junk violates ~every 267 bytes, so false candidates cost one window.
+    let mut cursor = position;
+    // Byte right after `position` (the EOI's `FF`), used only to decide a
+    // pair straddling a window edge.
+    let mut next_byte: Option<u8> = Some(0xFF);
+    let mut last_violation: Option<u64> = None;
+    // Byte after the `FF` at the last violation (e.g. `0xDA` for an SOS
+    // scan boundary), used to label a multi-scan/progressive tail.
+    let mut violation_marker: Option<u8> = None;
+    let mut nuls: u64 = 0;
+    let mut rst_seen = false;
+    let mut window = vec![0u8; JPEG_SCAN_WINDOW as usize];
+    while cursor > lower && last_violation.is_none() {
+        let window_start = cursor.saturating_sub(JPEG_SCAN_WINDOW).max(lower);
+        let len = (cursor - window_start) as usize;
+        let Some(bytes) = salvage_read(file, window_start, len, file_len)? else {
+            return Ok(None);
+        };
+        window[..len].copy_from_slice(&bytes);
+        let buf = &window[..len];
+        let mut i = 0usize;
+        let mut win_last: Option<usize> = None;
+        while i + 1 < len {
+            if buf[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let next = buf[i + 1];
+            if next == 0x00 {
+                i += 2;
+                continue;
+            }
+            if (0xD0..=0xD7).contains(&next) {
+                rst_seen = true;
+                i += 2;
+                continue;
+            }
+            if next == 0xFF {
+                // Padding byte: legal inside a scan before the next marker.
+                i += 1;
+                continue;
+            }
+            win_last = Some(i);
+            i += 2;
+        }
+        // Pair straddling the window edge: `FF` at the very end pairs with
+        // the byte after the window (already scanned toward the EOI).
+        if len >= 1 && buf[len - 1] == 0xFF {
+            match next_byte {
+                Some(0x00) | Some(0xFF) => {}
+                Some(0xD0..=0xD7) => rst_seen = true,
+                Some(_) => win_last = Some(len - 1),
+                None => {}
+            }
+        }
+        if let Some(index) = win_last {
+            let marker = match buf.get(index + 1) {
+                Some(&byte) => byte,
+                None => next_byte.unwrap_or(0),
+            };
+            violation_marker = Some(marker);
+        }
+        match win_last {
+            Some(index) => {
+                // Only bytes after the violation belong to the run.
+                nuls += buf[index + 2..].iter().filter(|&&byte| byte == 0).count() as u64;
+                last_violation = Some(window_start + index as u64);
+            }
+            None => {
+                nuls += buf.iter().filter(|&&byte| byte == 0).count() as u64;
+            }
+        }
+        next_byte = Some(buf[0]);
+        cursor = window_start;
+    }
+    let start = match last_violation {
+        Some(violation) => violation + 2,
+        None => lower,
+    };
+    if end - start < JPEG_RUN_MIN {
+        return Ok(None);
+    }
+    // Zero-filled regions pass the stuffing oracle trivially; they are not
+    // JPEG. Real (even flat) JPEG scans stay far above this threshold.
+    if nuls * 100 > JPEG_NUL_PERCENT * (end - start) {
+        return Ok(None);
+    }
+    // The coding process decides whether a tail is allowed at all:
+    // progressive/arithmetic scans stop at the last scan boundary under a
+    // backward walk and the Huffman walker would not apply either.
+    let sof = jpeg_sof_verdict(file, file_len);
+    if sof == SofVerdict::NonSequential {
+        return Ok(None);
+    }
+    let spike = salvage_spike_before(file, start, prior_end, file_len)?;
+    let trailer = jpeg_trailer(file, end, file_len)?;
+    let mut extra_evidence: Vec<&'static str> = vec!["stuffing_run"];
+    match sof {
+        SofVerdict::Sequential => extra_evidence.push("sof:sequential"),
+        SofVerdict::Unreadable => extra_evidence.push("sof:unreadable"),
+        SofVerdict::NonSequential => unreachable!("non-sequential returned above"),
+    }
+    if rst_seen {
+        extra_evidence.push("dri_seen");
+    }
+    // A scan boundary (`SOS`) is a violation for the backward walker: the
+    // tail then starts at the final scan only.
+    let multi_scan = violation_marker == Some(0xDA);
+    if multi_scan {
+        extra_evidence.push("multi-scan?");
+    }
+    let sof_note = match sof {
+        SofVerdict::Sequential => "SOF0/SOF1 intact",
+        SofVerdict::Unreadable => "SOF unreadable (head destroyed)",
+        SofVerdict::NonSequential => unreachable!("non-sequential returned above"),
+    };
+    let scan_note = if multi_scan {
+        "; stops at the last scan (multi-scan/progressive)"
+    } else {
+        ""
+    };
+    Ok(Some(SalvageTail {
+        start,
+        end,
+        spike,
+        note: format!(
+            "salvage:tail: JPEG entropy-coded run (stuffing-clean) + EOI at {position:#x}; SOI..SOS missing ({sof_note}){scan_note}"
+        ),
+        extra_evidence,
+        trailer,
+    }))
+}
+
+/// Coding process of the JPEG whose `EOI` is being salvaged, read from the
+/// header when it survives. Ruined heads almost never parse: that is the
+/// normal `Unreadable` case, accepted as low confidence. `NonSequential`
+/// (progressive/arithmetic/lossless) is refused outright.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SofVerdict {
+    /// SOF0 (baseline) or SOF1 (extended sequential), Huffman.
+    Sequential,
+    /// Progressive, arithmetic, lossless or hierarchical: refuse.
+    NonSequential,
+    /// The header does not parse (head destroyed): accept as unreadable.
+    Unreadable,
+}
+
+fn jpeg_sof_verdict(file: &mut File, file_len: u64) -> SofVerdict {
+    let cap = file_len.min(JPEG_SOF_SCAN_CAP);
+    let buf = match salvage_read(file, 0, cap as usize, file_len) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) | Err(_) => return SofVerdict::Unreadable,
+    };
+    if buf.len() < 4 || buf[0] != 0xFF || buf[1] != 0xD8 {
+        return SofVerdict::Unreadable;
+    }
+    let mut index = 2usize;
+    let mut dac_seen = false;
+    while index + 4 <= buf.len() {
+        if buf[index] != 0xFF {
+            return SofVerdict::Unreadable;
+        }
+        let marker = buf[index + 1];
+        // Standalone markers (no length field): SOI, RSTn, TEM.
+        if marker == 0x01 || marker == 0xFF || (0xD0..=0xD7).contains(&marker) {
+            index += 2;
+            continue;
+        }
+        let length = u16::from_be_bytes([buf[index + 2], buf[index + 3]]) as usize;
+        if length < 2 {
+            return SofVerdict::Unreadable;
+        }
+        let segment_end = index + 2 + length;
+        if segment_end > buf.len() {
+            return SofVerdict::Unreadable;
+        }
+        match marker {
+            0xCC => dac_seen = true, // DAC: arithmetic coding conditioning
+            0xC0 | 0xC1 => {
+                return if dac_seen {
+                    SofVerdict::NonSequential
+                } else {
+                    SofVerdict::Sequential
+                };
+            }
+            0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB | 0xCD | 0xCE | 0xCF => {
+                return SofVerdict::NonSequential;
+            }
+            // SOS: the header ended without naming the coding process;
+            // fall back to what DAC said, else unreadable.
+            0xDA => {
+                return if dac_seen {
+                    SofVerdict::NonSequential
+                } else {
+                    SofVerdict::Unreadable
+                };
+            }
+            _ => {}
+        }
+        index = segment_end;
+    }
+    SofVerdict::Unreadable
+}
+
+/// Ransomware trailer after the JPEG's `FF D9`: bytes up to the end of the
+/// dump, capped at [`JPEG_TRAILER_CAP`], hashed and previewed for the index.
+/// The carved file itself never contains them.
+fn jpeg_trailer(file: &mut File, end: u64, file_len: u64) -> io::Result<TrailerMeta> {
+    let trailer_full = file_len - end;
+    if trailer_full == 0 {
+        return Ok((None, None, None, None));
+    }
+    let trailer_len = trailer_full.min(JPEG_TRAILER_CAP);
+    let Some(bytes) = salvage_read(file, end, trailer_len as usize, file_len)? else {
+        return Ok((None, None, None, None));
+    };
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hex(&hasher.finalize())
+    };
+    let preview_bytes = &bytes[..bytes.len().min(64)];
+    let ascii: String = preview_bytes
+        .iter()
+        .map(|&byte| {
+            if (0x20..=0x7e).contains(&byte) {
+                byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    let preview = format!("{} | {ascii}", hex(preview_bytes));
+    Ok((Some(end), Some(trailer_len), Some(digest), Some(preview)))
 }
 
 // --- MP4/MOV rebuild from a surviving `moov` (ROADMAP 8.11) ------------------
@@ -9464,8 +9781,9 @@ mod tests {
             let data: Vec<u8> = match round % 4 {
                 0 => (0..(next() % 4096) + 1).map(|_| next() as u8).collect(),
                 1 => {
-                    let mut blob: Vec<u8> =
-                        (0..(next() % 2048 + 512) as usize).map(|_| next() as u8).collect();
+                    let mut blob: Vec<u8> = (0..(next() % 2048 + 512) as usize)
+                        .map(|_| next() as u8)
+                        .collect();
                     for _ in 0..1 + next() % 4 {
                         let at = (next() % (blob.len() as u64 - 10)) as usize;
                         let needle: Vec<u8> = match next() % 4 {
@@ -10170,6 +10488,212 @@ mod tests {
         assert!(tail.notes.contains("3 chunk(s)"), "{}", tail.notes);
         assert_eq!(tail.offset, 32 + ruined as u64);
         assert_eq!(tail.size, (png.len() - ruined) as u64);
+    }
+
+    /// A stuffing-clean pseudo-random scan: bytes from `pseudo_random`
+    /// with every `FF` written as `FF 00`, so the region passes the
+    /// stuffing oracle. Tests compute sizes from the built buffer, never
+    /// hardcode them.
+    fn clean_scan(len: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + len / 256 + 16);
+        for byte in pseudo_random(len, seed) {
+            if byte == 0xFF {
+                out.push(0xFF);
+                out.push(0x00);
+            } else {
+                out.push(byte);
+            }
+        }
+        out
+    }
+
+    /// Sequential-Huffman JPEG with a `SOF0` and a stuffing-clean
+    /// entropy-coded body of `clean_body`. With `ruin` > 0 the first
+    /// `ruin` bytes are overwritten with random bytes (head encryption).
+    fn jpeg_sequential(clean_body: &[u8], ruin: usize) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        out.extend_from_slice(b"JFIF\x00\x01\x02\x00\x00\x01\x00\x01\x00\x00");
+        // SOF0: precision 8, 480x320, 3 components. length = 17.
+        out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x01, 0x40, 0x03]);
+        out.extend_from_slice(&[0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+        // SOS, single component, 8-bit, Huffman tables 0/0.
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        out.extend_from_slice(clean_body);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        if ruin > 0 {
+            let noise = pseudo_random(ruin, 0x1337_5EED);
+            out[..ruin].copy_from_slice(&noise);
+        }
+        out
+    }
+
+    /// Same skeleton with a chosen SOF marker byte (C2 progressive, C9/CA
+    /// arithmetic, ...) and an optional DAC segment inserted before SOS.
+    fn jpeg_sof(marker: u8, with_dac: bool, clean_body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        out.extend_from_slice(b"JFIF\x00\x01\x02\x00\x00\x01\x00\x01\x00\x00");
+        if with_dac {
+            // DAC: Tc=0/Th=0 with 7 zero bytes, length = 9.
+            out.extend_from_slice(&[0xFF, 0xCC, 0x00, 0x09]);
+            out.extend_from_slice(&[0x00; 7]);
+        }
+        out.extend_from_slice(&[0xFF, marker, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x01, 0x40, 0x03]);
+        out.extend_from_slice(&[0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        out.extend_from_slice(clean_body);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    /// Call the JPEG tail salvage directly on a fixture (used where the
+    /// header pass would legitimately carve the file first).
+    fn jpeg_tail_from(fixture: &[u8], prior_end: u64) -> Option<SalvageTail> {
+        let dir = temp_dir("jpeg-tail-direct");
+        let path = dir.join("fixture.jpg");
+        std::fs::write(&path, fixture).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let len = fixture.len() as u64;
+        let eoi = fixture
+            .windows(2)
+            .rposition(|pair| pair == [0xFF, 0xD9])
+            .expect("fixture ends with FF D9") as u64;
+        let tail = salvage_jpeg_tail(&mut file, eoi, len, 64 * 1024 * 1024, prior_end)
+            .expect("salvage must not fail");
+        std::fs::remove_dir_all(&dir).ok();
+        tail
+    }
+
+    #[test]
+    fn salvage_recovers_a_jpeg_behind_a_ruined_head() {
+        let clean = clean_scan(12 * 1024, 0xC0FF_EE11_2233_4455);
+        let jpeg = jpeg_sequential(&clean, 512);
+        let mut dump = jpeg;
+        dump.extend_from_slice(b"RANSOM-ID:8442");
+        let path = write_dump("salvage-jpeg", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Jpeg],
+            min_size: 1,
+            ..Default::default()
+        };
+        let plain = Carver::new(options.clone())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        assert!(plain.files.is_empty(), "{plain:?}");
+
+        let out_dir = path.parent().unwrap().join("out");
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        let root = path.parent().unwrap().to_path_buf();
+        let tail = report
+            .files
+            .iter()
+            .find(|file| file.kind == CarveKind::Jpeg)
+            .expect("a JPEG tail must be recovered");
+        assert_eq!(tail.role, CarveRole::Tail);
+        assert!(!tail.complete);
+        assert_eq!(tail.tier, 2);
+        assert!(!tail.evidence.is_empty());
+        assert!(tail.evidence.contains(&"stuffing_run"), "{tail:?}");
+        assert!(tail.evidence.contains(&"sof:unreadable"), "{tail:?}");
+        assert!(tail.notes.starts_with("salvage:tail"), "{}", tail.notes);
+        assert_eq!(tail.corrupted_offset, Some(tail.offset));
+        // The ruined head is 512 bytes; the last stuffing violation must be
+        // inside it.
+        assert!(tail.offset < 512, "offset {:#x}", tail.offset);
+        // The trailer after FF D9 is recorded, never written into the file.
+        assert_eq!(tail.trailer_len, Some(b"RANSOM-ID:8442".len() as u64));
+        assert!(tail.trailer_sha256.is_some());
+        let preview = tail.trailer_preview.as_deref().unwrap_or("");
+        assert!(preview.contains("RANSOM-ID:8442"), "{preview}");
+        let carved = std::fs::read(tail.path.as_ref().unwrap()).unwrap();
+        assert!(carved.ends_with(&[0xFF, 0xD9]));
+        assert!(
+            !carved.windows(14).any(|w| w == b"RANSOM-ID:8442"),
+            "the trailer must not appear in the carved tail"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn salvage_jpeg_tail_allows_rst_markers_and_flags_them() {
+        let mut body = clean_scan(6 * 1024, 0x1111_2222_3333);
+        body.extend_from_slice(&[0xFF, 0xD0]); // RST0
+        body.extend_from_slice(&clean_scan(6 * 1024, 0x4444_5555_6666));
+        body.extend_from_slice(&[0xFF, 0xD3]); // RST3
+        body.extend_from_slice(&clean_scan(6 * 1024, 0x7777_8888_9999));
+        let jpeg = jpeg_sequential(&body, 512);
+        let tail = jpeg_tail_from(&jpeg, 0).expect("RST-stuffed scan must be accepted");
+        assert!(tail.extra_evidence.contains(&"dri_seen"), "{tail:?}");
+        assert!(tail.extra_evidence.contains(&"stuffing_run"));
+    }
+
+    #[test]
+    fn salvage_jpeg_tail_stops_at_the_sos_boundary_and_labels_it() {
+        let clean = clean_scan(10 * 1024, 0xABCD_EF01_2345_6789);
+        let jpeg = jpeg_sequential(&clean, 0);
+        let tail = jpeg_tail_from(&jpeg, 0).expect("intact baseline + clean scan must salvage");
+        let sos_marker = jpeg
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0xDA])
+            .expect("fixture has an SOS");
+        assert_eq!(tail.start, (sos_marker + 2) as u64);
+        assert!(tail.extra_evidence.contains(&"multi-scan?"), "{tail:?}");
+        assert!(
+            tail.extra_evidence
+                .iter()
+                .any(|token| *token == "sof:unreadable" || *token == "sof:sequential"),
+            "{tail:?}"
+        );
+    }
+
+    #[test]
+    fn salvage_jpeg_tail_refuses_progressive_and_arithmetic() {
+        let clean = clean_scan(10 * 1024, 0x0F0F_0F0F_0F0F_0F0F);
+        for marker in [0xC2u8, 0xC3, 0xC5, 0xC9, 0xCA, 0xCB] {
+            let fixture = jpeg_sof(marker, false, &clean);
+            assert!(
+                jpeg_tail_from(&fixture, 0).is_none(),
+                "SOF{marker:#x} must be refused"
+            );
+        }
+        // Sequential SOF but a DAC segment up front: arithmetic, refused.
+        let dac_fixture = jpeg_sof(0xC0, true, &clean);
+        assert!(jpeg_tail_from(&dac_fixture, 0).is_none());
+        // Sequential SOF0 stays allowed.
+        let baseline = jpeg_sof(0xC0, false, &clean);
+        assert!(jpeg_tail_from(&baseline, 0).is_some());
+    }
+
+    #[test]
+    fn salvage_jpeg_tail_rejects_a_zero_filled_region() {
+        let mut fixture = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        fixture.extend_from_slice(b"JFIF\x00\x01\x02\x00\x00\x01\x00\x01\x00\x00");
+        fixture.extend_from_slice(&vec![0u8; 12 * 1024]);
+        fixture.extend_from_slice(&[0xFF, 0xD9]);
+        assert!(jpeg_tail_from(&fixture, 0).is_none());
+    }
+
+    #[test]
+    fn salvage_jpeg_tail_rejects_runs_shorter_than_eight_kib() {
+        // A clean scan whose body is only 4 KiB: even after starting right
+        // after the SOS, the tail is under JPEG_RUN_MIN.
+        let clean = clean_scan(4 * 1024, 0x2222_3333_4444_5555);
+        let fixture = jpeg_sequential(&clean, 0);
+        assert!(jpeg_tail_from(&fixture, 0).is_none());
+    }
+
+    #[test]
+    fn salvage_jpeg_tail_respects_prior_end() {
+        // An intact baseline fixture with a 12 KiB clean scan: with
+        // `prior_end` inside the last 4 KiB the usable span shrinks below
+        // JPEG_RUN_MIN and the tail must be refused.
+        let clean = clean_scan(12 * 1024, 0x3333_4444_5555_6666);
+        let fixture = jpeg_sequential(&clean, 0);
+        let eoi = (fixture.len() - 2) as u64;
+        assert!(jpeg_tail_from(&fixture, eoi - 4096).is_none());
+        assert!(jpeg_tail_from(&fixture, 0).is_some());
     }
 
     /// One cycle = 3 zero windows + 1 high-entropy window (1:3 duty).

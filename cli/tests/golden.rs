@@ -2674,6 +2674,114 @@ fn golden_carve_zip_rebuilds_the_surviving_members_after_a_ruined_head() {
     assert!(!needle(b"VICTIM-ID-777"), "victim trailer must be cut");
 }
 
+/// Deterministic stuffing-clean scan bytes: `high_entropy_bytes`-style
+/// pseudo-random with every `FF` expanded to `FF 00`, as a real encoder's
+/// entropy sector looks.
+fn stuffing_clean_bytes(len: usize, seed: u32) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(len + len / 128 + 8);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let byte = (state >> 24) as u8;
+        if byte == 0xFF {
+            out.push(0xFF);
+            out.push(0x00);
+        } else {
+            out.push(byte);
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn golden_carve_jpeg_tail_after_partial_encryption() {
+    let dir = tempfile::tempdir().unwrap();
+    // The partial-encryption shape: the first 4 KiB of a JPEG (SOI, APP0,
+    // SOF, SOS and the first part of the entropy sector) are overwritten;
+    // the entropy sector and EOI survive and are byte-stuffing-clean. The
+    // salvage pass must produce one `.jpg.tail.carved` covering the
+    // surviving scan, with `stuffing_run` evidence, cutting the victim
+    // trailer after EOI.
+    let clean = stuffing_clean_bytes(12 * 1024, 0xC0FF_EE11);
+    let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    jpeg.extend_from_slice(b"JFIF\x00\x01\x02\x00\x00\x01\x00\x01\x00\x00");
+    // SOF0: precision 8, 480x320, 3 components.
+    jpeg.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x01, 0x40, 0x03]);
+    jpeg.extend_from_slice(&[0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+    // SOS, single component.
+    jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+    jpeg.extend_from_slice(&clean);
+    jpeg.extend_from_slice(&[0xFF, 0xD9]);
+    // Overwrite the head with random bytes, ransomware style.
+    let ruin = high_entropy_bytes(4096);
+    jpeg[..4096].copy_from_slice(&ruin);
+    let mut dump = jpeg;
+    dump.extend_from_slice(b"VICTIM-ID-777");
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let out_dir = dir.path().join("carve");
+    let index = dir.path().join("index.ndjson");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "jpeg",
+            "--carve-out",
+            out_dir.to_str().unwrap(),
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    let records = std::fs::read_to_string(&index).unwrap();
+    let count = records
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    assert_eq!(count, 1, "{records}");
+    assert!(records.contains("\"role\":\"tail\""), "{records}");
+    assert!(records.contains("\"ext\":\"jpg\""), "{records}");
+    assert!(records.contains("stuffing_run"), "{records}");
+    assert!(records.contains("sof:unreadable"), "{records}");
+    assert!(records.contains("\"tier\":2"), "{records}");
+    assert!(records.contains("\"complete\":false"), "{records}");
+    assert!(records.contains("salvage:tail: JPEG"), "{records}");
+    // The victim trailer after EOI is recorded, never written into the file.
+    assert!(records.contains("\"trailer_len\":13"), "{records}");
+    assert!(records.contains("VICTIM-ID-777"), "{records}");
+
+    let partial = out_dir.join("partial");
+    let entries: Vec<_> = std::fs::read_dir(&partial)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{partial:?}");
+    let name = entries[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(name.ends_with(".jpg.tail.carved"), "{name}");
+    let bytes = std::fs::read(&entries[0]).unwrap();
+    assert!(bytes.ends_with(&[0xFF, 0xD9]));
+    assert!(
+        !bytes.windows(13).any(|w| w == b"VICTIM-ID-777"),
+        "the victim trailer must not appear in the carved tail"
+    );
+}
+
 #[test]
 fn golden_carve_pdf_rejects_magic_plus_random_garbage() {
     let dir = tempfile::tempdir().unwrap();
@@ -2756,7 +2864,10 @@ fn golden_carve_pdf_rejects_a_planted_startxref_and_eof_in_noise() {
     );
     assert!(output.status.success(), "{combined}");
     assert!(combined.contains("0 file(s)"), "{combined}");
-    assert!(!out_dir.join("partial").exists() || std::fs::read_dir(out_dir.join("partial")).unwrap().count() == 0);
+    assert!(
+        !out_dir.join("partial").exists()
+            || std::fs::read_dir(out_dir.join("partial")).unwrap().count() == 0
+    );
 }
 
 #[test]
@@ -2796,7 +2907,10 @@ fn golden_carve_pdf_with_magic_and_fake_eof_is_not_valid() {
     );
     assert!(output.status.success(), "{combined}");
     assert!(combined.contains("0 file(s)"), "{combined}");
-    assert!(!out_dir.join("partial").exists() || std::fs::read_dir(out_dir.join("partial")).unwrap().count() == 0);
+    assert!(
+        !out_dir.join("partial").exists()
+            || std::fs::read_dir(out_dir.join("partial")).unwrap().count() == 0
+    );
 }
 
 #[test]
