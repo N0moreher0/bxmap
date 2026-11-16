@@ -606,7 +606,7 @@ Chỉ chạy khi 8.12.2 không áp dụng được.
 **Quyết định mặc định (đổi nếu chủ repo muốn):** quality cố định 90; bản thô luôn giữ, bản `-adjusted` để P2; tách `src/jpeg_scan.rs`; `Rebuilt` có bảng chính xác vào thư mục chính, ước lượng vào `partial/`; chưa có `--carve-donor` ở P1.
 **Nguồn tham khảo:** repo DRCRecoveryData/JPEG_Recovery (không có LICENSE nên ý tưởng được viết lại độc lập từ ITU-T T.81, không sao chép mã); mã chỉ đọc, không chạy.
 
-**8.13 Cứu file bị xoá sạch 4 KiB đầu (bench `head4k`) bằng cấu trúc còn sống · P1 · ĐỀ XUẤT, chờ chủ repo duyệt (2026-11-16)**
+**8.13 Cứu file bị xoá sạch 4 KiB đầu (bench `head4k`) bằng cấu trúc còn sống · P1 · ĐÃ DUYỆT (2026-11-16), đang ở M0 (chờ dữ liệu bench 19 file)**
 - Hiện trạng (bench 2026-11-16): `head4k` MISS 17/19. Đây là hành vi theo thiết kế: magic ở đầu file đã bị xoá nên header pass không thấy gì; text pass cứu được 5 file. Muốn hơn nữa phải bỏ giả định "có magic ở đầu" và neo vào phần còn sống của file, cùng tinh thần 8.7.2 (footer-first), 8.11.2 (tìm đầu từ `moov`) và 8.12 (JPEG).
 - [ ] **M0 — đo, chưa code sản phẩm:** liệt kê 19 file của bench theo định dạng; với mỗi file ghi rõ sau 4 KiB đầu còn cấu trúc nào đọc được (footer, bảng offset, chunk, trang) và định dạng nào hoàn toàn không có neo. Kết quả M0 quyết định mục nào dưới đây đáng làm; không làm mục nào mà M0 cho thấy 0 file hưởng lợi.
 - [ ] **8.13.1 Neo ở đuôi/giữa file (theo từng định dạng, đã có validator):** ZIP/OOXML/APK (EOCD + central directory → suy ra offset local header, dựng lại phần còn sống), PNG (chunk `IDAT`/`IEND` liền kề, đã có ở 8.7.2), PDF (`xref`/`trailer`/`%%EOF`), SQLite (page header + kích thước trang), MP4 (đã có 8.11). Mỗi định dạng tái dùng validator hiện có, chỉ đổi cách tìm điểm bắt đầu.
