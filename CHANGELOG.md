@@ -6,6 +6,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **`--carve headloss`: clean tail of a file whose head was overwritten
+  (ROADMAP 8.13.3)**. New opt-in kind (`CarveKind::HeadLoss`, not part of
+  `all`; ask for it with `--carve headloss` or `--carve all,headloss`).
+  The header pass cannot see a file whose first 4 KiB were overwritten
+  with random bytes (the magic is gone), so a new pass looks for the
+  entropy drop instead: a high-entropy run followed by structured data.
+  Each structured run of 8 KiB or more is cut out as a `tail`-role record
+  in `partial/` (`...bin.tail.carved`) with `complete: false`, `tier` 3,
+  `entropy_drop` evidence, `corrupted_offset` at its first byte and a
+  `salvage:head4k` note. Edges are found on the 4 KiB grid, refined with
+  128-byte windows and pulled 256 bytes inside the clean side so no
+  random byte leaks into a tail. Zeros and wiped gaps are never
+  evidence, ranges an earlier pass already carved are subtracted, and
+  each tail is capped at `--carve-max-size` (64 MiB when unset). It runs
+  after the text pass and before the bin pass. Nothing is decrypted,
+  rebuilt or guessed; the format stays unknown. On the synthetic carve
+  bench (388 MB, 60 items) `--carve all,headloss` recovers 36/60 items
+  against 24/60 for `--carve all` (`head4k` 2/19 to 7/19, `trunc` 3/19
+  to 8/19, plus two plaintext files with no magic that `all` skips),
+  with every tail inside a real item and about 0.5 s more wall time. A
+  PE with high-entropy resource blocks comes out as several fragments.
 - **MP4/MOV rebuild from a surviving `moov` (ROADMAP 8.11, P1)**. When the
   original `ftyp`/`mdat` header is encrypted but the `moov` box (usually at
   the end of the file) survived, bxmap now parses `moov` (`mvhd`, tracks,

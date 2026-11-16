@@ -812,7 +812,12 @@ OPTIONS:
                           unclassified high-entropy runs (compressed, encrypted
                           or packed data no other type claimed, 16 KiB or more)
                           as ...bin.carved in partial/; also opt-in: --carve bin
-                          or all,bin. Extensions that share a container
+                          or all,bin. headloss recovers the clean tail of a
+                          file whose head was overwritten with random bytes
+                          (structured data after a sharp entropy drop, 8 KiB
+                          or more) as ...bin.tail.carved in partial/ with a
+                          salvage:head4k note; opt-in too: --carve headloss
+                          or all,headloss. Extensions that share a container
                           are exact filters: --carve docx writes only real
                           docx files. docx/xlsx/pptx/odt/ods/odp/jar/apk (zip),
                           doc/xls/ppt/msi/msg (ole), dll/sys (pe), mov/m4a

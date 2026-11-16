@@ -440,7 +440,10 @@ Recover structured files directly from a raw dump. The carver:
   (`--carve all`). Formats with no magic number are not carved, except plaintext
   via the opt-in `text` kind (`--carve text` / `--carve all,text`): content-based
   recovery of notes, logs, Markdown and source dumps, written to `partial/` with
-  `complete: false` and a `text:region` note. Entropy is only a boundary hint;
+  `complete: false` and a `text:region` note. The opt-in `headloss` kind
+  (`--carve headloss`) cuts out the clean tail of a file whose first bytes
+  were overwritten with random data (entropy drop, `.bin.tail.carved`,
+  `salvage:head4k` note). Otherwise entropy is only a boundary hint;
   structural validation decides what is written.
 - Deduplicates by SHA-256; identical files found at multiple offsets are recorded
   once with `duplicates: [offsets]` in the index.

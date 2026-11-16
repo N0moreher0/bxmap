@@ -167,7 +167,7 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   `7z`, `gzip`, `bz2`, `xz`, `tar`, `pdf`, `rtf`, `ole`, `sqlite`, `pe`, `elf`,
   `class`, `dex`, `wasm`, `lnk`, `evtx`, `pcap`, `pcapng`, `kdbx`, `pem`, `mp4`,
   `avi`, `wav`, `mkv`, `webm`, `ogg`, `opus`, `flac`, `mp3`, `vdi`, `vmdk`, `all`,
-  `text`, `bin` (comma-separated). `text` recovers plaintext (notes, logs, Markdown,
+  `text`, `bin`, `headloss` (comma-separated). `text` recovers plaintext (notes, logs, Markdown,
   source dumps) by content rather than by magic; it is not part of `all` - ask
   for it with `--carve text` or `--carve all,text`. Its boundaries are a
   heuristic, so recovered text lands in `partial/` with `complete: false` and
@@ -175,7 +175,19 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   (compressed, encrypted or packed data that no other type claimed, 16 KiB or
   more) the same opt-in way (`--carve bin` or `--carve all,bin`): each run
   lands in `partial/` as `...bin.carved` with `complete: false`, `tier` 3 and
-  `entropy` evidence, split into `--carve-max-size` pieces. Aliases: `rar` (both RAR versions), `jpg` (jpeg), `7zip`
+  `entropy` evidence, split into `--carve-max-size` pieces. `headloss`
+  recovers the clean tail of a file whose head was overwritten with random
+  bytes, the same opt-in way (`--carve headloss` or `--carve all,headloss`):
+  the header pass cannot see such a file (its magic is gone), so the pass
+  looks for the entropy drop, a high-entropy run followed by structured
+  data. Each structured run of 8 KiB or more lands in `partial/` as
+  `...bin.tail.carved` with `role: "tail"`, `complete: false`, `tier` 3,
+  `entropy_drop` evidence, `corrupted_offset` at its first byte and a
+  `salvage:head4k` note. Edges are refined byte-wise and kept a few
+  hundred bytes inside the clean side, so no random byte leaks in; zeros
+  and wiped gaps are never carved, and each tail is capped at
+  `--carve-max-size` (64 MiB when unset). The format stays unknown and
+  nothing is rebuilt. Aliases: `rar` (both RAR versions), `jpg` (jpeg), `7zip`
   (7z), `office`/`ms-office` (ole), `exe`/`executable` (pe), `db`/`sqlite3`
   (sqlite) and `tiff` (tif). Extensions that share a container are **exact
   filters** (the dump is still scanned once per format; only what gets written

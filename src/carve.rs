@@ -85,6 +85,29 @@ const TEXT_MIN_REGION: u64 = 2048;
 const BIN_BLOCK: usize = 4096;
 /// Smallest unclassified high-entropy run worth writing (4 blocks).
 const BIN_MIN_REGION: u64 = 16 * 1024;
+/// Block of the `--carve headloss` pass: one entropy score per block, on the
+/// same grid and with the same threshold as the bin pass.
+const HEADLOSS_BLOCK: usize = 4096;
+/// Window of the byte-level edge refine. A random window this size scores
+/// about 6.8 bits/byte; text, tables and machine code stay well below 6.
+const HEADLOSS_WINDOW: usize = 128;
+/// Step between refine windows.
+const HEADLOSS_STRIDE: usize = 16;
+/// A refine window under this entropy counts as clean (not random).
+const HEADLOSS_CLEAN: f64 = 6.3;
+/// Consecutive refine windows that must agree before an edge is believed.
+const HEADLOSS_SUSTAIN: usize = 8;
+/// Bytes kept between a refined edge and the first byte written, so a
+/// window that straddles the edge can never leak random bytes into a tail.
+const HEADLOSS_MARGIN: u64 = 2 * HEADLOSS_WINDOW as u64;
+/// A block under this entropy is blank (zeros, a wiped gap): never evidence.
+const HEADLOSS_BLANK: f64 = 1.0;
+/// This many blank blocks in a row end a tail (16 KiB of wiped space).
+const HEADLOSS_BLANK_RUN: u32 = 4;
+/// Smallest tail the head-loss pass writes (2 blocks).
+const HEADLOSS_MIN_REGION: u64 = 8 * 1024;
+/// Largest tail written per boundary when `max_size` is unset.
+const HEADLOSS_MAX_TAIL: u64 = 64 * 1024 * 1024;
 
 /// Which piece of a file a carved output holds. It decides the file-name
 /// suffix so a name never promises more than the bytes deliver.
@@ -168,6 +191,11 @@ fn evidence_for(
     ext_source: &'static str,
 ) -> (u8, Vec<&'static str>, CarveConfidence) {
     match role {
+        // 8.13.3: no footer vouches for it, only the entropy drop that
+        // marks where the overwritten head ends.
+        CarveRole::Tail if kind == CarveKind::HeadLoss => {
+            (3, vec!["entropy_drop"], CarveConfidence::Low)
+        }
         CarveRole::Tail => (2, vec!["footer"], CarveConfidence::Low),
         CarveRole::Reassembled => (2, vec!["magic", "reassembled"], CarveConfidence::Medium),
         // The three tables the rebuild actually cross-checked (8.11.1):
@@ -452,6 +480,13 @@ pub enum CarveKind {
     /// finds it by entropy and it is **not** part of [`CarveKind::ALL`]: ask
     /// for it with `--carve bin` (or `all,bin`).
     Bin,
+    /// The clean tail of a file whose head was overwritten with random bytes
+    /// (ROADMAP 8.13.3): structured data that follows a high-entropy run
+    /// with a sharp entropy drop. It has no magic number, so the head-loss
+    /// pass finds it by entropy and it is **not** part of
+    /// [`CarveKind::ALL`]: ask for it with `--carve headloss` (or
+    /// `all,headloss`). The format stays unknown; nothing is rebuilt.
+    HeadLoss,
 }
 
 impl CarveKind {
@@ -501,6 +536,7 @@ impl CarveKind {
             CarveKind::Evtx => "evtx",
             CarveKind::Text => "text",
             CarveKind::Bin => "bin",
+            CarveKind::HeadLoss => "headloss",
         }
     }
 
@@ -553,7 +589,7 @@ impl CarveKind {
             CarveKind::Rtf => "rtf",
             CarveKind::Evtx => "evtx",
             CarveKind::Text => "txt",
-            CarveKind::Bin => "bin",
+            CarveKind::Bin | CarveKind::HeadLoss => "bin",
         }
     }
 
@@ -649,6 +685,7 @@ impl CarveKind {
             "evtx" => Some(CarveKind::Evtx),
             "text" | "txt" => Some(CarveKind::Text),
             "bin" => Some(CarveKind::Bin),
+            "headloss" => Some(CarveKind::HeadLoss),
             _ => None,
         }
     }
@@ -675,7 +712,7 @@ impl CarveKind {
                 "elf" => vec![CarveKind::Elf],
                 other => vec![CarveKind::from_id(other).ok_or_else(|| {
                     format!(
-                        "unknown carve type '{other}' (known: {}, text)",
+                        "unknown carve type '{other}' (known: {}, text, bin, headloss)",
                         CarveKind::ALL
                             .iter()
                             .map(|kind| kind.as_str())
@@ -1401,6 +1438,11 @@ impl Carver {
         if self.options.kinds.contains(&CarveKind::Text) {
             self.text_pass(dump_path, out_dir, file_len, &mut report)?;
         }
+        // Before the bin pass: a head-loss tail is structured data, so it
+        // must not be swallowed by (or double-counted with) a noise run.
+        if self.options.kinds.contains(&CarveKind::HeadLoss) {
+            self.headloss_pass(dump_path, out_dir, file_len, &mut report)?;
+        }
         if self.options.kinds.contains(&CarveKind::Bin) {
             self.bin_pass(dump_path, out_dir, file_len, &mut report)?;
         }
@@ -2031,6 +2073,127 @@ impl Carver {
                     report.truncated = true;
                     break 'regions;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fifth pass behind `--carve headloss` (ROADMAP 8.13.3; it runs only
+    /// when [`CarveKind::HeadLoss`] is in the wanted kinds): the clean tail
+    /// of a file whose head was overwritten with random bytes.
+    ///
+    /// The header pass finds nothing there (the magic is gone), so this pass
+    /// looks for a sharp entropy drop: a high-entropy run followed by
+    /// structured data. The structured run is cut out as a [`CarveRole::Tail`]
+    /// record under `partial/`, with `corrupted_offset` at its first byte and
+    /// a `salvage:head4k` note. The format stays unknown: nothing is decrypted,
+    /// rebuilt or guessed, and the lost head is reported as lost. Blank runs
+    /// (zeros, wiped space) are never evidence, ranges an earlier pass already
+    /// carved are subtracted, and each tail is capped at `max_size` (64 MiB
+    /// when that is unset). Dedupe and the `max_files`/`max_total` caps match
+    /// the other passes.
+    fn headloss_pass(
+        &self,
+        dump_path: &str,
+        out_dir: Option<&Path>,
+        file_len: u64,
+        report: &mut CarveReport,
+    ) -> io::Result<()> {
+        // A header pass that already hit a cap must not be extended.
+        if report.truncated {
+            return Ok(());
+        }
+        let mut by_hash: HashMap<String, usize> = HashMap::new();
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        for (index, file) in report.files.iter().enumerate() {
+            by_hash.insert(file.sha256.clone(), index);
+            covered.push((file.offset, file.offset + file.size));
+            for &duplicate in &file.duplicates {
+                covered.push((duplicate, duplicate + file.size));
+            }
+        }
+        let max_len = if self.options.max_size == 0 {
+            HEADLOSS_MAX_TAIL
+        } else {
+            self.options.max_size
+        };
+        let min_region = self.options.min_size.max(HEADLOSS_MIN_REGION);
+        let mut source = File::open(dump_path)?;
+
+        for (at, end) in headloss_regions(dump_path, file_len, &covered, max_len)? {
+            let size = end - at;
+            if size < min_region {
+                continue;
+            }
+            let (sha256, entropy) = digest_region(&mut source, at, size)?;
+            if let Some(&index) = by_hash.get(&sha256) {
+                report.duplicates += 1;
+                report.duplicate_bytes += size;
+                report.files[index].duplicates.push(at);
+                continue;
+            }
+            let path = match out_dir {
+                Some(dir) => {
+                    // A tail is incomplete by definition, so it always goes
+                    // beside the other partial files.
+                    let partial = dir.join("partial");
+                    std::fs::create_dir_all(&partial)?;
+                    let name = carved_file_name(at, CarveKind::HeadLoss, CarveRole::Tail, &sha256);
+                    let path = partial.join(name);
+                    if path.exists() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "refusing to overwrite '{}'; use a fresh --carve-out",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    write_region(&mut source, at, size, &path)?;
+                    Some(path)
+                }
+                None => None,
+            };
+            let notes = format!(
+                "salvage:head4k: structured data 0x{at:x}-0x{end:x} follows a high-entropy run (entropy drop at 0x{at:x}); its head may be missing or overwritten, format unknown"
+            );
+            by_hash.insert(sha256.clone(), report.files.len());
+            report.bytes_written += size;
+            let (tier, evidence, confidence) =
+                evidence_for(CarveRole::Tail, CarveKind::HeadLoss, false, "kind");
+            report.files.push(CarvedFile {
+                offset: at,
+                kind: CarveKind::HeadLoss,
+                size,
+                complete: false,
+                sha256,
+                entropy,
+                notes,
+                path,
+                duplicates: Vec::new(),
+                corrupted_offset: Some(at),
+                entropy_spike_at: None,
+                partial_encryption: None,
+                trailer_offset: None,
+                trailer_len: None,
+                trailer_sha256: None,
+                trailer_preview: None,
+                tracks_intact: None,
+                ext: CarveKind::HeadLoss.default_ext().to_string(),
+                ext_source: "kind".to_string(),
+                role: CarveRole::Tail,
+                tier,
+                evidence,
+                confidence,
+            });
+
+            if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
+                report.truncated = true;
+                break;
+            }
+            if self.options.max_total != 0 && report.bytes_written >= self.options.max_total {
+                report.truncated = true;
+                break;
             }
         }
         Ok(())
@@ -2854,6 +3017,204 @@ fn bin_regions(
     for run in runs {
         for piece in subtract_covered(run, covered) {
             if piece.1 - piece.0 >= BIN_MIN_REGION {
+                out.push(piece);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Class of one [`HEADLOSS_BLOCK`] block in the head-loss pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadlossBlock {
+    /// Entropy at or above [`crate::ENTROPY_DEFAULT_THRESHOLD`]: random,
+    /// encrypted or compressed (the same call the bin pass makes).
+    Noise,
+    /// Structured data: text, tables, machine code.
+    Clean,
+    /// Zeros or a wiped gap: no evidence either way.
+    Blank,
+}
+
+fn headloss_class(block: &[u8]) -> HeadlossBlock {
+    let entropy = crate::shannon_entropy(block);
+    if entropy >= crate::ENTROPY_DEFAULT_THRESHOLD {
+        HeadlossBlock::Noise
+    } else if entropy < HEADLOSS_BLANK {
+        HeadlossBlock::Blank
+    } else {
+        HeadlossBlock::Clean
+    }
+}
+
+/// Entropy of every [`HEADLOSS_WINDOW`]-byte window of `zone`, stepping by
+/// [`HEADLOSS_STRIDE`].
+fn headloss_scores(zone: &[u8]) -> Vec<f64> {
+    if zone.len() < HEADLOSS_WINDOW {
+        return Vec::new();
+    }
+    (0..=zone.len() - HEADLOSS_WINDOW)
+        .step_by(HEADLOSS_STRIDE)
+        .map(|index| crate::shannon_entropy(&zone[index..index + HEADLOSS_WINDOW]))
+        .collect()
+}
+
+/// Index of the first window that opens a run of [`HEADLOSS_SUSTAIN`]
+/// windows on one side: clean (`clean == true`) or random (`false`).
+fn headloss_run(scores: &[f64], clean: bool) -> Option<usize> {
+    let mut run = 0usize;
+    for (index, &score) in scores.iter().enumerate() {
+        if (score < HEADLOSS_CLEAN) == clean {
+            run += 1;
+            if run >= HEADLOSS_SUSTAIN {
+                return Some(index + 1 - run);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
+fn headloss_read_zone(probe: &mut File, from: u64, to: u64) -> io::Result<Vec<u8>> {
+    let mut zone = vec![0u8; to.saturating_sub(from) as usize];
+    probe.seek(SeekFrom::Start(from))?;
+    probe.read_exact(&mut zone)?;
+    Ok(zone)
+}
+
+/// First byte to keep for a tail whose first clean block starts at
+/// `block_start` (the block before it is pure noise). The real edge lies in
+/// the two blocks around the change, so they are walked window by window;
+/// the result sits [`HEADLOSS_MARGIN`] past the first sustained clean window
+/// so no random byte can leak in. Without a sustained clean run the whole
+/// first clean block is skipped instead, since it may still carry some of
+/// the random head.
+fn headloss_tail_start(probe: &mut File, block_start: u64, file_len: u64) -> io::Result<u64> {
+    let block = HEADLOSS_BLOCK as u64;
+    let from = block_start.saturating_sub(block);
+    let to = (block_start + block).min(file_len);
+    let zone = headloss_read_zone(probe, from, to)?;
+    Ok(match headloss_run(&headloss_scores(&zone), true) {
+        Some(index) => from + (index * HEADLOSS_STRIDE) as u64 + HEADLOSS_MARGIN,
+        None => block_start + block,
+    })
+}
+
+/// One past the last byte to keep for a tail whose clean run stops where the
+/// noise block at `noise_start` begins. Mirrors [`headloss_tail_start`]: the
+/// end sits a window before the first sustained random window; without one
+/// the last clean block is dropped.
+fn headloss_tail_end(probe: &mut File, noise_start: u64, file_len: u64) -> io::Result<u64> {
+    let block = HEADLOSS_BLOCK as u64;
+    let from = noise_start.saturating_sub(block);
+    let to = (noise_start + block).min(file_len);
+    let zone = headloss_read_zone(probe, from, to)?;
+    Ok(match headloss_run(&headloss_scores(&zone), false) {
+        Some(index) => (from + (index * HEADLOSS_STRIDE) as u64)
+            .saturating_sub(HEADLOSS_WINDOW as u64)
+            .max(from),
+        None => from,
+    })
+}
+
+fn headloss_push(raw: &mut Vec<(u64, u64)>, start: u64, end: u64, max_len: u64) {
+    if end > start {
+        raw.push((start, end.min(start.saturating_add(max_len))));
+    }
+}
+
+/// Absolute `(start, end)` of every structured run that follows a
+/// high-entropy run: the clean tails of files whose head was overwritten.
+/// Streams the file once on the 4 KiB grid (no block list is held in
+/// memory) and refines each edge byte-wise from a second handle. A run ends
+/// at the next noise block or after [`HEADLOSS_BLANK_RUN`] blank blocks; a
+/// first clean block that is blank never starts one. Already-covered ranges
+/// are subtracted and pieces under [`HEADLOSS_MIN_REGION`] dropped.
+fn headloss_regions(
+    dump_path: &str,
+    file_len: u64,
+    covered: &[(u64, u64)],
+    max_len: u64,
+) -> io::Result<Vec<(u64, u64)>> {
+    struct Tail {
+        start: u64,
+        blank_run: u32,
+        clean_end: u64,
+    }
+
+    let mut stream = File::open(dump_path)?;
+    let mut probe = File::open(dump_path)?;
+    let mut raw: Vec<(u64, u64)> = Vec::new();
+    let mut tail: Option<Tail> = None;
+    let mut prev: Option<HeadlossBlock> = None;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut abs = 0u64;
+    loop {
+        let mut filled = 0usize;
+        while filled < buffer.len() {
+            let read = stream.read(&mut buffer[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+        for block in buffer[..filled].chunks(HEADLOSS_BLOCK) {
+            let at = abs;
+            let block_end = at + block.len() as u64;
+            abs = block_end;
+            // A sliver at the very end of the file scores too noisily.
+            if block.len() < 1024 {
+                continue;
+            }
+            let class = headloss_class(block);
+            if let Some(run) = tail.as_mut() {
+                let mut close: Option<u64> = None;
+                match class {
+                    HeadlossBlock::Noise => {
+                        close = Some(if run.blank_run > 0 {
+                            run.clean_end
+                        } else {
+                            headloss_tail_end(&mut probe, at, file_len)?
+                        });
+                    }
+                    HeadlossBlock::Blank => {
+                        run.blank_run += 1;
+                        if run.blank_run >= HEADLOSS_BLANK_RUN {
+                            close = Some(run.clean_end);
+                        }
+                    }
+                    HeadlossBlock::Clean => {
+                        run.blank_run = 0;
+                        run.clean_end = block_end;
+                    }
+                }
+                if let Some(end) = close {
+                    headloss_push(&mut raw, run.start, end, max_len);
+                    tail = None;
+                }
+            } else if class == HeadlossBlock::Clean && prev == Some(HeadlossBlock::Noise) {
+                let start = headloss_tail_start(&mut probe, at, file_len)?;
+                tail = Some(Tail {
+                    start,
+                    blank_run: 0,
+                    clean_end: block_end,
+                });
+            }
+            prev = Some(class);
+        }
+    }
+    if let Some(run) = tail {
+        headloss_push(&mut raw, run.start, run.clean_end, max_len);
+    }
+
+    let mut out = Vec::new();
+    for region in raw {
+        for piece in subtract_covered(region, covered) {
+            if piece.1 - piece.0 >= HEADLOSS_MIN_REGION {
                 out.push(piece);
             }
         }
@@ -4688,6 +5049,9 @@ fn validate(kind: CarveKind, file: &mut File, offset: u64, end: u64) -> io::Resu
         CarveKind::Bin => {
             Verdict::Invalid("bin has no header; it is found by the bin pass".to_string())
         }
+        CarveKind::HeadLoss => Verdict::Invalid(
+            "headloss has no header; it is found by the head-loss pass".to_string(),
+        ),
     };
     Ok((verdict, source.produced()))
 }
@@ -10573,6 +10937,223 @@ mod tests {
             report.files.iter().all(|file| file.kind != CarveKind::Bin),
             "{report:?}"
         );
+    }
+
+    /// Structured, low-entropy fixture for the head-loss tests: `len` bytes
+    /// drawn from a 32-symbol alphabet (all below 0x20), about 5 bits/byte.
+    /// No random byte is ever below 0x20 for long, so "every byte < 0x20" is a
+    /// purity check on a written tail.
+    fn structured(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 13 + i / 7) % 32) as u8).collect()
+    }
+
+    /// `[noise gap][4000 random head bytes][clean body][noise gap]`, with
+    /// the body at an unaligned offset. Returns `(dump, body_start, body_end)`.
+    fn head_loss_dump(body_len: usize) -> (Vec<u8>, u64, u64) {
+        let mut dump = pseudo_random(0x20000, 0x1eaf_0000_0000_0001);
+        dump.extend_from_slice(&pseudo_random(4000, 0x1eaf_0000_0000_0002));
+        let body_start = dump.len() as u64;
+        dump.extend_from_slice(&structured(body_len));
+        let body_end = dump.len() as u64;
+        dump.extend_from_slice(&pseudo_random(0x20000, 0x1eaf_0000_0000_0003));
+        (dump, body_start, body_end)
+    }
+
+    fn head_loss_options() -> CarveOptions {
+        CarveOptions {
+            kinds: vec![CarveKind::HeadLoss],
+            min_size: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn headloss_pass_cuts_the_clean_tail_after_an_overwritten_head() {
+        let (dump, body_start, body_end) = head_loss_dump(0xC000);
+        let path = write_dump("headloss-basic", &dump);
+        let out = path.parent().unwrap().join("out");
+        let report = Carver::new(head_loss_options())
+            .carve_to_dir(path.to_str().unwrap(), &out)
+            .unwrap();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.kind, CarveKind::HeadLoss);
+        assert_eq!(file.role, CarveRole::Tail);
+        assert!(!file.complete);
+        assert_eq!(file.tier, 3);
+        assert_eq!(file.evidence, vec!["entropy_drop"]);
+        assert_eq!(file.confidence.as_str(), "low");
+        assert_eq!(file.ext, "bin");
+        assert!(file.notes.starts_with("salvage:head4k"), "{file:?}");
+        assert_eq!(file.corrupted_offset, Some(file.offset));
+
+        // Conservative edges: never before the first clean byte, never past
+        // the last one, and no more than a window or two short of either.
+        let end = file.offset + file.size;
+        assert!(
+            file.offset >= body_start,
+            "{file:?} body at {body_start:#x}"
+        );
+        assert!(file.offset <= body_start + 1024, "{file:?}");
+        assert!(end <= body_end, "{file:?} body ends {body_end:#x}");
+        assert!(end + 1024 >= body_end, "{file:?}");
+
+        let on_disk = file.path.as_ref().expect("written to disk");
+        let name = on_disk.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with(".bin.tail.carved"), "{name}");
+        assert!(
+            name.starts_with(&format!("{:08x}-headloss-", file.offset)),
+            "{name}"
+        );
+        assert_eq!(on_disk.parent().unwrap().file_name().unwrap(), "partial");
+        let written = std::fs::read(on_disk).unwrap();
+        assert_eq!(written, dump[file.offset as usize..end as usize]);
+        // Purity: not one random byte leaked into the tail.
+        assert!(
+            written.iter().all(|&byte| byte < 0x20),
+            "random bytes leaked"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn headloss_pass_caps_a_tail_at_max_size() {
+        let (dump, body_start, _) = head_loss_dump(0xC000);
+        let path = write_dump("headloss-cap", &dump);
+        let options = CarveOptions {
+            max_size: 0x4000,
+            ..head_loss_options()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert_eq!(report.files[0].size, 0x4000);
+        assert!(report.files[0].offset >= body_start);
+    }
+
+    #[test]
+    fn headloss_pass_never_treats_a_wiped_gap_as_a_tail() {
+        let mut dump = pseudo_random(0x10000, 0x1eaf_0000_0000_0004);
+        dump.extend_from_slice(&vec![0u8; 0x10000]);
+        dump.extend_from_slice(&pseudo_random(0x10000, 0x1eaf_0000_0000_0005));
+        let path = write_dump("headloss-zeros", &dump);
+        let report = Carver::new(head_loss_options())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(report.files.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn headloss_pass_needs_a_noise_run_before_the_clean_data() {
+        // Structured data at the very start of the dump has no overwritten
+        // head in front of it: that is an intact file's business, not ours.
+        let mut dump = structured(0x10000);
+        dump.extend_from_slice(&pseudo_random(0x10000, 0x1eaf_0000_0000_0006));
+        let path = write_dump("headloss-nohead", &dump);
+        let report = Carver::new(head_loss_options())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert!(report.files.is_empty(), "{report:?}");
+
+        // Pure noise has no drop at all.
+        let path = write_dump(
+            "headloss-noise",
+            &pseudo_random(0x30000, 0x1eaf_0000_0000_0007),
+        );
+        let report = Carver::new(head_loss_options())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert!(report.files.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn headloss_pass_ignores_a_tail_below_the_minimum_region() {
+        // 6 KiB of clean data: under the 8 KiB floor once the edge margins
+        // are taken off, so it is noise, not evidence.
+        let (dump, _, _) = head_loss_dump(0x1800);
+        let path = write_dump("headloss-small", &dump);
+        let report = Carver::new(head_loss_options())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(report.files.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn headloss_pass_is_opt_in_and_all_does_not_include_it() {
+        assert!(!CarveKind::ALL.contains(&CarveKind::HeadLoss));
+        assert_eq!(
+            CarveKind::from_list("all").unwrap(),
+            CarveKind::ALL.to_vec()
+        );
+        assert!(CarveKind::from_list("headloss")
+            .unwrap()
+            .contains(&CarveKind::HeadLoss));
+        assert!(CarveKind::from_list("all,headloss")
+            .unwrap()
+            .contains(&CarveKind::HeadLoss));
+        assert_eq!(CarveKind::HeadLoss.default_ext(), "bin");
+        assert_eq!(CarveKind::HeadLoss.as_str(), "headloss");
+
+        let (dump, _, _) = head_loss_dump(0xC000);
+        let path = write_dump("headloss-optin", &dump);
+        let report = Carver::new(CarveOptions {
+            kinds: CarveKind::ALL.to_vec(),
+            min_size: 0,
+            ..Default::default()
+        })
+        .scan(path.to_str().unwrap())
+        .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|file| file.kind != CarveKind::HeadLoss),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn headloss_pass_runs_before_bin_so_the_tail_is_not_a_noise_run() {
+        // With both kinds wanted, the tail comes out once as a headloss Tail
+        // and the noise around it as bin regions; nothing is double-counted.
+        let (dump, body_start, body_end) = head_loss_dump(0xC000);
+        let path = write_dump("headloss-bin", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::HeadLoss, CarveKind::Bin],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        let tails: Vec<_> = report
+            .files
+            .iter()
+            .filter(|file| file.kind == CarveKind::HeadLoss)
+            .collect();
+        assert_eq!(tails.len(), 1, "{report:?}");
+        let (a, b) = (tails[0].offset, tails[0].offset + tails[0].size);
+        assert!(a >= body_start && b <= body_end, "{report:?}");
+        for bin in report
+            .files
+            .iter()
+            .filter(|file| file.kind == CarveKind::Bin)
+        {
+            assert!(
+                bin.offset + bin.size <= a || bin.offset >= b,
+                "bin region overlaps the tail: {report:?}"
+            );
+        }
     }
 
     /// Block-aligned deterministic text fixture: `blocks` blocks of 64-byte
