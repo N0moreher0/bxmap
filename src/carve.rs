@@ -6680,6 +6680,184 @@ mod tests {
         assert_eq!(tail.size, (png.len() - ruined) as u64);
     }
 
+    /// One cycle = 3 zero windows + 1 high-entropy window (1:3 duty).
+    fn one_in_four_windows(cycles: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(cycles * 4 * SPIKE_WINDOW);
+        for cycle in 0..cycles {
+            out.extend_from_slice(&vec![0u8; SPIKE_WINDOW * 3]);
+            out.extend_from_slice(&pseudo_random(SPIKE_WINDOW, seed + cycle as u64));
+        }
+        out
+    }
+
+    /// A ZIP local entry (stored, no EOCD) whose data is the 1:3 pattern.
+    /// The name is padded so the entry data starts exactly at the second
+    /// 4 KiB window of the region, keeping the cycle grid aligned.
+    fn zip_entry_with_periodic_payload() -> Vec<u8> {
+        let payload = one_in_four_windows(16, 0xF00D_1550_CA11_0FF1); // 256 KiB, 16 cycles
+        let name_len = SPIKE_WINDOW - 30; // local header is 30 bytes
+        let mut out = Vec::with_capacity(SPIKE_WINDOW + payload.len());
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // time
+        out.extend_from_slice(&0u16.to_le_bytes()); // date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc (never checked)
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name_len as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra
+        out.extend_from_slice(&vec![b'A'; name_len]);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[test]
+    fn a_partial_encrypted_zip_with_only_the_header_left_reports_corruption_and_spike_offsets() {
+        // Case "con header": the local header survived but the central
+        // directory is gone (truncated), the classic partial-encryption
+        // leftover. Expect: incomplete, corrupted_offset at the end of the
+        // carved region, an entropy spike at the first random window, and
+        // the suspected-partial-encryption label.
+        let entry = zip_entry_with_periodic_payload();
+        let mut dump = vec![0u8; 32];
+        dump.extend_from_slice(&entry);
+        dump.extend_from_slice(&[0u8; 32]);
+        let path = write_dump("periodic-zip-header", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options).scan(path.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.kind, CarveKind::Zip);
+        assert!(!file.complete, "{file:?}");
+        assert_eq!(file.offset, 32);
+        // The size runs to the EOCD search frontier, slightly past the
+        // local entry data; the only hard invariant is that it covers the
+        // entry and that corrupted_offset sits at the end of the region.
+        assert!(file.size >= entry.len() as u64, "{file:?}");
+        assert_eq!(file.corrupted_offset, Some(file.offset + file.size));
+        // Window 0 is the header (structured); the first high window is the
+        // 4th data window == region window 4.
+        assert_eq!(
+            file.entropy_spike_at,
+            Some(file.offset + 4 * SPIKE_WINDOW as u64),
+            "{file:?}"
+        );
+        let hint = file
+            .partial_encryption
+            .expect("the 1:3 cycle must be detected");
+        assert_eq!(hint.period, 16_384); // 4 windows * 4 KiB
+                                         // 65 windows in the region, 16 high ones.
+        assert!((hint.duty - 16.0 / 65.0).abs() < 1e-9, "duty {}", hint.duty);
+        assert!(file.evidence.contains(&"suspected-partial-encryption"));
+    }
+
+    #[test]
+    fn a_partial_encrypted_zip_with_only_the_footer_left_reports_the_tail_offsets() {
+        // Case "con footer, mat header": local header and payload are gone,
+        // the central directory + EOCD survived (footer-first salvage). The
+        // tail is tiny, so the periodic label does not apply; expect
+        // corrupted_offset == tail start and a spike at the boundary window.
+        let zip = zip_bytes(
+            "report.docx",
+            &one_in_four_windows(16, 0x0FF1_CE57_0000_0001),
+        );
+        let eocd_at = zip
+            .windows(4)
+            .rposition(|chunk| chunk == b"PK\x05\x06")
+            .unwrap();
+        let cd_size =
+            u32::from_le_bytes(zip[eocd_at + 12..eocd_at + 16].try_into().unwrap()) as usize;
+        let cd_at = eocd_at - cd_size;
+        let mut dump = vec![0u8; 32];
+        dump.extend_from_slice(&one_in_four_windows(16, 0x0FF1_CE57_0000_0002));
+        let tail_at = dump.len() as u64;
+        dump.extend_from_slice(&zip[cd_at..]);
+        dump.extend_from_slice(&[0u8; 32]);
+        let path = write_dump("periodic-zip-footer", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let plain = Carver::new(options.clone())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        let salvaged = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(
+            plain
+                .files
+                .iter()
+                .all(|file| !file.notes.starts_with("salvage:tail")),
+            "salvage must stay off by default: {plain:?}"
+        );
+        let tails: Vec<_> = salvaged
+            .files
+            .iter()
+            .filter(|file| file.notes.starts_with("salvage:tail"))
+            .collect();
+        assert_eq!(tails.len(), 1, "{salvaged:?}");
+        let tail = tails[0];
+        assert_eq!(tail.kind, CarveKind::Zip);
+        assert!(!tail.complete);
+        assert_eq!(tail.offset, tail_at);
+        assert_eq!(tail.corrupted_offset, Some(tail_at));
+        // The boundary window right before the CD is the last random one.
+        assert_eq!(
+            tail.entropy_spike_at,
+            Some(tail_at - SPIKE_WINDOW as u64),
+            "{tail:?}"
+        );
+        assert!(tail.evidence.contains(&"footer"));
+        // The CD + EOCD tail is far below the 64 KiB minimum for the
+        // periodic scan, so the label stays off (by design).
+        assert!(tail.partial_encryption.is_none());
+        assert!(!tail.evidence.contains(&"suspected-partial-encryption"));
+    }
+
+    #[test]
+    fn a_partial_encrypted_blob_with_no_header_and_no_footer_carves_nothing() {
+        // Case "mat ca hai": a bare 1:3 region, no signature anywhere. No
+        // header-first candidate, no footer for salvage, and alternating
+        // high/zero 4 KiB blocks keep the bin pass below BIN_MIN_REGION,
+        // so the region is deliberately not written out as a file in v1.
+        let dump = one_in_four_windows(16, 0x0FF1_CE57_0000_0003);
+        let path = write_dump("periodic-bare", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|file| !file.evidence.contains(&"suspected-partial-encryption")),
+            "no file means no label: {report:?}"
+        );
+        assert!(
+            report.files.iter().all(|file| file.kind != CarveKind::Zip
+                && file.kind != CarveKind::Pdf
+                && file.kind != CarveKind::Png),
+            "a bare 1:3 blob must not be rescued: {report:?}"
+        );
+    }
+
     #[test]
     fn a_bmp_with_a_periodic_encrypted_payload_is_labelled_suspected_partial_encryption() {
         // A BMP whose pixel region repeats 3 zero windows + 1 high-entropy
