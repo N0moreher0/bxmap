@@ -150,6 +150,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   validated. `carves_mp4_file` only passed by accident of the
   `size == 0` branch. MP4 files now validate at the correct box
   boundaries.
+- **`carve_pdf` no longer writes megabytes of "partial" PDFs from random
+  garbage (found by the real-file bench decoy)**: the bench plants a
+  `%PDF-1.4\n` decoy followed by 8 KB of random bytes and expects every
+  carver to reject it. `carve_pdf` accepted any `%PDF-` body whose
+  `%%EOF` was missing as a `Truncated` (tier-2 `structure_partial`)
+  record, so the decoy was written as a **7,986,146-byte
+  `.pdf.carved`** from pure noise — the whole remaining dump run. The
+  validator now rewinds and requires at least one PDF object header
+  (`N M obj`) inside the scanned window before declaring a
+  `Truncated`; without one it returns
+  `Invalid("PDF magic, but no %%EOF and no objects: not a PDF")`.
+  A body with an object (e.g. a partly-encrypted or truncated PDF)
+  keeps the exact previous behavior, cut at the end of the scanned
+  window. Also pinned down and fixed the decoy offset drift in
+  `.scratch-enc/bench/build_image.py` (`offset += 8 + 8192` assumed
+  every magic is 8 bytes; the recorded decoy offsets were cumulative
+  nibbles off the real positions).
 - **`carve_zip` accepted un-openable archives as `complete`** (found by the
   Lab 6 forensic dump and the real-file bench): the validator walked local
   headers and required a `PK\x05\x06` to exist, but never checked the

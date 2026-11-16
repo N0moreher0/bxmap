@@ -2662,10 +2662,65 @@ fn golden_carve_zip_rebuilds_the_surviving_members_after_a_ruined_head() {
     assert!(name.ends_with(".docx.rebuilt.carved"), "{name}");
     let bytes = std::fs::read(&entries[0]).unwrap();
     let needle = |n: &[u8]| bytes.windows(n.len()).any(|w| w == n);
-    assert!(needle(b"[Content_Types].xml"), "CD must keep [Content_Types].xml");
-    assert!(needle(b"word/document.xml"), "CD must keep word/document.xml");
+    assert!(
+        needle(b"[Content_Types].xml"),
+        "CD must keep [Content_Types].xml"
+    );
+    assert!(
+        needle(b"word/document.xml"),
+        "CD must keep word/document.xml"
+    );
     assert!(!needle(b"doomed.bin"));
     assert!(!needle(b"VICTIM-ID-777"), "victim trailer must be cut");
+}
+
+#[test]
+fn golden_carve_pdf_rejects_magic_plus_random_garbage() {
+    let dir = tempfile::tempdir().unwrap();
+    // A "PDF" that is the magic plus 1 MiB of non-ASCII fill: no objects,
+    // no %%EOF, no trailer. This used to be carved as an incomplete
+    // multi-megabyte PDF from pure garbage (bench spurious case).
+    let mut dump = b"%PDF-1.4\n".to_vec();
+    dump.extend_from_slice(&0xdeadbeefu32.to_le_bytes().repeat(262_144));
+    assert!(!dump.windows(4).any(|w| w == b" obj"));
+    assert!(!dump.windows(5).any(|w| w == b"%%EOF"));
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let out_dir = dir.path().join("carve");
+    let index = dir.path().join("index.ndjson");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "pdf",
+            "--carve-out",
+            out_dir.to_str().unwrap(),
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{combined}");
+    assert!(combined.contains("0 file(s)"), "{combined}");
+    assert!(
+        !out_dir.join("partial").exists()
+            || std::fs::read_dir(out_dir.join("partial")).unwrap().count() == 0
+    );
+    if index.exists() {
+        let records = std::fs::read_to_string(&index).unwrap();
+        assert_eq!(records.trim(), "", "{records}");
+    }
 }
 
 #[test]

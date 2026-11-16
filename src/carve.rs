@@ -6294,6 +6294,9 @@ fn carve_pdf(source: &mut Source<'_>) -> io::Result<Verdict> {
     let search_end = (source.abs() + MAX_PDF_SEARCH).min(source.end);
     let original_end = source.end;
     source.end = search_end;
+    // Remember the body start: on the no-EOF path we rewind and demand
+    // evidence that this is a PDF at all (see below).
+    let body = source.abs();
     match find_bytes(source, b"%%EOF")? {
         Some(offset) => {
             source.end = original_end;
@@ -6313,9 +6316,27 @@ fn carve_pdf(source: &mut Source<'_>) -> io::Result<Verdict> {
             }
             Ok(Verdict::Valid)
         }
-        None => Ok(Verdict::Truncated(
-            "no %%EOF marker found before the size limit".to_string(),
-        )),
+        None => {
+            // A PDF with no %%EOF is either truncated or fake. Before
+            // writing up to MAX_PDF_SEARCH of random garbage as a "partial"
+            // PDF, require evidence that the body is a PDF at all: at least
+            // one object header (`N M obj`). Random data has a ~2e-3 chance
+            // of containing one in 8 MiB, and a body without it is never a
+            // PDF, not even an encrypted one.
+            source.rewind_to(body);
+            let has_object = find_bytes(source, b" obj")?.is_some();
+            if !has_object {
+                return Ok(Verdict::Invalid(
+                    "PDF magic, but no %%EOF and no objects: not a PDF".to_string(),
+                ));
+            }
+            // Preserve the original semantics: the partial file is cut at
+            // the end of the scanned window, not at the object we found.
+            source.rewind_to(search_end);
+            Ok(Verdict::Truncated(
+                "no %%EOF marker found before the size limit".to_string(),
+            ))
+        }
     }
 }
 
