@@ -7231,13 +7231,53 @@ fn carve_bz2(source: &mut Source<'_>) -> io::Result<Verdict> {
             "BZIP2 block magic is missing after the stream header".to_string(),
         ));
     }
-    // The body is a Huffman/arithmetic bit stream with no terminal marker we
-    // can trust; carve to the end of the candidate window and label the
-    // result incomplete.
-    source.skip(window_len(source))?;
-    Ok(Verdict::Truncated(
-        "bz2 stream body not decoded; extent ends at the candidate window".to_string(),
-    ))
+    // The body is a bit-packed stream we do not decode, but it ends with a
+    // 48-bit end-of-stream marker (0x177245385090) and a 32-bit combined CRC,
+    // at *any* bit alignment. Scan for the marker so the extent is the real
+    // stream instead of the whole candidate window (which would swallow every
+    // neighbouring carve inside it).
+    const BZ2_EOS: u64 = 0x1772_4538_5090;
+    const MASK48: u64 = 0xffff_ffff_ffff;
+    source.skip(4)?;
+    let mut acc: u64 = 0;
+    // Bytes fed into `acc`, counted from the stream origin (header = 4).
+    let mut fed: u64 = 4;
+    let mut end_off: Option<u64> = None;
+    'scan: loop {
+        source.fill(1)?;
+        let available = source.len - source.at;
+        if available == 0 {
+            break;
+        }
+        for k in 0..available {
+            acc = (acc << 8) | u64::from(source.buf[source.at + k]);
+            let count = fed + k as u64 + 1;
+            // 48 bits at a shift of up to 7 need 7 whole stream bytes, so the
+            // match can never overlap the 4-byte header.
+            if count >= 4 + 7 && (0..8).any(|shift| (acc >> shift) & MASK48 == BZ2_EOS) {
+                // The marker ends `shift` bits before byte `count`; the CRC
+                // adds 32 bits and the stream is padded to a byte, which is
+                // always exactly 4 more bytes.
+                end_off = Some(count + 4);
+                break 'scan;
+            }
+        }
+        fed += available as u64;
+        source.skip(available as u64)?;
+    }
+    match end_off {
+        Some(off) if off <= window_len(source) => {
+            source.rewind_to(source.origin + off);
+            Ok(Verdict::Valid)
+        }
+        _ => {
+            source.skip(window_len(source))?;
+            Ok(Verdict::Truncated(
+                "bz2 end-of-stream marker not found; extent ends at the candidate window"
+                    .to_string(),
+            ))
+        }
+    }
 }
 
 fn carve_xz(source: &mut Source<'_>) -> io::Result<Verdict> {
@@ -7262,9 +7302,45 @@ fn carve_xz(source: &mut Source<'_>) -> io::Result<Verdict> {
             "XZ header CRC-32 does not match".to_string(),
         ));
     }
+    // The stream ends with a 12-byte footer: CRC-32 (4) | backward size (4) |
+    // stream flags (2, equal to the header's) | "YZ". Find the first footer
+    // that checks out so the extent is the real stream, not the whole
+    // candidate window (which would swallow every neighbouring carve).
+    let needle = [header[6], header[7], b'Y', b'Z'];
+    let origin = source.origin;
+    source.skip(12)?;
+    while let Some(hit) = find_bytes(source, &needle)? {
+        // `hit` is where the flags start; the footer starts 8 bytes earlier.
+        // The skip(12) above guarantees `hit >= origin + 12`.
+        let footer_at = hit - 8;
+        source.rewind_to(footer_at);
+        let Some(footer) = take_bytes(source, 12)? else {
+            break;
+        };
+        let stored_crc = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
+        let backward = u64::from(u32::from_le_bytes([
+            footer[4], footer[5], footer[6], footer[7],
+        ]));
+        let index_size = (backward + 1) * 4;
+        let end = footer_at + 12;
+        let crc_ok = crc32(0xffff_ffff, &footer[4..10]) ^ 0xffff_ffff == stored_crc;
+        // A whole stream is a multiple of four bytes and holds header +
+        // index + footer; the index starts with a 0x00 indicator byte.
+        let shape_ok =
+            crc_ok && (end - origin) % 4 == 0 && footer_at >= origin + 12 + index_size && {
+                source.rewind_to(footer_at - index_size);
+                peek_u8(source)? == Some(0x00)
+            };
+        if shape_ok {
+            source.rewind_to(end);
+            return Ok(Verdict::Valid);
+        }
+        // False positive: resume just past this hit.
+        source.rewind_to(hit + 1);
+    }
     source.skip(window_len(source))?;
     Ok(Verdict::Truncated(
-        "XZ stream body not decoded; extent ends at the candidate window".to_string(),
+        "XZ footer not found; extent ends at the candidate window".to_string(),
     ))
 }
 
@@ -10284,7 +10360,52 @@ mod new_formats {
         ]
     }
 
-    /// A GIF whose global color table is exactly 2 entries (packed
+    /// A complete empty XZ stream (header + empty index + footer, 32 bytes).
+    fn minimal_xz_stream() -> Vec<u8> {
+        let flags = [0x00u8, 0x04]; // check = CRC64
+        let zlib_crc = |bytes: &[u8]| (crc32(0xffff_ffff, bytes) ^ 0xffff_ffff).to_le_bytes();
+        let mut out = vec![0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00];
+        out.extend_from_slice(&flags);
+        out.extend_from_slice(&zlib_crc(&flags));
+        let index = [0x00u8; 4]; // indicator, zero records, padding
+        out.extend_from_slice(&index);
+        out.extend_from_slice(&zlib_crc(&index));
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&1u32.to_le_bytes()); // backward size: (1 + 1) * 4 = 8
+        tail.extend_from_slice(&flags);
+        out.extend_from_slice(&zlib_crc(&tail));
+        out.extend_from_slice(&tail);
+        out.extend_from_slice(b"YZ");
+        out
+    }
+
+    /// A BZIP2 stream whose end-of-stream marker sits at a non-byte-aligned
+    /// bit offset (the real-world case).
+    fn minimal_bz2_stream() -> Vec<u8> {
+        let mut bits: Vec<bool> = Vec::new();
+        let mut push = |value: u64, width: u32| {
+            for i in (0..width).rev() {
+                bits.push((value >> i) & 1 == 1);
+            }
+        };
+        push(0x3141_5926_5359, 48); // block magic
+        for _ in 0..13 {
+            push(0, 7); // 91 junk bits: the marker starts 3 bits into a byte
+        }
+        push(0x1772_4538_5090, 48); // end-of-stream magic
+        push(0xdead_beef, 32); // combined CRC
+        let mut out = b"BZh9".to_vec();
+        for chunk in bits.chunks(8) {
+            let mut byte = 0u8;
+            for (i, bit) in chunk.iter().enumerate() {
+                if *bit {
+                    byte |= 0x80 >> i;
+                }
+            }
+            out.push(byte);
+        }
+        out
+    }
     /// 0b1000_0000): the table is 6 bytes, so any off-by-one in the size
     /// check lands the walker in the middle of the table.
     fn minimal_gif_gct() -> Vec<u8> {
@@ -10394,6 +10515,35 @@ mod new_formats {
         let report = carve_one("gif-gct", CarveKind::Gif, &minimal_gif_gct());
         assert_eq!(report.files.len(), 1, "{report:?}");
         assert!(report.files[0].complete, "{:?}", report.files[0]);
+    }
+
+    #[test]
+    fn xz_and_bz2_extents_stop_at_their_own_terminator() {
+        // Before: the extent was the whole candidate window, so a small .xz
+        // swallowed every carve behind it. Now it ends at the XZ footer / the
+        // BZIP2 end-of-stream marker, and trailing bytes stay out.
+        let junk = std::iter::repeat(0xaau8).take(4096);
+        for (name, kind, stream) in [
+            ("xz-term", CarveKind::Xz, minimal_xz_stream()),
+            ("bz2-term", CarveKind::Bz2, minimal_bz2_stream()),
+        ] {
+            let mut payload = stream.clone();
+            payload.extend(junk.clone());
+            let report = carve_one(name, kind, &payload);
+            assert_eq!(report.files.len(), 1, "{name}: {report:?}");
+            assert!(report.files[0].complete, "{name}: {:?}", report.files[0]);
+            assert_eq!(report.files[0].size, stream.len() as u64, "{name}");
+        }
+    }
+
+    #[test]
+    fn xz_with_a_corrupt_footer_is_not_trusted() {
+        let mut stream = minimal_xz_stream();
+        let len = stream.len();
+        stream[len - 12] ^= 0xff; // footer CRC-32
+        let report = carve_one("xz-bad-footer", CarveKind::Xz, &stream);
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert!(!report.files[0].complete, "{:?}", report.files[0]);
     }
 
     #[test]

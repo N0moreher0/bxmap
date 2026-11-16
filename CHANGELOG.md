@@ -66,6 +66,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fields and dedupe semantics match the rebuilt record.
 
 ### Fixed
+- **XZ and BZIP2 carves no longer swallow the dump up to the candidate
+  window.** Both used to validate only the header and run to the end of the
+  window (64 MB), so an 18 KB `readme.md.xz` produced a pseudo-file that
+  absorbed 12 real files behind it (both MP4s, `loot.sqlite`, `capture.pcap`).
+  XZ now ends at the first footer that checks out (footer CRC-32, stream
+  size a multiple of 4, index indicator byte `0x00` at the position the
+  backward size points to); BZIP2 ends at its 48-bit end-of-stream marker
+  found at any bit alignment, plus the 32-bit CRC. Without a terminator the
+  carve is still `Truncated` to the window, as before. Tests: footer/marker
+  at an unaligned bit offset with trailing junk, and a corrupt XZ footer.
 - **`carve_mp4` walked boxes 8 bytes short** (`skip(size - 8)` although
   `peek_array` does not consume): almost every structurally valid MP4
   was carved as `Truncated` and landed in `partial/` instead of being
