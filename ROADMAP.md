@@ -606,6 +606,16 @@ Chỉ chạy khi 8.12.2 không áp dụng được.
 **Quyết định mặc định (đổi nếu chủ repo muốn):** quality cố định 90; bản thô luôn giữ, bản `-adjusted` để P2; tách `src/jpeg_scan.rs`; `Rebuilt` có bảng chính xác vào thư mục chính, ước lượng vào `partial/`; chưa có `--carve-donor` ở P1.
 **Nguồn tham khảo:** repo DRCRecoveryData/JPEG_Recovery (không có LICENSE nên ý tưởng được viết lại độc lập từ ITU-T T.81, không sao chép mã); mã chỉ đọc, không chạy.
 
+**8.13 Cứu file bị xoá sạch 4 KiB đầu (bench `head4k`) bằng cấu trúc còn sống · P1 · ĐỀ XUẤT, chờ chủ repo duyệt (2026-11-16)**
+- Hiện trạng (bench 2026-11-16): `head4k` MISS 17/19. Đây là hành vi theo thiết kế: magic ở đầu file đã bị xoá nên header pass không thấy gì; text pass cứu được 5 file. Muốn hơn nữa phải bỏ giả định "có magic ở đầu" và neo vào phần còn sống của file, cùng tinh thần 8.7.2 (footer-first), 8.11.2 (tìm đầu từ `moov`) và 8.12 (JPEG).
+- [ ] **M0 — đo, chưa code sản phẩm:** liệt kê 19 file của bench theo định dạng; với mỗi file ghi rõ sau 4 KiB đầu còn cấu trúc nào đọc được (footer, bảng offset, chunk, trang) và định dạng nào hoàn toàn không có neo. Kết quả M0 quyết định mục nào dưới đây đáng làm; không làm mục nào mà M0 cho thấy 0 file hưởng lợi.
+- [ ] **8.13.1 Neo ở đuôi/giữa file (theo từng định dạng, đã có validator):** ZIP/OOXML/APK (EOCD + central directory → suy ra offset local header, dựng lại phần còn sống), PNG (chunk `IDAT`/`IEND` liền kề, đã có ở 8.7.2), PDF (`xref`/`trailer`/`%%EOF`), SQLite (page header + kích thước trang), MP4 (đã có 8.11). Mỗi định dạng tái dùng validator hiện có, chỉ đổi cách tìm điểm bắt đầu.
+- [ ] **8.13.2 Ranh giới entropy chuẩn 4 KiB:** vùng đầu entropy cao dài đúng ~4096 byte (hoặc bội số sector) rồi chuyển sang dữ liệu sạch là dấu hiệu `head4k`. Dùng làm tín hiệu tăng tin cậy và gắn nhãn `suspected-partial-encryption` (đã có ở 8.7.3), không dùng làm điều kiện duy nhất để carve.
+- [ ] **8.13.3 Kết quả tối thiểu khi chưa dựng được:** ghi phần sạch vào `partial/` với role `Tail` (`.tail.carved`) kèm `corrupted_offset` = ranh giới 4 KiB và note `salvage:head4k`. Đây là bằng chứng và tránh MISS im lặng; tên file và trường index khớp 8.10/8.11.
+- [ ] **8.13.4 Test và đo:** fixture tổng hợp cho từng định dạng được chọn sau M0 (xoá 4096 byte đầu của file hợp lệ), golden CLI, fuzz qua `carve_scan` (đặc biệt footer giả và EOCD giả vì neo ở đuôi dễ false positive); đo lại bench, ghi số MISS trước/sau, không hứa trước con số.
+- **Ranh giới giữ nguyên:** chỉ cắt, định vị, dựng header từ cấu trúc còn sống và gắn nhãn; không giải mã, không dùng khoá, không đoán nội dung đã bị xoá. Phần đã mất vĩnh viễn thì báo rõ là mất.
+- **Thứ tự đề xuất:** M0 → 8.13.3 (rẻ, hết MISS im lặng) → 8.13.1 theo định dạng có nhiều file nhất trong M0 → 8.13.2 → 8.13.4. Độc lập với 8.12; dùng chung `CarveRole::Tail`/`Rebuilt` và các trường index sẵn có.
+
 **Xong khi:** carve được JPEG/PNG/ZIP/RAR hoàn chỉnh từ dump tổng hợp với 0 false negative trên bộ test; không panic và không vượt trần bộ nhớ trên input hỏng; so sánh công khai với foremost/PhotoRec có số liệu.
 
 ---
