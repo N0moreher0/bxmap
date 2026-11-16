@@ -6,6 +6,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **The JPEG MCU walker is now a complete, tested module with the ITU-T
+  T.81 Annex K tables built in (ROADMAP 8.12.3)**. `src/jpeg_scan.rs`
+  gained: (1) `decode_block` extracted from the decode loop (DC diff +
+  AC run/size + EOB + ZRL; no dequantization, no IDCT); (2)
+  `walk_mcus(unstuffed, restarts, geometry, tables, start_bit,
+  limit_mcus) -> WalkStats {mcus, blocks, end_bit, err, first_boundaries,
+  dc_luma, restarts_consumed, geometry}` — the single walker behind
+  `verify_scan`, with an arbitrary `start_bit` (for the 8.12.4 probes) and
+  a caller-controlled MCU limit; (3) the four Annex K tables
+  (DC/AC × luma/chroma) as compile-time constants validated byte-exact
+  against the `DHT` segments libjpeg actually writes in the repo
+  fixtures, built once via `OnceLock` into 16-bit lookups (~0.5 MiB),
+  with `AnnexK::for_components` mapping component 0 → luma tables, the
+  rest → chroma; (4) safety caps: `dc_luma` keeps only the first 65 536
+  entries, `first_boundaries` only the first 1 100; every loop is bounded
+  by the remaining bits or by `limit_mcus`; table/component count
+  mismatch and garbage input return `err` in `WalkStats`, never panic.
+  `verify_scan` now re-uses `walk_mcus` instead of its own copy of the
+  loop; behavior is unchanged. Tests: symbol counts 12/12/162/162, Kraft
+  sums ≤ 1, LUT slot checks for every symbol, canonical encode →
+  incremental 1-bit decode roundtrip, `OnceLock` built-once identity,
+  and a bit-for-bit equality check between the Annex K walk and the
+  file-tables walk on libjpeg fixtures (IJG embeds the Annex K tables).
+  269 lib tests (was 258), 117 golden; clippy `-D warnings`; fmt clean.
+  Bench (412 MB, 63 items) unchanged on all four `--carve all` variants
+  (30/30/36/42 recovered); Lab 6 (1.61 GiB) unchanged at 128 files.
 - **JPEG whose head was destroyed but whose table chain survives is rebuilt
   exactly (ROADMAP 8.12.2, P1)**. When ransomware destroyed only the
   leading `APP0`/`EXIF` region (the corruption shape the bench's `head4k`

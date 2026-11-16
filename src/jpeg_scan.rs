@@ -1,4 +1,4 @@
-//! JPEG baseline entropy-coded scan walker (ROADMAP 8.12.3 foundation).
+//! JPEG baseline entropy-coded scan walker (ROADMAP 8.12.3).
 //!
 //! This module does **not** decode pixels. It answers one question: given a
 //! (possibly rebuilt) baseline/sequential Huffman JPEG, does the entropy
@@ -20,9 +20,12 @@
 //! - progressive (`SOF2`+) and arithmetic are out of scope on purpose.
 //!
 //! No dequantization, no IDCT, no colour transform. The tables come from
-//! the file itself (`DHT`); nothing here is assumed.
+//! the file itself (`DHT`); nothing here is assumed. The Annex K tables
+//! (T.81) are provided for callers that have no tables of their own —
+//! ROADMAP 8.12.4 — built once into 16-bit lookups via `OnceLock`.
 
 use std::fmt;
+use std::sync::OnceLock;
 
 /// Offset of the SOS marker plus one `(Cs, Td, Ta)` triple per component
 /// (component id, DC Huffman table id, AC Huffman table id).
@@ -92,24 +95,42 @@ pub struct ComponentInfo {
     pub ta: u8,
 }
 
-/// Result of a successful walk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WalkStats {
-    /// Number of MCUs decoded (`mcu_cols × mcu_rows`).
-    pub mcus: u64,
-    /// Total 8×8 blocks decoded across all components.
-    pub blocks: u64,
-    /// Geometry the scan claims.
-    pub geometry: ScanGeometry,
-}
-
 /// Largest supported component count.
 pub const MAX_COMPONENTS: usize = 4;
 /// Hard cap on decoded MCUs, mirroring the 8.12.8 safety rule.
 pub const MAX_MCUS: u64 = 8_000_000;
+/// Cap on the `dc_luma` vector (ROADMAP 8.12.3: the first 65_536 MCUs).
+pub const DC_LUMA_CAP: usize = 65_536;
+/// Cap on the `first_boundaries` vector (ROADMAP 8.12.3).
+pub const FIRST_BOUNDARIES_CAP: usize = 1_100;
+
+/// Result of an MCU walk (ROADMAP 8.12.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WalkStats {
+    /// Number of MCUs decoded.
+    pub mcus: u64,
+    /// Total 8×8 blocks decoded across all components.
+    pub blocks: u64,
+    /// Bit position right after the last fully decoded MCU (or at the point
+    /// `err` was raised).
+    pub end_bit: usize,
+    /// Why the walk stopped; `None` when it reached `limit_mcus` cleanly.
+    pub err: Option<WalkError>,
+    /// Bit positions of MCU starts, in decode order, capped at
+    /// `FIRST_BOUNDARIES_CAP` entries.
+    pub first_boundaries: Vec<usize>,
+    /// Running DC predictor of the luma component (component index 0) after
+    /// each luma block, in decode order, capped at `DC_LUMA_CAP` entries.
+    pub dc_luma: Vec<i32>,
+    /// Restart markers consumed from the `restarts` slice passed in (an
+    /// index into it, not a count of bytes).
+    pub restarts_consumed: usize,
+    /// Geometry the walk used.
+    pub geometry: ScanGeometry,
+}
 
 /// One Huffman table as a 16-bit lookup.
-struct HuffmanTable {
+pub(crate) struct HuffmanTable {
     /// `lut[next_16_bits]` → `(length_bits, symbol)`. A length of 0 means
     /// the code does not exist (invalid for this table).
     lut: Vec<(u8, u8)>,
@@ -166,6 +187,119 @@ impl HuffmanTable {
     }
 }
 
+// --- ITU-T T.81 Annex K (K.3.1/K.3.2/K.3.3/K.3.4) -------------------------
+// Byte-exact against every libjpeg-encoded fixture and camera_sample.jpg
+// checked into this repo (see tests below). The tables are surfaced for
+// the test suite and for ROADMAP 8.12.4; the lib target does not call them
+// yet, so the whole surface carries `#[allow(dead_code)]`.
+
+#[allow(dead_code)]
+const ANNEX_K_DC_LUMA_NR: [u8; 16] = [
+    0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+#[allow(dead_code)]
+const ANNEX_K_DC_LUMA_VAL: [u8; 12] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+];
+#[allow(dead_code)]
+const ANNEX_K_DC_CHROMA_NR: [u8; 16] = [
+    0x00, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+#[allow(dead_code)]
+const ANNEX_K_DC_CHROMA_VAL: [u8; 12] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+];
+#[allow(dead_code)]
+const ANNEX_K_AC_LUMA_NR: [u8; 16] = [
+    0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D,
+];
+#[allow(dead_code)]
+const ANNEX_K_AC_LUMA_VAL: [u8; 162] = [
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+    0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+    0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+    0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA,
+];
+#[allow(dead_code)]
+const ANNEX_K_AC_CHROMA_NR: [u8; 16] = [
+    0x00, 0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04, 0x07, 0x05, 0x04, 0x04, 0x00, 0x01, 0x02, 0x77,
+];
+#[allow(dead_code)]
+const ANNEX_K_AC_CHROMA_VAL: [u8; 162] = [
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33, 0x52, 0xF0,
+    0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34, 0xE1, 0x25, 0xF1, 0x17, 0x18, 0x19, 0x1A, 0x26,
+    0x27, 0x28, 0x29, 0x2A, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5,
+    0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3,
+    0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA,
+    0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA,
+];
+
+/// The four Annex K tables, built into 16-bit lookups once.
+#[allow(dead_code)]
+pub(crate) struct AnnexK {
+    pub dc_luma: HuffmanTable,
+    pub dc_chroma: HuffmanTable,
+    pub ac_luma: HuffmanTable,
+    pub ac_chroma: HuffmanTable,
+}
+
+#[allow(dead_code)]
+static ANNEX_K: OnceLock<AnnexK> = OnceLock::new();
+
+/// The shared Annex K tables. The LUTs cost ~0.5 MiB (4 tables × 65 536 ×
+/// 2 bytes) and are built once, on first use.
+#[allow(dead_code)]
+pub(crate) fn annex_k() -> &'static AnnexK {
+    ANNEX_K.get_or_init(|| AnnexK {
+        dc_luma: HuffmanTable::build(&ANNEX_K_DC_LUMA_NR, &ANNEX_K_DC_LUMA_VAL)
+            .expect("ITU-T T.81 Annex K DC luma table must be valid"),
+        dc_chroma: HuffmanTable::build(&ANNEX_K_DC_CHROMA_NR, &ANNEX_K_DC_CHROMA_VAL)
+            .expect("ITU-T T.81 Annex K DC chroma table must be valid"),
+        ac_luma: HuffmanTable::build(&ANNEX_K_AC_LUMA_NR, &ANNEX_K_AC_LUMA_VAL)
+            .expect("ITU-T T.81 Annex K AC luma table must be valid"),
+        ac_chroma: HuffmanTable::build(&ANNEX_K_AC_CHROMA_NR, &ANNEX_K_AC_CHROMA_VAL)
+            .expect("ITU-T T.81 Annex K AC chroma table must be valid"),
+    })
+}
+
+#[allow(dead_code)]
+impl AnnexK {
+    /// Map a scan's components onto the Annex K luma/chroma tables
+    /// (component index 0 is treated as luma, the rest as chroma).
+    pub(crate) fn for_components(&self, geometry: &ScanGeometry) -> Vec<ComponentTables<'_>> {
+        geometry
+            .components
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index == 0 {
+                    ComponentTables {
+                        dc: &self.dc_luma,
+                        ac: &self.ac_luma,
+                    }
+                } else {
+                    ComponentTables {
+                        dc: &self.dc_chroma,
+                        ac: &self.ac_chroma,
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
 /// Bit reader over the unstuffed entropy bytes.
 struct BitReader<'a> {
     data: &'a [u8],
@@ -173,8 +307,8 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, bit_pos: 0 }
+    fn with_offset(data: &'a [u8], bit_pos: usize) -> Self {
+        Self { data, bit_pos }
     }
 
     /// Bits still unread.
@@ -530,6 +664,174 @@ fn unstuff(data: &[u8]) -> (Vec<u8>, Vec<usize>) {
     (out, rests)
 }
 
+/// Borrowed per-component table set, aligned with `ScanGeometry::components`
+/// (ROADMAP 8.12.3: callers need several table sources — the file's own
+/// `DHT` segments, or the shared Annex K tables for probes without tables).
+pub(crate) struct ComponentTables<'a> {
+    pub dc: &'a HuffmanTable,
+    pub ac: &'a HuffmanTable,
+}
+
+/// Decode one 8×8 block: the DC difference plus the AC coefficients, in
+/// zig-zag order. No dequantization, no IDCT. Returns the DC predictor
+/// increment; the AC coefficients are validated but discarded.
+fn decode_block(
+    reader: &mut BitReader<'_>,
+    tables: &ComponentTables<'_>,
+) -> Result<i32, WalkError> {
+    // DC coefficient: category, then the extra bits.
+    let dc_code = tables.dc.lut[reader.peek16() as usize];
+    if dc_code.0 == 0 {
+        return Err(WalkError::InvalidCode);
+    }
+    reader.skip(dc_code.0 as usize)?;
+    let size = dc_code.1 as u32;
+    let extra = reader.read_bits(size)?;
+    let diff = extend(size, extra);
+    // AC coefficients, zig-zag order, up to 63.
+    let mut k = 1usize;
+    while k < 64 {
+        let ac_code = tables.ac.lut[reader.peek16() as usize];
+        if ac_code.0 == 0 {
+            return Err(WalkError::InvalidCode);
+        }
+        reader.skip(ac_code.0 as usize)?;
+        let symbol = ac_code.1;
+        if symbol == 0x00 {
+            // EOB: the rest of the block is zero.
+            break;
+        }
+        if symbol == 0xF0 {
+            // ZRL: 16 zeros.
+            k += 16;
+            continue;
+        }
+        let run = (symbol >> 4) as usize;
+        let size = (symbol & 0x0F) as usize;
+        k += run;
+        if k >= 64 {
+            return Err(WalkError::InvalidCode);
+        }
+        let extra = reader.read_bits(size as u32)?;
+        let _coefficient = extend(size as u32, extra);
+        k += 1;
+    }
+    Ok(diff)
+}
+
+/// Walk the entropy-coded MCUs (ROADMAP 8.12.3). `unstuffed` is the
+/// stuffing-free entropy bytes; `restarts` holds the byte offsets of the
+/// restart markers in that slice (as produced by `unstuff`). `tables` must
+/// be aligned with `geometry.components`. `start_bit` is where the decode
+/// begins (0 for a full scan; arbitrary for candidate probes). At most
+/// `limit_mcus` MCUs are decoded. Errors are reported in `WalkStats::err`;
+/// the function never panics and every loop is bounded by the remaining bits.
+pub(crate) fn walk_mcus(
+    unstuffed: &[u8],
+    restarts: &[usize],
+    geometry: &ScanGeometry,
+    tables: &[ComponentTables<'_>],
+    start_bit: usize,
+    limit_mcus: u64,
+) -> WalkStats {
+    let mut stat = WalkStats {
+        mcus: 0,
+        blocks: 0,
+        end_bit: start_bit.min(unstuffed.len() * 8),
+        err: None,
+        first_boundaries: Vec::with_capacity(limit_mcus.min(FIRST_BOUNDARIES_CAP as u64) as usize),
+        dc_luma: Vec::with_capacity(limit_mcus.min(DC_LUMA_CAP as u64) as usize),
+        restarts_consumed: 0,
+        geometry: geometry.clone(),
+    };
+    if tables.len() != geometry.components.len() {
+        // Internal contract violation; report it, never panic.
+        stat.err = Some(WalkError::InvalidSegment(
+            "walk_mcus: table/component count mismatch".to_string(),
+        ));
+        return stat;
+    }
+    let h_max = geometry.components.iter().map(|c| c.h).max().unwrap_or(1) as u16;
+    let v_max = geometry.components.iter().map(|c| c.v).max().unwrap_or(1) as u16;
+    let mcu_cols = u64::from(geometry.width).div_ceil(u64::from(h_max) * 8);
+    let mcu_rows = u64::from(geometry.height).div_ceil(u64::from(v_max) * 8);
+    let total_mcus = match mcu_cols.checked_mul(mcu_rows) {
+        Some(total) if total > 0 && total <= MAX_MCUS => total,
+        _ => {
+            stat.err = Some(WalkError::TooLarge);
+            return stat;
+        }
+    };
+    let limit = limit_mcus.min(total_mcus) as usize;
+    let mut reader = BitReader::with_offset(unstuffed, start_bit);
+    let mut dc_pred = [0i32; MAX_COMPONENTS];
+    let mut rest_index = 0usize;
+    for _mcu in 0..limit {
+        let mcu = _mcu as u64;
+        if geometry.dri > 0 && mcu > 0 && mcu % u64::from(geometry.dri) == 0 {
+            // The encoder pads to a byte boundary before each restart
+            // marker and resets the DC predictors.
+            let current_bit = reader.bit_pos;
+            if current_bit % 8 != 0 {
+                let pad = 8 - (current_bit % 8);
+                let pad_bits = match reader.read_bits(pad as u32) {
+                    Ok(bits) => bits,
+                    Err(error) => {
+                        stat.err = Some(error);
+                        return finish(stat, reader.bit_pos, rest_index);
+                    }
+                };
+                if pad_bits != (1u32 << pad) - 1 {
+                    stat.err = Some(WalkError::Padding);
+                    return finish(stat, reader.bit_pos, rest_index);
+                }
+            }
+            let at = reader.bit_pos / 8;
+            match rest_index {
+                i if i < restarts.len() && restarts[i] == at => {
+                    rest_index += 1;
+                    dc_pred = [0; MAX_COMPONENTS];
+                }
+                _ => {
+                    stat.err = Some(WalkError::RestartMismatch);
+                    return finish(stat, reader.bit_pos, rest_index);
+                }
+            }
+        }
+        if stat.first_boundaries.len() < FIRST_BOUNDARIES_CAP {
+            stat.first_boundaries.push(reader.bit_pos);
+        }
+        for (index, component) in geometry.components.iter().enumerate() {
+            let h = component.h as usize;
+            let v = component.v as usize;
+            for _ in 0..(h * v) {
+                let diff = match decode_block(&mut reader, &tables[index]) {
+                    Ok(diff) => diff,
+                    Err(error) => {
+                        stat.err = Some(error);
+                        return finish(stat, reader.bit_pos, rest_index);
+                    }
+                };
+                dc_pred[index] = dc_pred[index].wrapping_add(diff);
+                // Component 0 is the luma plane in interleaved scans.
+                if index == 0 && stat.dc_luma.len() < DC_LUMA_CAP {
+                    stat.dc_luma.push(dc_pred[index]);
+                }
+                stat.blocks += 1;
+            }
+        }
+        stat.mcus += 1;
+    }
+    finish(stat, reader.bit_pos, rest_index)
+}
+
+/// Fill the final position fields of a finished walk.
+fn finish(mut stat: WalkStats, end_bit: usize, restarts_consumed: usize) -> WalkStats {
+    stat.end_bit = end_bit;
+    stat.restarts_consumed = restarts_consumed;
+    stat
+}
+
 /// Decode an entropy sector and check the MCU count and the end-of-scan
 /// padding. `bytes` must start at SOI; the scan is everything from the end
 /// of the SOS header up to (but excluding) the final `FF D9`.
@@ -564,88 +866,36 @@ pub fn verify_scan(bytes: &[u8]) -> Result<WalkStats, WalkError> {
         return Err(WalkError::TooLarge);
     }
 
+    let component_tables: Vec<ComponentTables<'_>> = geometry
+        .components
+        .iter()
+        .map(|component| ComponentTables {
+            dc: tables[component.td as usize]
+                .as_ref()
+                .expect("checked above"),
+            ac: tables[4 + component.ta as usize]
+                .as_ref()
+                .expect("checked above"),
+        })
+        .collect();
     let (unstuffed, restarts) = unstuff(scan);
-    let mut reader = BitReader::new(&unstuffed);
-    let mut dc_pred = [0i32; MAX_COMPONENTS];
-    let mut rest_index = 0usize;
-    let mut blocks: u64 = 0;
-
-    for mcu in 0..total_mcus {
-        if geometry.dri > 0 && mcu > 0 && mcu % u64::from(geometry.dri) == 0 {
-            // The encoder pads to a byte boundary before each restart
-            // marker and resets the DC predictors.
-            let current_bit = reader.bit_pos;
-            if current_bit % 8 != 0 {
-                let pad = 8 - (current_bit % 8);
-                let pad_bits = reader.read_bits(pad as u32)?;
-                if pad_bits != (1u32 << pad) - 1 {
-                    return Err(WalkError::Padding);
-                }
-            }
-            let at = reader.bit_pos / 8;
-            match rest_index {
-                i if i < restarts.len() && restarts[i] == at => {
-                    rest_index += 1;
-                    dc_pred = [0; MAX_COMPONENTS];
-                }
-                _ => return Err(WalkError::RestartMismatch),
-            }
-        }
-        for (index, component) in geometry.components.iter().enumerate() {
-            let h = component.h as usize;
-            let v = component.v as usize;
-            for _ in 0..(h * v) {
-                let dc_huffman = tables[component.td as usize]
-                    .as_ref()
-                    .ok_or_else(|| WalkError::InvalidSegment("missing DC table".to_string()))?;
-                let ac_huffman = tables[4 + component.ta as usize]
-                    .as_ref()
-                    .ok_or_else(|| WalkError::InvalidSegment("missing AC table".to_string()))?;
-                // DC coefficient: category, then the extra bits.
-                let dc_code = dc_huffman.lut[reader.peek16() as usize];
-                if dc_code.0 == 0 {
-                    return Err(WalkError::InvalidCode);
-                }
-                reader.skip(dc_code.0 as usize)?;
-                let size = dc_code.1 as u32;
-                let extra = reader.read_bits(size)?;
-                let diff = extend(size, extra);
-                dc_pred[index] = dc_pred[index].wrapping_add(diff);
-                // AC coefficients, zig-zag order, up to 63.
-                let mut k = 1usize;
-                while k < 64 {
-                    let ac_code = ac_huffman.lut[reader.peek16() as usize];
-                    if ac_code.0 == 0 {
-                        return Err(WalkError::InvalidCode);
-                    }
-                    reader.skip(ac_code.0 as usize)?;
-                    let symbol = ac_code.1;
-                    if symbol == 0x00 {
-                        // EOB: the rest of the block is zero.
-                        break;
-                    }
-                    if symbol == 0xF0 {
-                        // ZRL: 16 zeros.
-                        k += 16;
-                        continue;
-                    }
-                    let run = (symbol >> 4) as usize;
-                    let size = (symbol & 0x0F) as usize;
-                    k += run;
-                    if k >= 64 {
-                        return Err(WalkError::InvalidCode);
-                    }
-                    let extra = reader.read_bits(size as u32)?;
-                    let _coefficient = extend(size as u32, extra);
-                    k += 1;
-                }
-                blocks += 1;
-            }
-        }
+    let stats = walk_mcus(
+        &unstuffed,
+        &restarts,
+        &geometry,
+        &component_tables,
+        0,
+        total_mcus,
+    );
+    if let Some(error) = stats.err {
+        return Err(error);
     }
-    if geometry.dri > 0 && rest_index < restarts.len() {
-        // A trailing restart after the very last MCU: encoders emit one when
-        // the MCU count is an exact multiple of the restart interval.
+    // A trailing restart marker can sit right after the final MCU
+    // (the encoder emits one when the MCU count is an exact multiple of
+    // the restart interval).
+    let mut cursor = stats.restarts_consumed;
+    let mut reader = BitReader::with_offset(&unstuffed, stats.end_bit);
+    if geometry.dri > 0 && cursor < restarts.len() {
         let current_bit = reader.bit_pos;
         if current_bit % 8 != 0 {
             let pad = 8 - (current_bit % 8);
@@ -655,14 +905,14 @@ pub fn verify_scan(bytes: &[u8]) -> Result<WalkStats, WalkError> {
             }
         }
         let at = reader.bit_pos / 8;
-        match rest_index {
+        match cursor {
             i if i < restarts.len() && restarts[i] == at => {
-                rest_index += 1;
+                cursor += 1;
             }
             _ => return Err(WalkError::RestartMismatch),
         }
     }
-    if geometry.dri > 0 && rest_index != restarts.len() {
+    if geometry.dri > 0 && cursor != restarts.len() {
         return Err(WalkError::RestartMismatch);
     }
     let remaining = reader.remaining();
@@ -675,11 +925,7 @@ pub fn verify_scan(bytes: &[u8]) -> Result<WalkStats, WalkError> {
             return Err(WalkError::Padding);
         }
     }
-    Ok(WalkStats {
-        mcus: total_mcus,
-        blocks,
-        geometry,
-    })
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -723,5 +969,276 @@ mod tests {
     fn verify_scan_rejects_a_truncated_scan() {
         let truncated = &RGB[..RGB.len() - 20];
         assert!(verify_scan(truncated).is_err());
+    }
+
+    // --- Annex K constants + OnceLock (ROADMAP 8.12.3) ------------------
+
+    const ANNEX_K_TABLES: &[(&str, &[u8], &[u8])] = &[
+        ("DC luma", &ANNEX_K_DC_LUMA_NR, &ANNEX_K_DC_LUMA_VAL),
+        ("DC chroma", &ANNEX_K_DC_CHROMA_NR, &ANNEX_K_DC_CHROMA_VAL),
+        ("AC luma", &ANNEX_K_AC_LUMA_NR, &ANNEX_K_AC_LUMA_VAL),
+        ("AC chroma", &ANNEX_K_AC_CHROMA_NR, &ANNEX_K_AC_CHROMA_VAL),
+    ];
+
+    #[test]
+    fn annex_k_symbol_counts_match_the_spec() {
+        let expected = [12usize, 12, 162, 162];
+        for ((name, counts, _values), expected) in ANNEX_K_TABLES.iter().zip(expected) {
+            let total: usize = counts.iter().map(|&b| b as usize).sum();
+            assert_eq!(total, expected, "{name}: symbol count mismatch");
+        }
+    }
+
+    #[test]
+    fn annex_k_kraft_sums_do_not_exceed_one() {
+        for (name, counts, _values) in ANNEX_K_TABLES {
+            let kraft: f64 = counts
+                .iter()
+                .enumerate()
+                .map(|(index, &count)| count as f64 / (1u64 << (index + 1)) as f64)
+                .sum();
+            assert!(kraft <= 1.0 + 1e-9, "{name}: Kraft sum is {kraft}");
+        }
+    }
+
+    #[test]
+    fn annex_k_canonical_codes_are_unique_and_in_range() {
+        // Independent canonical construction (no HuffmanTable::build):
+        // every code must fit its length class and never repeat.
+        for (name, counts, values) in ANNEX_K_TABLES {
+            let mut code: u32 = 0;
+            let mut seen = std::collections::HashSet::new();
+            let mut index = 0usize;
+            for (length_index, &count) in counts.iter().enumerate() {
+                let length = (length_index + 1) as u32;
+                for _ in 0..count {
+                    let _symbol = values[index];
+                    index += 1;
+                    assert!(
+                        code < (1u32 << length),
+                        "{name}: code overflows length {length}"
+                    );
+                    assert!(
+                        seen.insert((length, code)),
+                        "{name}: duplicate code at length {length}"
+                    );
+                    code += 1;
+                }
+                code <<= 1;
+            }
+            assert_eq!(index, values.len(), "{name}: values length mismatch");
+        }
+    }
+
+    #[test]
+    fn annex_k_lut_maps_every_symbol_at_its_canonical_slot() {
+        let annex = annex_k();
+        let tables: [(&HuffmanTable, &[u8; 16], &[u8]); 4] = [
+            (&annex.dc_luma, &ANNEX_K_DC_LUMA_NR, &ANNEX_K_DC_LUMA_VAL),
+            (
+                &annex.dc_chroma,
+                &ANNEX_K_DC_CHROMA_NR,
+                &ANNEX_K_DC_CHROMA_VAL,
+            ),
+            (&annex.ac_luma, &ANNEX_K_AC_LUMA_NR, &ANNEX_K_AC_LUMA_VAL),
+            (
+                &annex.ac_chroma,
+                &ANNEX_K_AC_CHROMA_NR,
+                &ANNEX_K_AC_CHROMA_VAL,
+            ),
+        ];
+        for (table, counts, values) in tables {
+            let mut code: u32 = 0;
+            let mut index = 0usize;
+            for (length_index, &count) in counts.iter().enumerate() {
+                let length = (length_index + 1) as u32;
+                for _ in 0..count {
+                    let symbol = values[index];
+                    index += 1;
+                    let slot = (code << (16 - length)) as usize;
+                    assert_eq!(
+                        table.lut[slot],
+                        (length as u8, symbol),
+                        "table entry at slot {slot:#06x}"
+                    );
+                    code += 1;
+                }
+                code <<= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn annex_k_encode_decode_roundtrip() {
+        // Canonical encode of every symbol, then an independent
+        // 1-bit-at-a-time incremental decode; they must agree.
+        struct BitWriter {
+            bits: Vec<bool>,
+        }
+        impl BitWriter {
+            fn write(&mut self, code: u32, length: u32) {
+                for i in (0..length).rev() {
+                    self.bits.push((code >> i) & 1 != 0);
+                }
+            }
+        }
+        for (name, counts, values) in ANNEX_K_TABLES {
+            // (length, code) -> symbol (decode), and symbol -> (code, length) (encode)
+            let mut decode_map = std::collections::HashMap::new();
+            let mut encode_map = std::collections::HashMap::new();
+            let mut code: u32 = 0;
+            let mut index = 0usize;
+            for (length_index, &count) in counts.iter().enumerate() {
+                let length = (length_index + 1) as u32;
+                for _ in 0..count {
+                    let symbol = values[index];
+                    index += 1;
+                    decode_map.insert((length, code), symbol);
+                    encode_map.insert(symbol, (code, length));
+                    code += 1;
+                }
+                code <<= 1;
+            }
+            // encode every symbol in the table
+            let mut writer = BitWriter { bits: Vec::new() };
+            for &symbol in values.iter() {
+                let &(c, l) = encode_map.get(&symbol).expect("symbol must have a code");
+                writer.write(c, l);
+            }
+            // decode it back incrementally, one bit at a time
+            let mut decoded = Vec::with_capacity(values.len());
+            let mut pos = 0usize;
+            while pos < writer.bits.len() {
+                let mut code: u32 = 0;
+                let mut length = 0u32;
+                let mut found = false;
+                while length < 16 {
+                    assert!(
+                        pos < writer.bits.len(),
+                        "{name}: ran out of bits mid-symbol"
+                    );
+                    code = (code << 1) | u32::from(writer.bits[pos]);
+                    pos += 1;
+                    length += 1;
+                    if let Some(&symbol) = decode_map.get(&(length, code)) {
+                        decoded.push(symbol);
+                        found = true;
+                        break;
+                    }
+                }
+                assert!(found, "{name}: no code match after 16 bits");
+            }
+            assert_eq!(decoded.as_slice(), *values, "{name}: roundtrip mismatch");
+        }
+    }
+
+    #[test]
+    fn annex_k_built_once() {
+        assert!(std::ptr::eq(annex_k(), annex_k()));
+    }
+
+    #[test]
+    fn annex_k_walk_matches_the_file_tables_on_libjpeg_fixtures() {
+        // IJG-encoded fixtures embed the Annex K tables verbatim, so the
+        // Annex K walk must agree with the file-table walk bit-for-bit.
+        let (scan_start, geometry) = parse_geometry(RGB).unwrap();
+        let eoi = RGB
+            .windows(2)
+            .rposition(|w| w == [0xFF, 0xD9])
+            .expect("fixture ends with EOI");
+        let (unstuffed, restarts) = unstuff(&RGB[scan_start..eoi]);
+        let file_tables = parse_huff_tables(RGB, scan_start).unwrap();
+        let file_refs: Vec<ComponentTables<'_>> = geometry
+            .components
+            .iter()
+            .map(|c| ComponentTables {
+                dc: file_tables[c.td as usize].as_ref().unwrap(),
+                ac: file_tables[4 + c.ta as usize].as_ref().unwrap(),
+            })
+            .collect();
+        let annex = annex_k();
+        let annex_refs = annex.for_components(&geometry);
+        let by_file = walk_mcus(&unstuffed, &restarts, &geometry, &file_refs, 0, MAX_MCUS);
+        let by_annex = walk_mcus(&unstuffed, &restarts, &geometry, &annex_refs, 0, MAX_MCUS);
+        assert_eq!(by_file.err, None);
+        assert_eq!(by_annex.err, None);
+        assert_eq!(by_file.mcus, by_annex.mcus);
+        assert_eq!(by_file.blocks, by_annex.blocks);
+        assert_eq!(by_file.end_bit, by_annex.end_bit);
+        assert_eq!(by_file.dc_luma, by_annex.dc_luma);
+        assert_eq!(by_file.first_boundaries, by_annex.first_boundaries);
+        assert_eq!(by_file.mcus, 80); // 10 x 8 MCUs at 4:2:0
+    }
+
+    #[test]
+    fn walk_mcus_respects_the_limit() {
+        let (scan_start, geometry) = parse_geometry(RGB).unwrap();
+        let eoi = RGB
+            .windows(2)
+            .rposition(|w| w == [0xFF, 0xD9])
+            .expect("fixture ends with EOI");
+        let (unstuffed, restarts) = unstuff(&RGB[scan_start..eoi]);
+        let file_tables = parse_huff_tables(RGB, scan_start).unwrap();
+        let file_refs: Vec<ComponentTables<'_>> = geometry
+            .components
+            .iter()
+            .map(|c| ComponentTables {
+                dc: file_tables[c.td as usize].as_ref().unwrap(),
+                ac: file_tables[4 + c.ta as usize].as_ref().unwrap(),
+            })
+            .collect();
+        let stats = walk_mcus(&unstuffed, &restarts, &geometry, &file_refs, 0, 10);
+        assert_eq!(stats.err, None);
+        assert_eq!(stats.mcus, 10);
+        assert_eq!(stats.first_boundaries.len(), 10);
+        // 4:2:0: four luma blocks (hence four DC predictions) per MCU.
+        assert_eq!(stats.dc_luma.len(), 40);
+    }
+
+    #[test]
+    fn walk_mcus_rejects_a_table_component_count_mismatch() {
+        let (scan_start, geometry) = parse_geometry(RGB).unwrap();
+        let eoi = RGB
+            .windows(2)
+            .rposition(|w| w == [0xFF, 0xD9])
+            .expect("fixture ends with EOI");
+        let (unstuffed, restarts) = unstuff(&RGB[scan_start..eoi]);
+        let annex = annex_k();
+        let refs = vec![ComponentTables {
+            dc: &annex.dc_luma,
+            ac: &annex.ac_luma,
+        }]; // one component's worth for a 3-component scan
+        let stats = walk_mcus(&unstuffed, &restarts, &geometry, &refs, 0, MAX_MCUS);
+        assert!(stats.err.is_some());
+    }
+
+    #[test]
+    fn walk_mcus_never_panics_on_garbage() {
+        let (scan_start, geometry) = parse_geometry(RGB).unwrap();
+        let eoi = RGB
+            .windows(2)
+            .rposition(|w| w == [0xFF, 0xD9])
+            .expect("fixture ends with EOI");
+        let garbage = vec![0xAAu8; eoi - scan_start];
+        let file_tables = parse_huff_tables(RGB, scan_start).unwrap();
+        let refs: Vec<ComponentTables<'_>> = geometry
+            .components
+            .iter()
+            .map(|c| ComponentTables {
+                dc: file_tables[c.td as usize].as_ref().unwrap(),
+                ac: file_tables[4 + c.ta as usize].as_ref().unwrap(),
+            })
+            .collect();
+        let stats = walk_mcus(&garbage, &[], &geometry, &refs, 0, MAX_MCUS);
+        assert!(stats.err.is_some() || stats.mcus > 0);
+    }
+
+    #[test]
+    fn caps_hold_on_a_real_scan() {
+        let stats = verify_scan(RGB).unwrap();
+        assert_eq!(stats.first_boundaries.len(), stats.mcus as usize);
+        assert_eq!(stats.dc_luma.len(), stats.mcus as usize * 4); // 4:2:0
+        assert!(stats.first_boundaries.len() <= FIRST_BOUNDARIES_CAP);
+        assert!(stats.dc_luma.len() <= DC_LUMA_CAP);
     }
 }
