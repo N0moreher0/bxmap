@@ -3993,6 +3993,21 @@ fn salvage_pdf_tail(
     }
     let lower = prior_end.max(end.saturating_sub(max_size));
     let (start, spike) = salvage_boundary(file, end, lower, file_len)?;
+    // A planted `startxref ... %%EOF` in random bytes is the fake-footer
+    // shape. The tail must carry PDF structure too: check the last 4 KiB
+    // (where the trailer always lives) for an object header or a trailer.
+    let tail_len = (end - start) as usize;
+    let look = tail_len.min(4096);
+    let tail_at = end - look as u64;
+    if let Some(window) = salvage_read(file, tail_at, look, file_len)? {
+        let has_struct = window.windows(4).any(|w| w == b" obj")
+            || window.windows(7).any(|w| w == b"trailer");
+        if !has_struct {
+            return Ok(None);
+        }
+    } else {
+        return Ok(None);
+    }
     Ok(Some(SalvageTail {
         start,
         end,
@@ -6299,6 +6314,17 @@ fn carve_pdf(source: &mut Source<'_>) -> io::Result<Verdict> {
     let body = source.abs();
     match find_bytes(source, b"%%EOF")? {
         Some(offset) => {
+            // Magic + a planted %%EOF is the fake-footer shape; a real PDF
+            // always carries at least one object header or a trailer.
+            source.rewind_to(body);
+            let has_object = find_bytes(source, b" obj")?.is_some();
+            source.rewind_to(body);
+            let has_trailer = find_bytes(source, b"trailer")?.is_some();
+            if !has_object && !has_trailer {
+                return Ok(Verdict::Invalid(
+                    "PDF magic + %%EOF but no objects or trailer: not a PDF".to_string(),
+                ));
+            }
             source.end = original_end;
             source.skip(offset - source.abs())?;
             if source.skip(5)? != 5 {
@@ -9391,6 +9417,92 @@ mod tests {
         );
         assert_eq!(report.files.len(), 1, "{report:?}");
         assert!(report.files[0].notes.starts_with("salvage:tail"));
+    }
+
+    #[test]
+    fn salvage_refuses_a_lone_startxref_and_eof_planted_in_random_data() {
+        // A planted `startxref ... %%EOF` alone is not a PDF tail: with no
+        // object header or trailer anywhere, nothing may be written.
+        let mut dump = Vec::new();
+        dump.extend_from_slice(&pseudo_random(8192, 0x2545_f491_4f6c_dd1d));
+        dump.extend_from_slice(b"startxref\n123456\n%%EOF\n");
+        dump.extend_from_slice(&[0u8; 64]);
+
+        let path = write_dump("salvage-pdf-fake", &dump);
+        let options = CarveOptions {
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert!(
+            report.files.iter().all(|file| file.kind != CarveKind::Pdf),
+            "must not write a PDF from a planted startxref/%%EOF: {report:?}"
+        );
+    }
+
+    #[test]
+    fn carve_scan_survives_seeded_junk_and_mutated_fixtures() {
+        // Deterministic xorshift64 — no external fuzz toolchain required.
+        // Covers: pure junk, junk sprinkled with fake EOCD/CD/local-header/
+        // %%EOF needles, a mutated multi-member ZIP, and a mutated PDF trailer.
+        // Asserting only "does not panic" — a panic unwinds and fails the test.
+        let big = vec![b'A'; 700];
+        let fixture = zip_multi(&[("a.bin", big.as_slice()), ("b.txt", b"hello world")]);
+        let trailer_pdf = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n9999\n%%EOF\n".to_vec();
+        let mut state: u64 = 0x853c_49e6_748f_ea9b;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..2400 {
+            let data: Vec<u8> = match round % 4 {
+                0 => (0..(next() % 4096) + 1).map(|_| next() as u8).collect(),
+                1 => {
+                    let mut blob: Vec<u8> =
+                        (0..(next() % 2048 + 512) as usize).map(|_| next() as u8).collect();
+                    for _ in 0..1 + next() % 4 {
+                        let at = (next() % (blob.len() as u64 - 10)) as usize;
+                        let needle: Vec<u8> = match next() % 4 {
+                            0 => b"PK\x05\x06".to_vec(),
+                            1 => b"PK\x01\x02".to_vec(),
+                            2 => b"PK\x03\x04".to_vec(),
+                            _ => b"%%EOF\n".to_vec(),
+                        };
+                        blob[at..at + needle.len()].copy_from_slice(&needle);
+                    }
+                    blob
+                }
+                2 => {
+                    let mut blob = fixture.clone();
+                    for _ in 0..1 + next() % 32 {
+                        let at = (next() % blob.len() as u64) as usize;
+                        blob[at] ^= 1 << (next() % 8);
+                    }
+                    blob
+                }
+                _ => {
+                    let mut blob = trailer_pdf.clone();
+                    for _ in 0..1 + next() % 16 {
+                        let at = (next() % blob.len() as u64) as usize;
+                        blob[at] ^= 1 << (next() % 8);
+                    }
+                    blob
+                }
+            };
+            let name = format!("prop-{round}");
+            let path = write_dump(&name, &data);
+            let _ = Carver::new(CarveOptions::default()).scan(path.to_str().unwrap());
+            let _ = Carver::new(CarveOptions::default())
+                .with_salvage(true)
+                .scan(path.to_str().unwrap());
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
     }
 
     #[test]

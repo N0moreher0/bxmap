@@ -150,6 +150,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   validated. `carves_mp4_file` only passed by accident of the
   `size == 0` branch. MP4 files now validate at the correct box
   boundaries.
+- **`carve_pdf` and `salvage_pdf_tail` now refuse a planted
+  `startxref`/`%%EOF` with no PDF structure (fake footer, ROADMAP
+  8.13.4)**: two fake-footer shapes slipped through. `%PDF-` + random +
+  `%%EOF` was declared `Valid` (tier 1, complete) because the validator
+  never looked at the body; a `startxref 123456 %%EOF` planted alone in
+  random data produced a salvaged "tail" file. The validator now parses
+  the body for at least one object header (`N M obj`) or a `trailer`
+  before calling a PDF complete (Random = reject) or accepting a salvaged
+  tail (must carry structure in its last 4 KiB). Bench-synthetic
+  fixtures: `fake-pdf-eof.bin` (footer alone) and `pdf-magic-decoy.bin`
+  (magic + planted EOF in noise) now produce **zero** files; the intact
+  bench PDF still carves EXACT, and the unit trailer fixture still
+  salvages.
 - **`carve_pdf` no longer writes megabytes of "partial" PDFs from random
   garbage (found by the real-file bench decoy)**: the bench plants a
   `%PDF-1.4\n` decoy followed by 8 KB of random bytes and expects every
@@ -167,6 +180,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `.scratch-enc/bench/build_image.py` (`offset += 8 + 8192` assumed
   every magic is 8 bytes; the recorded decoy offsets were cumulative
   nibbles off the real positions).
+- **Fuzz coverage for the footer-first anchors (ROADMAP 8.13.4)**:
+  synthetic fake-footer dumps (fake EOCD, empty-claim EOCD, bare IEND,
+  lone `startxref`/`%%EOF`, head-4 KiB-overwritten valid ZIP/PNG) are
+  added to `fuzz/corpus/carve_scan/` so CI's fuzz smoke covers the
+  tail-anchored paths. Local `cargo fuzz` needs clang and this machine
+  has none; instead a seeded deterministic property test
+  (`carve_scan_survives_seeded_junk_and_mutated_fixtures`, 2400 cases:
+  pure junk, junk with sprinkled `PK\x05\x06`/`PK\x01\x02`/`PK\x03\x04`/
+  `%%EOF` needles, byte-flipped multi-member ZIP and PDF fixtures)
+  asserts `carve_scan` never panics, with and without salvage.
 - **`carve_zip` accepted un-openable archives as `complete`** (found by the
   Lab 6 forensic dump and the real-file bench): the validator walked local
   headers and required a `PK\x05\x06` to exist, but never checked the

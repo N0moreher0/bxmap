@@ -2724,6 +2724,82 @@ fn golden_carve_pdf_rejects_magic_plus_random_garbage() {
 }
 
 #[test]
+fn golden_carve_pdf_rejects_a_planted_startxref_and_eof_in_noise() {
+    let dir = tempfile::tempdir().unwrap();
+    // A planted `startxref` + `%%EOF` alone in random bytes: the classic
+    // fake-footer shape. Must not produce a file (bench fake-footer case).
+    let mut dump = high_entropy_bytes(1024);
+    dump.extend_from_slice(b"startxref\n123456\n%%EOF\n");
+    dump.extend_from_slice(&high_entropy_bytes(512));
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let out_dir = dir.path().join("carve");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "--max-strings",
+            "0",
+            "--carve-out",
+            out_dir.to_str().unwrap(),
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{combined}");
+    assert!(combined.contains("0 file(s)"), "{combined}");
+    assert!(!out_dir.join("partial").exists() || std::fs::read_dir(out_dir.join("partial")).unwrap().count() == 0);
+}
+
+#[test]
+fn golden_carve_pdf_with_magic_and_fake_eof_is_not_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    // Magic + random + planted `startxref`/`%%EOF`: no objects, no trailer.
+    // The validator must not call this a complete PDF.
+    let mut dump = b"%PDF-1.4\n".to_vec();
+    dump.extend_from_slice(&high_entropy_bytes(4096));
+    dump.extend_from_slice(b"startxref\n99\n%%EOF\n");
+    dump.extend_from_slice(&high_entropy_bytes(512));
+    assert!(!dump.windows(4).any(|w| w == b" obj"));
+    assert!(!dump.windows(7).any(|w| w == b"trailer"));
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let out_dir = dir.path().join("carve");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "pdf",
+            "--max-strings",
+            "0",
+            "--carve-out",
+            out_dir.to_str().unwrap(),
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{combined}");
+    assert!(combined.contains("0 file(s)"), "{combined}");
+    assert!(!out_dir.join("partial").exists() || std::fs::read_dir(out_dir.join("partial")).unwrap().count() == 0);
+}
+
+#[test]
 fn golden_carve_bin_writes_unclassified_high_entropy_runs() {
     let dir = tempfile::tempdir().unwrap();
     // 32 KiB of high-entropy bytes with no magic and no footer, between
