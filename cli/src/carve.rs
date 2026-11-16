@@ -10,6 +10,14 @@ fn json_opt_u64(value: Option<u64>) -> String {
     }
 }
 
+/// JSON string for an optional value, `null` when absent.
+fn json_opt_str(value: Option<&str>) -> String {
+    match value {
+        Some(value) => json_escape(value),
+        None => "null".to_string(),
+    }
+}
+
 /// `suspected-partial-encryption` object for the index, or `null`.
 /// Heuristic only (ROADMAP 8.7.3): compressed data also scores high entropy.
 fn json_partial_encryption(hint: Option<bxmap::carve::PartialEncryption>) -> String {
@@ -54,7 +62,7 @@ pub fn write_carve_index(report: &CarveReport, path: &str) -> io::Result<()> {
             .collect::<Vec<_>>()
             .join(",");
         let record = format!(
-            "{{\"offset\":{},\"offset_hex\":\"{:#x}\",\"type\":\"{}\",\"size\":{},\"sha256\":\"{}\",\"entropy\":{:.4},\"complete\":{},\"corrupted_offset\":{},\"entropy_spike_at\":{},\"partial_encryption\":{},\"notes\":{},\"path\":{},\"duplicates\":[{}],\"file_name\":{},\"ext\":{},\"ext_source\":{},\"role\":\"{}\",\"tier\":{},\"evidence\":[{}],\"confidence\":\"{}\"}}",
+            "{{\"offset\":{},\"offset_hex\":\"{:#x}\",\"type\":\"{}\",\"size\":{},\"sha256\":\"{}\",\"entropy\":{:.4},\"complete\":{},\"corrupted_offset\":{},\"entropy_spike_at\":{},\"partial_encryption\":{},\"trailer_offset\":{},\"trailer_len\":{},\"trailer_sha256\":{},\"trailer_preview\":{},\"notes\":{},\"path\":{},\"duplicates\":[{}],\"file_name\":{},\"ext\":{},\"ext_source\":{},\"role\":\"{}\",\"tier\":{},\"evidence\":[{}],\"confidence\":\"{}\"}}",
             file.offset,
             file.offset,
             file.kind.as_str(),
@@ -65,6 +73,10 @@ pub fn write_carve_index(report: &CarveReport, path: &str) -> io::Result<()> {
             json_opt_u64(file.corrupted_offset),
             json_opt_u64(file.entropy_spike_at),
             json_partial_encryption(file.partial_encryption),
+            json_opt_u64(file.trailer_offset),
+            json_opt_u64(file.trailer_len),
+            json_opt_str(file.trailer_sha256.as_deref()),
+            json_opt_str(file.trailer_preview.as_deref()),
             json_escape(&file.notes),
             match file.path.as_ref() {
                 Some(path) => json_escape(&path.to_string_lossy()),

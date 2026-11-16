@@ -448,7 +448,11 @@ Recover structured files directly from a raw dump. The carver:
   `0001a2b0-zip-9f3c1e2a.docx.carved`): the extension is taken from a static
   table and refined from content only when the structure is proven (ZIP with
   Word parts -> `docx`, PE with the DLL flag -> `dll`, ...). Plaintext is
-  `.txt.carved`; a salvaged tail without its header is `.{ext}.tail.carved`.
+  `.txt.carved`; a salvaged tail without its header is `.{ext}.tail.carved`;
+  an MP4 whose head was encrypted but whose `moov` survived is rebuilt with a
+  fresh `ftyp`/`mdat` header (offsets shifted, `co64` promotion when needed)
+  and named `.mp4.rebuilt.carved` — the frames that were encrypted are
+  garbage, the rest can play.
   `.carved` is always the last extension so nothing auto-executes or auto-opens.
   `ext` is a static string, never taken from the file.
 - Refines the extension from content (bounded sniff: ZIP central directory, OLE
@@ -461,10 +465,13 @@ Recover structured files directly from a raw dump. The carver:
   `Get-ChildItem *.carved | Rename-Item -NewName { $_.Name -replace '\.carved$','' }` (PowerShell) or
   `for f in *.carved; do mv "$f" "${f%.carved}"; done` (bash).
 - Every record carries the evidence behind the file in the index — `ext`,
-  `ext_source`, `role` (`whole|tail|reassembled`), `tier` (1 = structure
-  validated to the terminator, 2 = incomplete header or salvaged tail, 3 =
-  readable text only), `evidence` (the checks backing it) and `confidence`
-  (`high`/`medium`/`low`) — so scripts do not have to parse names.
+  `ext_source`, `role` (`whole|tail|reassembled|rebuilt`), `tier` (1 = structure
+  validated to the terminator, 2 = incomplete header, salvaged tail or rebuilt
+  container, 3 = readable text only), `evidence` (the checks backing it) and
+  `confidence` (`high`/`medium`/`low`) — so scripts do not have to parse names.
+  Rebuilt MP4s carry `trailer_offset`, `trailer_len`, `trailer_sha256` and
+  `trailer_preview` (the ransomware trailer after `moov`, e.g. a victim ID);
+  every other role gets `null`.
 - Refuses to overwrite existing files: re-running into the same `--carve-out`
   directory is an error.
 - Produces a separate `--carve-index` (JSON array or NDJSON) so carving never

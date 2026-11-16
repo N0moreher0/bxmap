@@ -194,13 +194,31 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   writing; nothing is decrypted, decompressed, or executed.
   Types select file formats only, never a technique: every carve runs the
   full recovery stack, including a footer-first second pass for ZIP
-  (central directory + end record) and PDF (`startxref` + `%%EOF`) tails
-  whose header is gone, e.g. after partial encryption. Tails are cut out and
-  written to `partial/` with notes starting `salvage:tail`. A tail is walked
-  back until the first high-entropy window (>= 7.8 bits/byte), a file already
-  carved, or `--carve-max-size`. PNG/JPEG/MP4 are not salvaged yet (weak
-  footers, compressed bodies). Heuristic only: compressed data also has high
-  entropy. Incomplete files (`complete: false`) always land in `partial/`.
+  (central directory + end record), PDF (`startxref` + `%%EOF`) and PNG
+  (the IDAT run before `IEND`) tails whose header is gone, e.g. after
+  partial encryption, and a rebuild pass for MP4/MOV files whose head is
+  encrypted: when the original `ftyp`/`mdat` header is gone but the `moov`
+  box (usually at the end) survives, bxmap parses `moov` (`mvhd`, tracks,
+  `stbl` with `stsd`/`stts`/`stsc`/`stsz` or `stz2`/`stco` or `co64`),
+  cross-checks the tables (samples vs chunk counts, monotonic chunk
+  offsets) and writes a **fresh `ftyp` + `mdat` header with every chunk
+  offset shifted**. The rebuilt file replaces only the header: the head
+  was encrypted, so the first frames are garbage, but what was not
+  encrypted can play. A `stco` table whose entries would overflow 32 bits
+  after the shift is promoted to `co64`; nothing is truncated to the
+  4 GB limit of the reference repair tools. The ransomware trailer after
+  `moov` (often a victim ID) is cut out of the rebuilt file and recorded
+  in the index (`trailer_offset`, `trailer_len`, `trailer_sha256`,
+  `trailer_preview`, hex + ASCII). Fragmented MP4s (`mvex`) and compressed
+  moovs (`cmov`) are rejected with a reason. Rebuilt files are labelled
+  `role: "rebuilt"`, land in `partial/` (`complete: false`), tier 2,
+  `confidence: medium`, named `{offset:08x}-mp4-{sha8}.mp4.rebuilt.carved`.
+  Tails are cut out and written to `partial/` with notes starting
+  `salvage:tail`. A tail is walked back until the first high-entropy window
+  (>= 7.8 bits/byte), a file already carved, or `--carve-max-size`.
+  JPEG is not salvaged yet (weak `FF D9` footer, compressed body).
+  Heuristic only: compressed data also has high entropy. Incomplete files
+  (`complete: false`) always land in `partial/`.
 - `--carve-out <dir>` — destination directory (default `<input>.bxmap/carved`).
   Existing files are never overwritten; re-running into the same directory
   exits with an error.
@@ -209,6 +227,7 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   `--format` so carving never reshapes the string output.
   Each record has `offset`, `offset_hex`, `type`, `size`, `sha256`, `entropy`,
   `complete`, `corrupted_offset`, `entropy_spike_at`, `partial_encryption`,
+  `trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview`,
   `notes`, `path`, and `duplicates`. For incomplete files `corrupted_offset`
   is where structural validation stopped and `entropy_spike_at` is the first
   4 KiB window that jumps to >= 7.8 bits/byte after structured data (both
@@ -218,10 +237,15 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   signature of file-system encryption that encrypts a fraction of every
   file. Heuristic hint, **not** a ransomware verdict: compressed data also
   scores as high entropy. Fully structured and uniformly high (compressed or
-  encrypted end to end) files produce `null`.
+  encrypted end to end) files produce `null`. `trailer_offset`,
+  `trailer_len`, `trailer_sha256` and `trailer_preview` (hex + ASCII, max
+  64 bytes) are non-null only for `role: "rebuilt"` files: they describe
+  the ransomware trailer that followed the original `moov` box, cut out of
+  the rebuilt file (len capped at 1 MiB of the source remainder); every
+  other role gets `null`.
   Records also carry the evidence behind each file, so scripts do not have to
   parse the name: `file_name`, `ext` and `ext_source` (`kind`,
-  `sniff:<rule>` or `fallback`), `role` (`whole`, `tail`, `reassembled`),
+  `sniff:<rule>` or `fallback`), `role` (`whole`, `tail`, `reassembled`, `rebuilt`),
   `tier` (1 = structure validated to the terminator, 2 = header valid but
   incomplete or a footer-found tail, 3 = readable text only), `evidence` (the
   checks that back it: `magic`, `structure_ok`, `terminator_ok`,

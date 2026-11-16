@@ -2371,6 +2371,158 @@ fn golden_carve_recovers_a_pdf_tail_after_partial_encryption() {
     assert_eq!(partial, 1, "the salvaged tail belongs in partial/");
 }
 
+/// Minimal MP4: `ftyp` + `mdat` (two 4 KiB chunks of synthetic video data)
+/// + `moov` with a single avc1 track. Returns (bytes, moov_offset,
+/// moov_len). Mirrors the lib fixture; the rebuild path never sees the
+/// header once it is ruined.
+fn mp4_with_moov() -> (Vec<u8>, usize, usize) {
+    let payload_size = 8192usize;
+    let ftyp: &[u8] = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42";
+    let mut file = Vec::new();
+    file.extend_from_slice(ftyp); // 24 B
+    file.extend_from_slice(&((payload_size + 8) as u32).to_be_bytes());
+    file.extend_from_slice(b"mdat");
+    file.extend_from_slice(&high_entropy_bytes(payload_size));
+
+    let u32be = |value: u32| value.to_be_bytes();
+    let bx = |typ: &[u8; 4], body: Vec<u8>| {
+        let mut out = Vec::with_capacity(8 + body.len());
+        out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+        out.extend_from_slice(typ);
+        out.extend_from_slice(&body);
+        out
+    };
+    // stsd: one avc1 sample entry (32 bytes).
+    let mut stsd = Vec::new();
+    stsd.extend_from_slice(&u32be(0));
+    stsd.extend_from_slice(&u32be(1));
+    stsd.extend_from_slice(&u32be(32));
+    stsd.extend_from_slice(b"avc1");
+    stsd.extend_from_slice(&[0u8; 24]);
+    // stts: 1 entry, 2 samples.
+    let mut stts = Vec::new();
+    stts.extend_from_slice(&u32be(0));
+    stts.extend_from_slice(&u32be(1));
+    stts.extend_from_slice(&u32be(2));
+    stts.extend_from_slice(&u32be(1000));
+    // stsc: 1 entry, 1 sample per chunk.
+    let mut stsc = Vec::new();
+    stsc.extend_from_slice(&u32be(0));
+    stsc.extend_from_slice(&u32be(1));
+    stsc.extend_from_slice(&u32be(1));
+    stsc.extend_from_slice(&u32be(1));
+    stsc.extend_from_slice(&u32be(1));
+    // stsz: variable sizes, 2 entries.
+    let mut stsz = Vec::new();
+    stsz.extend_from_slice(&u32be(0));
+    stsz.extend_from_slice(&u32be(0));
+    stsz.extend_from_slice(&u32be(2));
+    stsz.extend_from_slice(&u32be(4096));
+    stsz.extend_from_slice(&u32be(4096));
+    // stco: chunk offsets in an intact file (the rebuild shifts them by 32).
+    let chunk1 = 24 + 8;
+    let chunk2 = chunk1 + 4096;
+    let mut stco = Vec::new();
+    stco.extend_from_slice(&u32be(0));
+    stco.extend_from_slice(&u32be(2));
+    stco.extend_from_slice(&u32be(chunk1));
+    stco.extend_from_slice(&u32be(chunk2));
+
+    let stbl = bx(
+        b"stbl",
+        [
+            bx(b"stsd", stsd),
+            bx(b"stts", stts),
+            bx(b"stsc", stsc),
+            bx(b"stsz", stsz),
+            bx(b"stco", stco),
+        ]
+        .concat(),
+    );
+    let minf = bx(b"minf", stbl);
+    let mdia = bx(b"mdia", minf);
+    let trak = bx(b"trak", mdia);
+    let moov = bx(b"moov", trak);
+    let moov_offset = file.len();
+    let moov_len = moov.len();
+    file.extend_from_slice(&moov);
+    (file, moov_offset, moov_len)
+}
+
+#[test]
+fn golden_carve_mp4_rebuilds_a_ruined_head_and_records_the_trailer() {
+    let dir = tempfile::tempdir().unwrap();
+    // The partial-encryption leftover of a phone video: ftyp and mdat header
+    // gone, moov at the end intact, plus a ransomware trailer.
+    let (orig, moov_offset, moov_len) = mp4_with_moov();
+    let mut dump = vec![0xAAu8; 64];
+    dump.extend_from_slice(&orig[64..]);
+    dump.extend_from_slice(b"VICTIM-ID-777"); // 13-byte ransomware trailer
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let index = dir.path().join("mp4.ndjson");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "mp4",
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let records = std::fs::read_to_string(&index).unwrap();
+    assert_eq!(records.lines().count(), 1, "{records}");
+    assert!(records.contains("\"type\":\"mp4\""), "{records}");
+    assert!(records.contains("\"role\":\"rebuilt\""), "{records}");
+    assert!(records.contains(".mp4.rebuilt.carved\""), "{records}");
+    assert!(records.contains("\"complete\":false"), "{records}");
+    assert!(
+        records.contains("\"evidence\":[\"moov_ok\",\"tables_cross_ok\",\"chunk_range_ok\"]"),
+        "{records}"
+    );
+    // Shift 32 = ftyp (24) + mdat header (8); payload length 8224.
+    assert!(records.contains("\"size\":8448"), "{records}");
+    assert!(records.contains("\"trailer_len\":13"), "{records}");
+    assert!(records.contains("VICTIM-ID-777"), "{records}");
+    assert!(records.contains("\"corrupted_offset\":0"), "{records}");
+
+    let carved = dir
+        .path()
+        .join("dump.bin.bxmap")
+        .join("carved")
+        .join("partial");
+    let entries: Vec<_> = std::fs::read_dir(&carved)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{carved:?}");
+    let name = entries[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(name.ends_with(".mp4.rebuilt.carved"), "{name}");
+    let bytes = std::fs::read(&entries[0]).unwrap();
+    assert_eq!(&bytes[4..8], b"ftyp");
+    assert_eq!(&bytes[28..32], b"mdat");
+    let moov_in_rebuilt = 32 + 8224;
+    assert_eq!(&bytes[moov_in_rebuilt + 4..moov_in_rebuilt + 8], b"moov");
+    let _ = (moov_offset, moov_len);
+}
+
 #[test]
 fn golden_carve_bin_writes_unclassified_high_entropy_runs() {
     let dir = tempfile::tempdir().unwrap();

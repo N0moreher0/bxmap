@@ -824,7 +824,16 @@ OPTIONS:
                           the full recovery stack, including a footer-first
                           second pass for ZIP (central directory + end
                           record) and PDF (startxref + %%EOF) files whose
-                          header is gone, e.g. after partial encryption.
+                          header is gone, a PNG tail pass (IDAT run before
+                          IEND), and an MP4 rebuild pass: when the ftyp/mdat
+                          header is gone but moov survives, bxmap parses
+                          moov and writes a fresh ftyp+mdat header with all
+                          chunk offsets shifted (stco promoted to co64 when
+                          entries would overflow 32 bits), giving
+                          .mp4.rebuilt.carved in partial/ - the head is
+                          garbage, the rest can play. The trailer after moov
+                          (e.g. a ransomware victim ID) is cut out and kept
+                          in the index (trailer_offset/len/sha256/preview).
                           Tails are labelled salvage:tail, cut back to the
                           first high-entropy window and written to partial/;
                           nothing is decrypted or repaired. Incomplete files
@@ -840,7 +849,8 @@ OPTIONS:
                           overwritten.
                           Output names are {offset:08x}-{kind}-{sha8}.{ext}.carved
                           (plaintext is .txt.carved, a salvaged tail without its
-                          header is .{ext}.tail.carved). .carved is always the
+                          header is .{ext}.tail.carved, a rebuilt MP4 is
+                          .mp4.rebuilt.carved). .carved is always the
                           last extension so a double-click cannot open or run
                           the file; to use one, strip the trailing .carved in
                           an isolated environment. Scripts should read `path`

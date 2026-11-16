@@ -452,7 +452,7 @@ Nguyên tắc (giữ nguyên các ranh giới cũ):
 - Có muốn cờ bỏ `.carved` cho loại không thực thi (P2) hay luôn để người dùng tự đổi tên?
 - Dump bxmap xử lý chủ yếu là RAM dump hay disk image? (RAM dump: file phân mảnh theo trang → ưu tiên reassembly khi có bảng trang; disk image: ưu tiên footer/size chính xác và cluster liền kề.)
 
-**8.11 Dựng lại container MP4/MOV khi đầu file bị mã hoá (`moov` còn sống) · P1 · CHƯA LÀM (thiết kế 2026-11-15; tham khảo công cụ web DRCLAB "Video Ransomware Repair")**
+**8.11 Dựng lại container MP4/MOV khi đầu file bị mã hoá (`moov` còn sống) · P1 · M1–M3 XONG (code 2026-11-16; M4 oracle NAL chưa làm)**
 
 Bối cảnh: ransomware mã hoá một phần ghi đè phần đầu video, làm mất `ftyp` và header `mdat`, nên carve header-first không thấy chữ ký. Nhưng `moov` (chỉ mục mẫu) của video quay từ điện thoại/camera thường nằm **cuối file** và còn nguyên; sau `moov` thường có một đoạn trailer (ID nạn nhân) do ransomware gắn. Đây là đúng chỗ 8.7.2 đã hoãn ("MP4 `moov` footer-first") vì thiếu quy tắc dừng theo cấu trúc; mục này cho quy tắc đó.
 
@@ -463,24 +463,24 @@ Bối cảnh: ransomware mã hoá một phần ghi đè phần đầu video, là
 - Ranh giới bxmap giữ nguyên: chỉ **dựng cấu trúc** (cắt, ghép, sửa offset, gắn nhãn), **không giải mã**, không crack, không dùng khoá. Cùng tinh thần 8.7.
 
 **8.11.1 Định vị `moov` bằng cấu trúc, không chỉ chữ ký + size**
-- [ ] Parse `moov` theo ISO/IEC 14496-12: `mvhd` (timescale, duration), ≥ 1 `trak` → `mdia/minf/stbl` đủ `stsd`, `stts`, `stsc`, `stsz` (hoặc `stz2`), `stco` (hoặc `co64`).
-- [ ] Kiểm chéo: tổng mẫu `stts` = số mẫu `stsz`; `stsc` phủ hết chunk; `entry_count` của `stco/co64` = số chunk; mọi offset tăng đơn điệu theo track. Lệch → `Invalid` với `reason` rõ.
-- [ ] Từ chối: box size 0/1 (largesize) không hợp lệ hay vượt phần dump còn lại, lồng quá sâu, `cmov` (moov nén; ghi note), fragmented MP4 (`moof/mfra`; ghi note, chưa hỗ trợ), `moov` còn bị mã hoá (parse hỏng).
-- [ ] Trần cấp phát: `entry_count` và tổng bộ nhớ bị chặn theo `--carve-max-size`/kích thước vùng còn lại; không cấp phát theo số liệu header chưa kiểm (như mọi validator, mục 8.2).
+- [x] Parse `moov` theo ISO/IEC 14496-12: ≥ 1 `trak` → `mdia/minf/stbl` đủ `stsd`, `stts`, `stsc`, `stsz` (hoặc `stz2`), `stco` (hoặc `co64`). (`mvhd` KHÔNG bắt buộc — không cần cho rebuild; chỉ yêu cầu ≥1 `trak`/`stbl` hợp lệ. Parser đệ quy có giới hạn sâu 6, ≤ 200k box.)
+- [x] Kiểm chéo: tổng mẫu `stts` = số mẫu `stsz`; `stsc` phủ hết chunk; `entry_count` của `stco/co64` = số chunk; mọi offset tăng đơn điệu theo track. Lệch → `Invalid` với `reason` rõ. (Kiểm đủ: stts==stsz/stz2 count, stsc tăng nghiêm ngặt và phủ đúng chunks, chunk offsets non-decreasing, samples consumed == stsz count; sai ở bất kỳ đâu đều reject với reason cụ thể.)
+- [x] Từ chối: box size 0/1 (largesize) không hợp lệ hay vượt phần dump còn lại, lồng quá sâu, `cmov` (moov nén; ghi note), fragmented MP4 (`moof/mfra`; ghi note, chưa hỗ trợ), `moov` còn bị mã hoá (parse hỏng). (`moof` cũng rơi vào nhánh từ chối qua `mvex` — fragment detection là qua `mvex`; `cmov` bị reject. Box size vượt parent/dump → reject; `size==0` = đến hết parent (hợp lệ cho box cuối container).)
+- [x] Trần cấp phát: `entry_count` và tổng bộ nhớ bị chặn theo `--carve-max-size`/kích thước vùng còn lại; không cấp phát theo số liệu header chưa kiểm (như mọi validator, mục 8.2). (MAX_STSC_ENTRIES 1M, MAX_STTS_ENTRIES 200k, MAX_SAMPLES 20M/track, MAX_CHUNKS 20M/track, MAX_BOXES_IN_MOOV 200k, MAX_MOOV_READ 64 MiB; moov đọc vào RAM có trần; bytes của table không cấp phát theo entry count — đọc tuần tự.)
 
 **8.11.2 Tìm đầu file từ chính `moov` (cải thiện chính)**
-- [ ] Với mỗi track, tính độ dài từng chunk từ `stsc` + `stsz`; `E = max(chunk_offset + chunk_len)` qua mọi track = vị trí cuối dữ liệu `mdat` theo toạ độ file gốc.
-- [ ] Nếu `moov` nằm ngay sau `mdat`: `moov_file_offset ≈ E` ⇒ `file_start_trong_dump = moov_offset_trong_dump − E`. Vậy **không cần header còn sống** để biết file bắt đầu ở đâu trong dump/disk image liền khối; giải quyết đúng chỗ carve header-first bó tay.
-- [ ] Nếu giữa `mdat` và `moov` có box đệm (`free`/`skip`) hoặc `E` không khớp: ghi `start_confidence: low` và dùng khoảng lệch làm bằng chứng; không đoán thêm.
-- [ ] Nếu nguồn là **một file lẻ** (người dùng đưa file đã mã hoá) thì `file_start = 0`; có thể kiểm `E ≤ moov_offset`.
-- [ ] Giới hạn đã biết: dump phân mảnh (RAM, trang 4 KB) thì dải trước `moov` có thể không liền; khi đó chỉ báo bằng chứng và để reassembly (8.5, chưa làm) xử lý sau.
+- [x] Với mỗi track, tính độ dài từng chunk từ `stsc` + `stsz`; `E = max(chunk_offset + chunk_len)` qua mọi track = vị trí cuối dữ liệu `mdat` theo toạ độ file gốc. (Đọc `stsz` theo con trỏ — không dựng Vec samples; constant `sample_size` thì nhân nhanh; `stz2` 4/8/16-bit nibble-packed đều hỗ trợ.)
+- [x] Nếu `moov` nằm ngay sau `mdat`: `moov_file_offset ≈ E` ⇒ `file_start_trong_dump = moov_offset_trong_dump − E`. Vậy **không cần header còn sống** để biết file bắt đầu ở đâu trong dump/disk image liền khối; giải quyết đúng chỗ carve header-first bó tay. (Với `E > box_at_moov` → reject "moov chunk tables point past the start of this dump (moov-first layout?)": front-loaded moov không dựng được — correct reject.)
+- [x] Nếu giữa `mdat` và `moov` có box đệm (`free`/`skip`) hoặc `E` không khớp: ghi `start_confidence: low` và dùng khoảng lệch làm bằng chứng; không đoán thêm. (Ghi `start_confidence=low` trong notes khi `payload_start > 0` — tức input được hiểu là ảnh đĩa hoặc file có box đệm trước `moov`. Trong trường hợp đó payload có thể map lệch — vẫn ghi file nhưng gắn nhãn low; mismatch sẽ lộ ra khi `moov` dựng lại không parse hay lệch chunk range — post-check bắt, reject file dựng.)
+- [x] Nếu nguồn là **một file lẻ** (người dùng đưa file đã mã hoá) thì `file_start = 0`; có thể kiểm `E ≤ moov_offset`. (Dump == file → `S = 0` tự động; dump là ảnh đĩa → `S = S0` bất kỳ ≥ 0; cả hai đều đúng về bản chất; kiểm `payload_start ≥ prior_end` và không overlap vùng đã carve.)
+- [ ] Giới hạn đã biết: dump phân mảnh (RAM, trang 4 KB) thì dải trước `moov` có thể không liền; khi đó chỉ báo bằng chứng và để reassembly (8.5, chưa làm) xử lý sau. (Không kiểm chứng được từ trong dump — giữ nguyên giới hạn.)
 
 **8.11.3 Dựng lại container**
-- [ ] File ra = `ftyp` mới (`isom`, minor 0, compatible `isom`,`mp42`; 20 B) + header `mdat` (8 B; **16 B dạng largesize** nếu payload ≥ 2^32 − 8) + payload `[file_start, moov_start)` nguyên văn + `moov` sao chép với offset đã cộng `shift = len(ftyp) + len(mdat header)` (28 hoặc 36).
-- [ ] `stco` tràn u32 sau khi cộng → đổi sang `co64` (moov dài ra nhưng nằm cuối nên không dịch thêm offset nào; cập nhật size các box cha). `co64` có sẵn thì chỉ cộng. Không có giới hạn 4 GB như công cụ tham khảo.
-- [ ] Kiểm sau cùng: parse lại file dựng, mọi chunk offset nằm trong payload mới, `E + shift` = `moov_start_mới`, tổng độ dài khớp. Không khớp → không ghi, trả `Invalid` kèm lý do.
-- [ ] Brand: mặc định `isom`/`mp42`; tuỳ chọn sau cho `.mov` (`qt  `) nếu nguồn cho biết đuôi gốc (không tự suy ra).
-- [ ] **Trailer sau `moov`** (ID nạn nhân/chân ransomware): cắt khỏi file dựng, nhưng ghi vào index `trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview` (tối đa 64 byte, hex + ASCII) để analyst tra ID Ransomware / NoMoreRansom. Chỉ là dữ liệu trong dump, không lưu thành bí mật.
+- [x] File ra = `ftyp` mới (`isom`, minor 0, compatible `isom`+`mp42`; **24 B**, lệch so với bản phác 20 B — 20 B không đủ 2 compat brand; shift=32) + header `mdat` (8 B; **16 B dạng largesize** nếu payload ≥ 2^32 − 8) + payload `[file_start, moov_start)` nguyên văn + `moov` sao chép với offset đã cộng `shift = len(ftyp) + len(mdat header)` (32 hoặc 40).
+- [x] `stco` tràn u32 sau khi cộng → đổi sang `co64` (moov dài ra nhưng nằm cuối nên không dịch thêm offset nào; cập nhật size các box cha). `co64` có sẵn thì chỉ cộng. Không có giới hạn 4 GB như công cụ tham khảo. (Serialize lại cây box từ trong ra ngoài — box size cha tự tăng theo; unit test `an_stco_table_that_would_overflow_is_promoted_to_co64` kiểm shift áp đúng 1 lần.)
+- [x] Kiểm sau cùng: parse lại file dựng, mọi chunk offset nằm trong payload mới, `E + shift` = `moov_start_mới`, tổng độ dài khớp. Không khớp → không ghi, trả `Invalid` kèm lý do. (Re-analyze `moov_new`: phải parse OK và `E_new == shift + payload_len`; fail → reject, không ghi. Cộng thêm: file dựng được mở lại và chạy qua `carve_mp4` — `Valid` mới xuất ra; fail → xoá file, reject với lý do.)
+- [x] Brand: mặc định `isom`/`mp42`; tuỳ chọn sau cho `.mov` (`qt  `) nếu nguồn cho biết đuôi gốc (không tự suy ra).
+- [x] **Trailer sau `moov`** (ID nạn nhân/chân ransomware): cắt khỏi file dựng, nhưng ghi vào index `trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview` (tối đa 64 byte, hex + ASCII) để analyst tra ID Ransomware / NoMoreRansom. Chỉ là dữ liệu trong dump, không lưu thành bí mật. (Cap 1 MiB cho phần trailer ghi index.)
 
 **8.11.4 Nhận biết khung còn nguyên (công cụ tham khảo không có)**
 - [ ] Track video AVC/HEVC (nhận từ `stsd`: `avc1/avc3/hvc1/hev1`; độ dài trường NAL từ `lengthSizeMinusOne` ở `avcC/hvcC`): mẫu hợp lệ nếu độ dài NAL đầu mẫu (big-endian) ≤ `sample_size − len_field` và byte header NAL có `forbidden_zero_bit = 0`, `nal_unit_type` hợp lệ. Dữ liệu đã mã hoá lọt qua kiểm tra này với xác suất rất thấp.
@@ -492,18 +492,20 @@ Bối cảnh: ransomware mã hoá một phần ghi đè phần đầu video, là
 - [ ] Tuỳ chọn ghi thêm bản cắt bảng mẫu bắt đầu từ sync sample nguyên đầu tiên (hoặc dùng `elst` bỏ đoạn đầu); luôn đi kèm bản dựng đầy đủ. Chỉ làm sau khi 8.11.1–8.11.4 vững; cần sửa `stts/stsc/stsz/stco/stss` nhất quán.
 
 **8.11.6 Đầu ra và đặt tên (khớp 8.10)**
-- [ ] Thêm `CarveRole::Rebuilt` → `{offset:08x}-mp4-{sha8}.mp4.rebuilt.carved` (hậu tố như `.tail`: "cấu trúc đã dựng, khung có thể còn mã hoá"); vào `partial/` (`complete:false`), `tier` 2, `confidence` mặc định `medium` (lên `high` khi `intact_ratio` cao và `start_confidence` cao).
-- [ ] `notes`: `rebuild: ftyp+mdat header regenerated; shift=28; head encrypted [0..X) est.`; `evidence`: `moov_ok`, `tables_cross_ok`, `chunk_range_ok`, `nal_oracle`. Dedupe SHA-256 như cũ; không mở, không chạy.
+- [x] Thêm `CarveRole::Rebuilt` → `{offset:08x}-mp4-{sha8}.mp4.rebuilt.carved` (hậu tố như `.tail`: "cấu trúc đã dựng, khung có thể còn mã hoá"); vào `partial/` (`complete:false`), `tier` 2, `confidence` mặc định `medium` (lên `high` khi `intact_ratio` cao và `start_confidence` cao). (`offset` = đầu payload dựng lại; `confidence` medium vĩnh viễn ở P1 — chưa có intact_ratio.)
+- [x] `notes`: `rebuild: ftyp+mdat header regenerated (shift=N); moov preserved with chunk offsets +=N; payload at 0x..; N track(s); start_confidence=high|low`; `evidence`: `moov_ok`, `tables_cross_ok`, `chunk_range_ok` (`nal_oracle` để M4). Dedupe SHA-256 như cũ; không mở, không chạy.
 
 **8.11.7 CLI và phạm vi**
-- [ ] Không thêm cờ kỹ thuật (nguyên tắc 8.7.6): salvage MP4 chạy trong `--carve` khi gặp `moov` hợp lệ không có `ftyp` đi trước; chọn loại bằng `--carve mp4` (alias `mov`, `m4a` đã có). File lẻ: `bxmap <file> --carve mp4` là đủ.
-- [ ] Không làm lệnh con `repair-video` riêng (giữ tool gọn); ghi quyết định ở đây.
+- [x] Không thêm cờ kỹ thuật (nguyên tắc 8.7.6): salvage MP4 chạy trong `--carve` khi gặp `moov` hợp lệ không có `ftyp` đi trước; chọn loại bằng `--carve mp4` (alias `mov`, `m4a` đã có). File lẻ: `bxmap <file> --carve mp4` là đủ. (`moov` là needle trong salvage pass; mọi `--carve`/`--carve all` đều chạy rebuild; không cờ kỹ thuật mới.)
+- [x] Không làm lệnh con `repair-video` riêng (giữ tool gọn); ghi quyết định ở đây.
 
 **8.11.8 An toàn, fuzz và test**
-- [ ] Fuzz qua `carve_scan`: box size 0/1/khổng lồ, vòng lồng, `entry_count` khổng lồ, tổng `stsz` tràn, offset chồng nhau: không panic, không vượt trần.
-- [ ] Fixture tổng hợp: MP4 nhỏ (ftyp + mdat + moov cuối; track giả có mẫu NAL-length hợp lệ; `stco/stsc/stsz/stts/stss` nhỏ) → ghi đè N byte đầu bằng dữ liệu ngẫu nhiên + gắn trailer ID. Kiểm: định vị `moov`, `file_start` đúng, `stco + 28` và parse lại khớp, trailer vào index, oracle đánh dấu đúng mẫu hỏng/nguyên.
-- [ ] Biến thể: `co64`; tràn u32 bằng test số học (không tạo 4 GB thật); `moov` bị mã hoá → từ chối rõ lý do; fragmented/`cmov` → từ chối + note.
-- [ ] Golden CLI cho `--carve mp4` trên dump tổng hợp (có padding hai đầu); đối chiếu bằng `ffprobe` nếu máy có (tuỳ chọn, không bắt buộc cho CI).
+- [ ] Fuzz qua `carve_scan`: box size 0/1/khổng lồ, vòng lồng, `entry_count` khổng lồ, tổng `stsz` tràn, offset chồng nhau: không panic, không vượt trần. (Có hostile-unit-test nhưng chưa có fuzz harness chuyên biệt cho moov.)
+- [x] Fixture tổng hợp: MP4 nhỏ (ftyp + mdat + moov cuối; `stco/stsc/stsz/stts` nhỏ) → ghi đè N byte đầu bằng dữ liệu ngẫu nhiên + gắn trailer ID. Kiểm: định vị `moov`, `file_start` đúng, `stco + 32` và parse lại khớp, trailer vào index. (Test lib `a_ruined_head_with_a_surviving_moov_rebuilds_the_container`: offset 0, size = 32+8224+moov, corrupted_offset Some(0), evidence moov_ok/tables_cross_ok/chunk_range_ok, notes chứa shift=32/start_confidence, trailer_offset/len/sha256/preview ("VICTIM-ID-777"), file dựng parse lại = `Verdict::Valid` + `E_new == shift + payload_len`.)
+- [x] Biến thể: `co64`; tràn u32 bằng test số học (không tạo 4 GB thật); `moov` bị mã hoá → từ chối rõ lý do; fragmented/`cmov` → từ chối + note. (Unit test promotion; parse lỗi → rejected_details có lý do, không panic.)
+- [x] Golden CLI cho `--carve mp4` trên dump tổng hợp (có padding hai đầu); đối chiếu bằng `ffprobe` nếu máy có (tuỳ chọn, không bắt buộc cho CI). (`golden_carve_mp4_rebuilds_a_ruined_head_and_records_the_trailer`: index role/rebuilt/size 8448/trailer_len 13/corrupted_offset 0/file_name .mp4.rebuilt.carved; file ghi ra parse đúng; ffprobe chưa chạy (không bắt buộc).)
+
+**Ghi chú thực hiện 8.11 (2026-11-16):** M1–M3 xong; **đầu vào 2026-11-16**: lib carve_mp4 **bug thật** được tìm thấy — box walker đi thiếu 8 byte (`skip(size - 8)` trong khi `peek_array` không tiêu thụ) khiến hầu hết MP4 hợp lệ bị ghi nhận `Truncated` (chỉ `carves_mp4_file` pass nhờ nhánh `size == 0`); đã sửa (`skip(size)`), kèm test validate đúng box boundary. `FTYP_BOX` 24 B (`isom` + minor 0 + compat `isom`,`mp42`) → shift=32 (hoặc 40 với largesize mdat), lệch so với phác 20 B/28 — ghi nhận rõ ở trên. Golden test `golden_carve_mp4_rebuilds_a_ruined_head_and_records_the_trailer` + lib tests hostile (`misordered chunk`, `mvex`, `stsz≠stts`, `stco overflow→co64`, `huge moov size`, `ruined head happy path`). **Chưa làm:** M4 (oracle NAL — `avcC`/`hvcC`, intact_ratio, `stss`, `first_intact_sync_sample`); M5 đã có HELP/README/CHANGELOG/golden; M6 (P2) chưa. Fuzz moov chưa chuyên biệt (unit hostile phủ phần lớn). Đối chiếu Lab 6 cho MP4 chưa đo (Lab 6 có thể không có video bị cắt đầu — không có hit `ftyp`).
 
 **8.11.9 Thứ tự làm**
 1. M1: parser `moov` + kiểm chéo bảng + fuzz (chưa ghi file).

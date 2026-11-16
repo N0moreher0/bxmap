@@ -97,6 +97,10 @@ pub enum CarveRole {
     Tail,
     /// Fragments stitched together by `reassemble_fragments`.
     Reassembled,
+    /// MP4 container rebuilt around a surviving `moov` box (ROADMAP 8.11):
+    /// fresh `ftyp`/`mdat` headers, sample tables shifted. Frames in the
+    /// still-encrypted head may be unusable.
+    Rebuilt,
 }
 
 impl CarveRole {
@@ -106,6 +110,7 @@ impl CarveRole {
             CarveRole::Whole => "whole",
             CarveRole::Tail => "tail",
             CarveRole::Reassembled => "reassembled",
+            CarveRole::Rebuilt => "rebuilt",
         }
     }
 }
@@ -157,6 +162,14 @@ fn evidence_for(
     match role {
         CarveRole::Tail => (2, vec!["footer"], CarveConfidence::Low),
         CarveRole::Reassembled => (2, vec!["magic", "reassembled"], CarveConfidence::Medium),
+        // The three tables the rebuild actually cross-checked (8.11.1):
+        // moov parsed, chunk tables cross-checked against stsz/stts, and
+        // every chunk offset inside the payload.
+        CarveRole::Rebuilt => (
+            2,
+            vec!["moov_ok", "tables_cross_ok", "chunk_range_ok"],
+            CarveConfidence::Medium,
+        ),
         CarveRole::Whole if kind == CarveKind::Text => {
             (3, vec!["text_ratio"], CarveConfidence::Low)
         }
@@ -219,6 +232,12 @@ pub fn carved_file_name_with_ext(
         }
         CarveRole::Reassembled => {
             format!("{offset:08x}-{kind_id}-reassembled.{ext}.carved")
+        }
+        CarveRole::Rebuilt => {
+            format!(
+                "{offset:08x}-{kind_id}-{}.{ext}.rebuilt.carved",
+                short_hash(sha256)
+            )
         }
     }
 }
@@ -797,6 +816,14 @@ pub struct CarvedFile {
     /// structured or uniformly high (compressed/encrypted end to end).
     /// Compressed data also scores high, so this is a hint, not a verdict.
     pub partial_encryption: Option<PartialEncryption>,
+    /// Trailer after the end of a rebuilt MP4's `moov` box (ROADMAP 8.11.3):
+    /// whatever the ransomware appended after the original file (often a
+    /// victim ID). Offset/len/sha256/preview describe the recorded slice,
+    /// capped to 1 MiB of the source remainder. `None` for every other role.
+    pub trailer_offset: Option<u64>,
+    pub trailer_len: Option<u64>,
+    pub trailer_sha256: Option<String>,
+    pub trailer_preview: Option<String>,
     /// Extension carried before `.carved`: the kind's default, or a more
     /// specific one proven by the content sniff (ROADMAP 8.10.3).
     pub ext: String,
@@ -1181,6 +1208,10 @@ impl Carver {
                     corrupted_offset,
                     entropy_spike_at,
                     partial_encryption,
+                    trailer_offset: None,
+                    trailer_len: None,
+                    trailer_sha256: None,
+                    trailer_preview: None,
                     ext: choice.ext.to_string(),
                     ext_source: choice.source.to_string(),
                     role: CarveRole::Whole,
@@ -1255,6 +1286,186 @@ impl Carver {
                     continue;
                 }
                 let position = window.offset_of(found.start());
+                if kind == CarveKind::Mp4 {
+                    // 8.11: rebuild the container instead of salvaging a
+                    // tail. The head is gone, `moov` survived; emit a fresh
+                    // `ftyp`/`mdat` header and shift every chunk offset.
+                    let rebuilt = match mp4_rebuild(
+                        &mut source,
+                        position,
+                        file_len,
+                        self.options.max_size,
+                        &covered,
+                    ) {
+                        Ok(Ok(rebuilt)) => rebuilt,
+                        Ok(Err(reason)) => {
+                            report.rejected += 1;
+                            if report.rejected_details.len() < 16 {
+                                report.rejected_details.push(format!(
+                                    "{:#x} mp4: {reason}",
+                                    position.saturating_sub(4)
+                                ));
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    };
+                    let size = rebuilt.rebuilt_len;
+                    if size < self.options.min_size {
+                        report.rejected += 1;
+                        continue;
+                    }
+                    // The original moov box end in the dump:
+                    let moov_end = rebuilt.moov_end;
+                    if !self.ext_filter.allows(CarveKind::Mp4, "mp4") {
+                        covered.push((rebuilt.payload_start, moov_end));
+                        report.filtered += 1;
+                        continue;
+                    }
+                    let sha256 = rebuilt.sha256.clone();
+                    let entropy = rebuilt.entropy;
+                    covered.push((rebuilt.payload_start, moov_end));
+                    if let Some(&index) = by_hash.get(&sha256) {
+                        report.duplicates += 1;
+                        report.duplicate_bytes += size;
+                        report.files[index].duplicates.push(rebuilt.payload_start);
+                        continue;
+                    }
+                    let path = match out_dir {
+                        Some(dir) => {
+                            // A rebuilt MP4 is incomplete by definition, so it
+                            // always goes beside the other partial files.
+                            let partial = dir.join("partial");
+                            if let Err(error) = std::fs::create_dir_all(&partial) {
+                                failure = Some(error);
+                                return false;
+                            }
+                            let name = carved_file_name_with_ext(
+                                rebuilt.payload_start,
+                                CarveKind::Mp4,
+                                "mp4",
+                                CarveRole::Rebuilt,
+                                &sha256,
+                            );
+                            let path = partial.join(name);
+                            if path.exists() {
+                                failure = Some(io::Error::new(
+                                    io::ErrorKind::AlreadyExists,
+                                    format!(
+                                        "refusing to overwrite '{}'; use a fresh --carve-out",
+                                        path.display()
+                                    ),
+                                ));
+                                return false;
+                            }
+                            let result = (|| -> io::Result<()> {
+                                let mut out = BufWriter::new(File::create(&path)?);
+                                out.write_all(&rebuilt_header(rebuilt.payload_len))?;
+                                stream_region(
+                                    &mut source,
+                                    rebuilt.payload_start,
+                                    rebuilt.payload_len,
+                                    |chunk| out.write_all(chunk),
+                                )?;
+                                out.write_all(&rebuilt.moov)?;
+                                out.flush()
+                            })();
+                            if let Err(error) = result {
+                                failure = Some(error);
+                                return false;
+                            }
+                            // End-to-end: the rebuilt file must pass our own
+                            // MP4 validator before we hand it out.
+                            let check = std::fs::File::open(&path).and_then(|mut file| {
+                                let len = file.metadata()?.len();
+                                let mut check = Source::new(&mut file, 0, len);
+                                match carve_mp4(&mut check) {
+                                    Ok(verdict) => Ok(verdict),
+                                    Err(error) => Err(error),
+                                }
+                            });
+                            match check {
+                                Ok(Verdict::Valid) => Some(path),
+                                Ok(Verdict::Truncated(reason)) => {
+                                    std::fs::remove_file(&path).ok();
+                                    report.rejected += 1;
+                                    if report.rejected_details.len() < 16 {
+                                        report.rejected_details.push(format!(
+                                            "{:#x} mp4: rebuilt file truncated at own validator: {reason}",
+                                            rebuilt.payload_start
+                                        ));
+                                    }
+                                    covered.pop();
+                                    continue;
+                                }
+                                Ok(Verdict::Invalid(reason)) => {
+                                    std::fs::remove_file(&path).ok();
+                                    report.rejected += 1;
+                                    if report.rejected_details.len() < 16 {
+                                        report.rejected_details.push(format!(
+                                            "{:#x} mp4: rebuilt file invalid at own validator: {reason}",
+                                            rebuilt.payload_start
+                                        ));
+                                    }
+                                    covered.pop();
+                                    continue;
+                                }
+                                Err(error) => {
+                                    std::fs::remove_file(&path).ok();
+                                    failure = Some(error);
+                                    return false;
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    by_hash.insert(sha256.clone(), report.files.len());
+                    report.bytes_written += size;
+                    let (tier, evidence, confidence) =
+                        evidence_for(CarveRole::Rebuilt, CarveKind::Mp4, false, "kind");
+                    let entropy_spike_at = None;
+                    let partial_encryption = None;
+                    report.files.push(CarvedFile {
+                        offset: rebuilt.payload_start,
+                        kind: CarveKind::Mp4,
+                        size,
+                        complete: false,
+                        sha256,
+                        entropy,
+                        notes: rebuilt.notes,
+                        path,
+                        duplicates: Vec::new(),
+                        corrupted_offset: Some(rebuilt.payload_start),
+                        entropy_spike_at,
+                        partial_encryption,
+                        trailer_offset: rebuilt.trailer_offset,
+                        trailer_len: rebuilt.trailer_len,
+                        trailer_sha256: rebuilt.trailer_sha256,
+                        trailer_preview: rebuilt.trailer_preview,
+                        ext: "mp4".to_string(),
+                        ext_source: "kind".to_string(),
+                        role: CarveRole::Rebuilt,
+                        tier,
+                        evidence,
+                        confidence,
+                    });
+
+                    if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
+                        report.truncated = true;
+                        stop = true;
+                        return false;
+                    }
+                    if self.options.max_total != 0 && report.bytes_written >= self.options.max_total
+                    {
+                        report.truncated = true;
+                        stop = true;
+                        return false;
+                    }
+                    continue;
+                }
                 let tail = match salvage_tail(
                     kind,
                     &mut source,
@@ -1352,6 +1563,10 @@ impl Carver {
                     corrupted_offset: Some(tail.start),
                     entropy_spike_at: tail.spike,
                     partial_encryption,
+                    trailer_offset: None,
+                    trailer_len: None,
+                    trailer_sha256: None,
+                    trailer_preview: None,
                     ext: kind.default_ext().to_string(),
                     ext_source: "kind".to_string(),
                     role: CarveRole::Tail,
@@ -1483,6 +1698,10 @@ impl Carver {
                 corrupted_offset: None,
                 entropy_spike_at: None,
                 partial_encryption: None,
+                trailer_offset: None,
+                trailer_len: None,
+                trailer_sha256: None,
+                trailer_preview: None,
                 ext: CarveKind::Text.default_ext().to_string(),
                 ext_source: "kind".to_string(),
                 role: CarveRole::Whole,
@@ -1603,6 +1822,10 @@ impl Carver {
                     corrupted_offset: None,
                     entropy_spike_at: None,
                     partial_encryption,
+                    trailer_offset: None,
+                    trailer_len: None,
+                    trailer_sha256: None,
+                    trailer_preview: None,
                     ext: CarveKind::Bin.default_ext().to_string(),
                     ext_source: "kind".to_string(),
                     role: CarveRole::Whole,
@@ -2061,6 +2284,9 @@ const PDF_EOF: &[u8] = b"%%EOF";
 /// PNG IEND chunk: zero length, tag and its fixed CRC. 12 fixed bytes do not
 /// turn up by chance, so unlike a bare `FF D9` this is a usable footer.
 const PNG_IEND: &[u8] = b"\x00\x00\x00\x00IEND\xaeB`\x82";
+/// MP4 `moov` box type. Short and common in random data, so the salvage
+/// pass only accepts it after the full `moov` structure validates (8.11).
+const MP4_MOOV: &[u8] = b"moov";
 /// How far back from an IEND the PNG tail salvage reads at most.
 const PNG_SALVAGE_WINDOW: u64 = 64 * 1024 * 1024;
 /// Longest footer minus one: chunk overlap so a footer split across two
@@ -2068,26 +2294,35 @@ const PNG_SALVAGE_WINDOW: u64 = 64 * 1024 * 1024;
 const FOOTER_OVERLAP: usize = 11;
 
 /// Footers the salvage pass understands. Only formats whose footer is long or
-/// can be checked structurally are listed: a bare JPEG `FF D9` or an MP4
-/// `moov` would flood the pass with false positives, and JPEG bodies are
-/// compressed already, so an entropy boundary says nothing about them. PNG is
-/// walked back chunk by chunk (CRC-verified) instead of by entropy.
+/// can be checked structurally are listed: a bare JPEG `FF D9` would flood the
+/// pass with false positives, and JPEG bodies are compressed already, so an
+/// entropy boundary says nothing about them. PNG is walked back chunk by
+/// chunk (CRC-verified) instead of by entropy. An MP4 `moov` is accepted only
+/// when the whole box parses and its chunk tables cross-check (8.11).
 fn has_footer(kind: CarveKind) -> bool {
-    matches!(kind, CarveKind::Zip | CarveKind::Pdf | CarveKind::Png)
+    matches!(
+        kind,
+        CarveKind::Zip | CarveKind::Pdf | CarveKind::Png | CarveKind::Mp4
+    )
 }
 
 struct FooterMatcher {
     aho: AhoCorasick,
-    kinds: [CarveKind; 3],
+    kinds: [CarveKind; 4],
 }
 
 fn footer_matcher() -> &'static FooterMatcher {
     static MATCHER: OnceLock<FooterMatcher> = OnceLock::new();
     MATCHER.get_or_init(|| FooterMatcher {
         aho: AhoCorasickBuilder::new()
-            .build([ZIP_EOCD, PDF_EOF, PNG_IEND])
+            .build([ZIP_EOCD, PDF_EOF, PNG_IEND, MP4_MOOV])
             .expect("footer patterns are valid"),
-        kinds: [CarveKind::Zip, CarveKind::Pdf, CarveKind::Png],
+        kinds: [
+            CarveKind::Zip,
+            CarveKind::Pdf,
+            CarveKind::Png,
+            CarveKind::Mp4,
+        ],
     })
 }
 
@@ -2561,6 +2796,7 @@ fn salvage_tail(
     match kind {
         CarveKind::Zip => salvage_zip_tail(file, position, file_len, max_size, prior_end),
         CarveKind::Pdf => salvage_pdf_tail(file, position, file_len, max_size, prior_end),
+        CarveKind::Mp4 => Ok(None), // handled by mp4_rebuild() in the salvage pass
         CarveKind::Png => salvage_png_tail(file, position, file_len, max_size, prior_end),
         _ => Ok(None),
     }
@@ -2729,6 +2965,851 @@ fn png_previous_idat(buffer: &[u8], boundary: usize) -> Option<usize> {
         }
     }
     None
+}
+
+// --- MP4/MOV rebuild from a surviving `moov` (ROADMAP 8.11) ------------------
+
+/// Largest `moov` box we read into memory to rebuild a file whose head is
+/// missing. Anything bigger is rejected before allocation.
+const MAX_MOOV_READ: u64 = 64 * 1024 * 1024;
+/// `stsc` entry cap per track (real files: hundreds to a few thousand).
+const MAX_STSC_ENTRIES: u64 = 1_000_000;
+/// `stts` entry cap per track.
+const MAX_STTS_ENTRIES: u64 = 200_000;
+/// Sample count cap per track (from `stsz`/`stz2`).
+const MAX_SAMPLES: u64 = 20_000_000;
+/// Chunk (`stco`/`co64`) count cap per track.
+const MAX_CHUNKS: u64 = 20_000_000;
+/// Depth of the `moov` box tree we walk while checking it.
+const MAX_BOX_DEPTH: usize = 6;
+/// Box cap for one `moov`, guarding pathological nesting.
+const MAX_BOXES_IN_MOOV: u64 = 200_000;
+/// Ransomware trailer recorded in the index, capped to this many bytes.
+const MP4_TRAILER_CAP: u64 = 1024 * 1024;
+/// `ftyp` we regenerate: major brand `isom`, minor version 0, compatible
+/// brands `isom` + `mp42`. 24 bytes.
+const FTYP_BOX: &[u8] = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42";
+/// Payload this large needs a 64-bit `mdat` size header.
+const MDAT_LARGE_THRESHOLD: u64 = u32::MAX as u64 - 8;
+
+/// One box in the `moov` tree. `children` is non-empty only for the
+/// container types the patcher understands.
+struct MoovBox {
+    typ: [u8; 4],
+    /// Raw box contents (without the 8- or 16-byte box header).
+    data: Vec<u8>,
+    /// Child boxes in file order (empty for leaf types).
+    children: Vec<MoovBox>,
+    /// `stco` table the rebuild promotes to `co64` because an entry would
+    /// not fit in 32 bits once the shift is added (8.11.3).
+    promote_to_co64: bool,
+}
+
+/// MP4 box types whose children we walk/patch; anything else is raw bytes.
+fn mp4_is_container(typ: &[u8; 4]) -> bool {
+    matches!(
+        typ,
+        b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"dinf" | b"mvex"
+    )
+}
+
+/// Parse the box at `[at, limit)` into a tree. Bounds are checked against
+/// the parent box, never trusted from the header itself.
+fn parse_mp4_box(
+    buf: &[u8],
+    at: usize,
+    limit: usize,
+    depth: usize,
+    seen: &mut u64,
+) -> Result<(MoovBox, usize), String> {
+    if depth > MAX_BOX_DEPTH {
+        return Err("boxes nested too deeply".to_string());
+    }
+    if at.checked_add(8).map_or(true, |end| end > limit) {
+        return Err("box header runs past the end of its parent".to_string());
+    }
+    let size32 = u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as u64;
+    let typ: [u8; 4] = buf[at + 4..at + 8]
+        .try_into()
+        .expect("slice of four bytes is four bytes");
+    let (header, size) = if size32 == 1 {
+        if at.checked_add(16).map_or(true, |end| end > limit) {
+            return Err("extended box header runs past the end of its parent".to_string());
+        }
+        let large = u64::from_be_bytes(
+            buf[at + 8..at + 16]
+                .try_into()
+                .expect("slice of eight bytes is eight bytes"),
+        );
+        if large < 16 {
+            return Err("extended box size is smaller than its header".to_string());
+        }
+        (16usize, large)
+    } else if size32 == 0 {
+        // Box runs to the end of its parent: legal for the last box in a
+        // container.
+        (8usize, (limit - at) as u64)
+    } else {
+        (8usize, size32)
+    };
+    if size < header as u64 {
+        return Err("box is smaller than its header".to_string());
+    }
+    let end = at as u64 + size;
+    if end > limit as u64 {
+        return Err("box extends past the end of its parent".to_string());
+    }
+    *seen += 1;
+    if *seen > MAX_BOXES_IN_MOOV {
+        return Err("too many boxes in moov".to_string());
+    }
+    let body = &buf[at + header..end as usize];
+    if mp4_is_container(&typ) {
+        let mut node = MoovBox {
+            typ,
+            data: Vec::new(),
+            children: Vec::new(),
+            promote_to_co64: false,
+        };
+        let mut cursor = 0usize;
+        while cursor < body.len() {
+            let (child, next) = parse_mp4_box(body, cursor, body.len(), depth + 1, seen)?;
+            node.children.push(child);
+            cursor = next;
+        }
+        Ok((node, end as usize))
+    } else {
+        Ok((
+            MoovBox {
+                typ,
+                data: body.to_vec(),
+                children: Vec::new(),
+                promote_to_co64: false,
+            },
+            end as usize,
+        ))
+    }
+}
+
+/// `u32` sample-size cursor over the raw `stsz`/`stz2` table bytes.
+enum SampleSizeCursor<'a> {
+    Constant {
+        sample_size: u32,
+        count: u64,
+        index: u64,
+    },
+    Fixed32 {
+        data: &'a [u8],
+        count: u64,
+        index: u64,
+    },
+    Fixed16 {
+        data: &'a [u8],
+        count: u64,
+        index: u64,
+    },
+    Fixed8 {
+        data: &'a [u8],
+        count: u64,
+        index: u64,
+    },
+    Nibble {
+        data: &'a [u8],
+        count: u64,
+        index: u64,
+    },
+}
+
+impl<'a> SampleSizeCursor<'a> {
+    fn count(&self) -> u64 {
+        match self {
+            SampleSizeCursor::Constant { count, .. }
+            | SampleSizeCursor::Fixed32 { count, .. }
+            | SampleSizeCursor::Fixed16 { count, .. }
+            | SampleSizeCursor::Fixed8 { count, .. }
+            | SampleSizeCursor::Nibble { count, .. } => *count,
+        }
+    }
+
+    fn next(&mut self) -> Result<u64, String> {
+        let count = self.count();
+        // Copy the index out so the borrow ends before the size lookup.
+        let at: u64 = *match &mut *self {
+            SampleSizeCursor::Constant { index, .. }
+            | SampleSizeCursor::Fixed32 { index, .. }
+            | SampleSizeCursor::Fixed16 { index, .. }
+            | SampleSizeCursor::Fixed8 { index, .. }
+            | SampleSizeCursor::Nibble { index, .. } => index,
+        };
+        if at >= count {
+            return Err("chunk tables reference more samples than stsz holds".to_string());
+        }
+        let size = match &*self {
+            SampleSizeCursor::Constant { sample_size, .. } => u64::from(*sample_size),
+            SampleSizeCursor::Fixed32 { data, .. } => {
+                let at = at as usize * 4;
+                u64::from(u32::from_be_bytes(data[at..at + 4].try_into().unwrap()))
+            }
+            SampleSizeCursor::Fixed16 { data, .. } => {
+                let at = at as usize * 2;
+                u64::from(u16::from_be_bytes(data[at..at + 2].try_into().unwrap()))
+            }
+            SampleSizeCursor::Fixed8 { data, .. } => u64::from(data[at as usize]),
+            SampleSizeCursor::Nibble { data, .. } => {
+                let byte = data[at as usize / 2];
+                if at % 2 == 0 {
+                    u64::from(byte >> 4)
+                } else {
+                    u64::from(byte & 0x0f)
+                }
+            }
+        };
+        match &mut *self {
+            SampleSizeCursor::Constant { index, .. }
+            | SampleSizeCursor::Fixed32 { index, .. }
+            | SampleSizeCursor::Fixed16 { index, .. }
+            | SampleSizeCursor::Fixed8 { index, .. }
+            | SampleSizeCursor::Nibble { index, .. } => *index += 1,
+        }
+        Ok(size)
+    }
+}
+
+/// `stco`/`co64` chunk offsets, in file order.
+enum ChunkOffsets<'a> {
+    Stco32 { data: &'a [u8], count: u64 },
+    Co64 { data: &'a [u8], count: u64 },
+}
+
+impl<'a> ChunkOffsets<'a> {
+    fn count(&self) -> u64 {
+        match self {
+            ChunkOffsets::Stco32 { count, .. } | ChunkOffsets::Co64 { count, .. } => *count,
+        }
+    }
+
+    fn get(&self, index: u64) -> Result<u64, String> {
+        match self {
+            ChunkOffsets::Stco32 { data, .. } => {
+                let at = index as usize * 4;
+                Ok(u64::from(u32::from_be_bytes(
+                    data[at..at + 4].try_into().unwrap(),
+                )))
+            }
+            ChunkOffsets::Co64 { data, .. } => {
+                let at = index as usize * 8;
+                Ok(u64::from_be_bytes(data[at..at + 8].try_into().unwrap()))
+            }
+        }
+    }
+}
+
+/// One `stbl` box, fully cross-checked against `stsz`/`stts` (8.11.1).
+/// Returns `E`, the highest end offset of any chunk (original-file
+/// coordinates).
+fn analyze_stbl(stbl: &MoovBox) -> Result<u64, String> {
+    let find = |typ: &[u8; 4]| stbl.children.iter().find(|child| &child.typ == typ);
+
+    // stsd must exist and hold at least one sample entry.
+    let stsd = find(b"stsd").ok_or_else(|| "stbl has no stsd".to_string())?;
+    if stsd.data.len() < 16 {
+        return Err("stsd is truncated".to_string());
+    }
+    let entry_count_stsd = u32::from_be_bytes(stsd.data[4..8].try_into().unwrap());
+    if entry_count_stsd == 0 {
+        return Err("stsd has no sample entries".to_string());
+    }
+
+    // stts: total sample count, cross-checked against stsz below.
+    let stts = find(b"stts").ok_or_else(|| "stbl has no stts".to_string())?;
+    if stts.data.len() < 8 {
+        return Err("stts truncated".to_string());
+    }
+    let stts_entries = u64::from(u32::from_be_bytes(stts.data[4..8].try_into().unwrap()));
+    if stts_entries > MAX_STTS_ENTRIES {
+        return Err("stts has too many entries".to_string());
+    }
+    if stts.data.len() != 8 + 8 * stts_entries as usize {
+        return Err("stts size does not match its entry count".to_string());
+    }
+    let mut total_samples = 0u64;
+    for index in 0..stts_entries {
+        let base = 8 + index as usize * 8;
+        let count = u32::from_be_bytes(stts.data[base..base + 4].try_into().unwrap()) as u64;
+        total_samples += count;
+        if total_samples > MAX_SAMPLES {
+            return Err("track has too many samples".to_string());
+        }
+    }
+
+    // stsc: (first_chunk, samples_per_chunk) pairs, strictly increasing.
+    let stsc = find(b"stsc").ok_or_else(|| "stbl has no stsc".to_string())?;
+    if stsc.data.len() < 8 {
+        return Err("stsc truncated".to_string());
+    }
+    let stsc_entries = u64::from(u32::from_be_bytes(stsc.data[4..8].try_into().unwrap()));
+    if stsc_entries == 0 {
+        return Err("stsc has no entries".to_string());
+    }
+    if stsc_entries > MAX_STSC_ENTRIES {
+        return Err("stsc has too many entries".to_string());
+    }
+    if stsc.data.len() != 8 + 12 * stsc_entries as usize {
+        return Err("stsc size does not match its entry count".to_string());
+    }
+    let mut stsc_table: Vec<(u32, u32)> = Vec::with_capacity(stsc_entries as usize);
+    for index in 0..stsc_entries {
+        let base = 8 + index as usize * 12;
+        let first_chunk = u32::from_be_bytes(stsc.data[base..base + 4].try_into().unwrap());
+        let samples_per_chunk =
+            u32::from_be_bytes(stsc.data[base + 4..base + 8].try_into().unwrap());
+        if samples_per_chunk == 0 {
+            return Err("stsc entry has zero samples per chunk".to_string());
+        }
+        if let Some(&(previous, _)) = stsc_table.last() {
+            if first_chunk <= previous {
+                return Err("stsc first_chunk values are not increasing".to_string());
+            }
+        }
+        stsc_table.push((first_chunk, samples_per_chunk));
+    }
+
+    // stsz or stz2: one of them, exactly.
+    let stsz = find(b"stsz");
+    let stz2 = find(b"stz2");
+    let mut sizes = match (stsz, stz2) {
+        (Some(stsz), None) => {
+            if stsz.data.len() < 12 {
+                return Err("stsz truncated".to_string());
+            }
+            let sample_size = u32::from_be_bytes(stsz.data[4..8].try_into().unwrap());
+            let entry_count = u64::from(u32::from_be_bytes(stsz.data[8..12].try_into().unwrap()));
+            if entry_count != total_samples {
+                return Err("stsz entry count does not match stts".to_string());
+            }
+            if entry_count > MAX_SAMPLES {
+                return Err("track has too many samples".to_string());
+            }
+            if sample_size != 0 {
+                if stsz.data.len() != 12 {
+                    return Err(
+                        "stsz with a constant sample size has a table it should not".to_string()
+                    );
+                }
+                SampleSizeCursor::Constant {
+                    sample_size,
+                    count: entry_count,
+                    index: 0,
+                }
+            } else {
+                if stsz.data.len() != 12 + 4 * entry_count as usize {
+                    return Err("stsz table size does not match its entry count".to_string());
+                }
+                SampleSizeCursor::Fixed32 {
+                    data: &stsz.data[12..],
+                    count: entry_count,
+                    index: 0,
+                }
+            }
+        }
+        (None, Some(stz2)) => {
+            if stz2.data.len() < 12 {
+                return Err("stz2 truncated".to_string());
+            }
+            let field_size = stz2.data[7];
+            if !matches!(field_size, 4 | 8 | 16) {
+                return Err("stz2 field size is not 4, 8 or 16".to_string());
+            }
+            let entry_count = u64::from(u32::from_be_bytes(stz2.data[8..12].try_into().unwrap()));
+            if entry_count != total_samples {
+                return Err("stz2 entry count does not match stts".to_string());
+            }
+            if entry_count > MAX_SAMPLES {
+                return Err("track has too many samples".to_string());
+            }
+            let packed = (entry_count * u64::from(field_size)).div_ceil(8) as usize;
+            if stz2.data.len() != 12 + packed {
+                return Err("stz2 table size does not match its entry count".to_string());
+            }
+            match field_size {
+                4 => SampleSizeCursor::Nibble {
+                    data: &stz2.data[12..],
+                    count: entry_count,
+                    index: 0,
+                },
+                8 => SampleSizeCursor::Fixed8 {
+                    data: &stz2.data[12..],
+                    count: entry_count,
+                    index: 0,
+                },
+                _ => SampleSizeCursor::Fixed16 {
+                    data: &stz2.data[12..],
+                    count: entry_count,
+                    index: 0,
+                },
+            }
+        }
+        (Some(_), Some(_)) => return Err("stbl has both stsz and stz2".to_string()),
+        (None, None) => return Err("stbl has neither stsz nor stz2".to_string()),
+    };
+
+    // stco or co64: chunk offsets.
+    let stco = find(b"stco");
+    let co64 = find(b"co64");
+    let offsets = match (stco, co64) {
+        (Some(stco), None) => {
+            if stco.data.len() < 8 {
+                return Err("stco truncated".to_string());
+            }
+            let count = u64::from(u32::from_be_bytes(stco.data[4..8].try_into().unwrap()));
+            if count == 0 || count > MAX_CHUNKS {
+                return Err("stco has an implausible chunk count".to_string());
+            }
+            if stco.data.len() != 8 + 4 * count as usize {
+                return Err("stco size does not match its entry count".to_string());
+            }
+            ChunkOffsets::Stco32 {
+                data: &stco.data[8..],
+                count,
+            }
+        }
+        (None, Some(co64)) => {
+            if co64.data.len() < 8 {
+                return Err("co64 truncated".to_string());
+            }
+            let count = u64::from(u32::from_be_bytes(co64.data[4..8].try_into().unwrap()));
+            if count == 0 || count > MAX_CHUNKS {
+                return Err("co64 has an implausible chunk count".to_string());
+            }
+            if co64.data.len() != 8 + 8 * count as usize {
+                return Err("co64 size does not match its entry count".to_string());
+            }
+            ChunkOffsets::Co64 {
+                data: &co64.data[8..],
+                count,
+            }
+        }
+        (Some(_), Some(_)) => return Err("stbl has both stco and co64".to_string()),
+        (None, None) => return Err("stbl has neither stco nor co64".to_string()),
+    };
+
+    // Walk chunks in order, summing sample sizes into chunk lengths; every
+    // offset must be non-decreasing and every sample must find its chunk.
+    let mut e = 0u64;
+    let mut sample_index = 0u64;
+    let mut previous_offset = 0u64;
+    let mut stsc_index = 0usize;
+    for chunk in 1..=offsets.count() {
+        while stsc_index + 1 < stsc_table.len() && u64::from(stsc_table[stsc_index + 1].0) <= chunk
+        {
+            stsc_index += 1;
+        }
+        let samples_in_chunk = u64::from(stsc_table[stsc_index].1);
+        let offset = offsets.get(chunk - 1)?;
+        if offset < previous_offset {
+            return Err("chunk offsets decrease inside a track".to_string());
+        }
+        previous_offset = offset;
+        let mut chunk_len = 0u64;
+        for _ in 0..samples_in_chunk {
+            chunk_len += sizes.next()?;
+        }
+        sample_index += samples_in_chunk;
+        e = e.max(offset + chunk_len);
+    }
+    if sample_index != total_samples {
+        return Err("chunk tables and stsz disagree on the sample count".to_string());
+    }
+    Ok(e)
+}
+
+/// Parse and fully cross-check the `moov` box at the start of `bytes`.
+/// Returns `(E, tracks)` where `E` is the highest end offset of any chunk in
+/// original-file coordinates.
+fn analyze_moov(bytes: &[u8]) -> Result<(u64, usize), String> {
+    let mut seen = 0u64;
+    let (root, _) = parse_mp4_box(bytes, 0, bytes.len(), 0, &mut seen)?;
+    if &root.typ != b"moov" {
+        return Err("not a moov box".to_string());
+    }
+    // Reject fragmented or compressed moov anywhere in the tree.
+    let mut stack: Vec<&MoovBox> = vec![&root];
+    while let Some(node) = stack.pop() {
+        if &node.typ == b"mvex" {
+            return Err("fragmented MP4 (mvex) is not supported".to_string());
+        }
+        if &node.typ == b"cmov" {
+            return Err("compressed moov (cmov) is not supported".to_string());
+        }
+        stack.extend(node.children.iter());
+    }
+    let mut e = 0u64;
+    let mut tracks = 0usize;
+    let mut stack: Vec<&MoovBox> = vec![&root];
+    while let Some(node) = stack.pop() {
+        if &node.typ == b"stbl" {
+            let track_e = analyze_stbl(node)?;
+            if track_e > e {
+                e = track_e;
+            }
+            tracks += 1;
+        }
+        stack.extend(node.children.iter());
+    }
+    if tracks == 0 {
+        return Err("moov has no track (stbl)".to_string());
+    }
+    if tracks > 64 {
+        return Err("moov has an implausible number of tracks".to_string());
+    }
+    Ok((e, tracks))
+}
+
+/// Mark `stco` tables whose entries overflow 32 bits once `shift` is added;
+/// those become `co64` on serialize. Returns how many tables were promoted.
+fn promote_overflowing_stco(node: &mut MoovBox, shift: u64) -> usize {
+    let mut promoted = 0usize;
+    if &node.typ == b"stco" && node.data.len() >= 8 {
+        let count = u32::from_be_bytes(node.data[4..8].try_into().unwrap()) as usize;
+        let entries_fit = node.data.len() == 8 + 4 * count;
+        if entries_fit {
+            for index in 0..count {
+                let at = 8 + index * 4;
+                let value = u64::from(u32::from_be_bytes(
+                    node.data[at..at + 4].try_into().unwrap(),
+                ));
+                if value + shift > u64::from(u32::MAX) {
+                    node.promote_to_co64 = true;
+                    promoted += 1;
+                    break;
+                }
+            }
+        }
+    }
+    for child in &mut node.children {
+        promoted += promote_overflowing_stco(child, shift);
+    }
+    promoted
+}
+
+/// Serialize a `moov` tree, adding `shift` to every chunk offset.
+fn serialize_moov(node: &MoovBox, shift: u64) -> Result<Vec<u8>, String> {
+    let body = if !node.children.is_empty() {
+        let mut out = Vec::new();
+        for child in &node.children {
+            out.extend_from_slice(&serialize_moov(child, shift)?);
+        }
+        out
+    } else if &node.typ == b"stco" && node.promote_to_co64 {
+        let count = u32::from_be_bytes(node.data[4..8].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(8 + 8 * count);
+        out.extend_from_slice(&node.data[0..4]); // version/flags
+        out.extend_from_slice(&(count as u32).to_be_bytes());
+        for index in 0..count {
+            let at = 8 + index * 4;
+            let value = u64::from(u32::from_be_bytes(
+                node.data[at..at + 4].try_into().unwrap(),
+            ));
+            out.extend_from_slice(&(value + shift).to_be_bytes());
+        }
+        out
+    } else if &node.typ == b"stco" && !node.data.is_empty() {
+        let count = u32::from_be_bytes(node.data[4..8].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(node.data.len());
+        out.extend_from_slice(&node.data[0..8]); // version/flags + count
+        for index in 0..count {
+            let at = 8 + index * 4;
+            let value = u64::from(u32::from_be_bytes(
+                node.data[at..at + 4].try_into().unwrap(),
+            ));
+            out.extend_from_slice(&((value + shift) as u32).to_be_bytes());
+        }
+        out
+    } else if &node.typ == b"co64" && !node.data.is_empty() {
+        let count = u32::from_be_bytes(node.data[4..8].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(node.data.len());
+        out.extend_from_slice(&node.data[0..8]); // version/flags + count
+        for index in 0..count {
+            let at = 8 + index * 8;
+            let value = u64::from_be_bytes(node.data[at..at + 8].try_into().unwrap());
+            out.extend_from_slice(&(value + shift).to_be_bytes());
+        }
+        out
+    } else {
+        node.data.clone()
+    };
+    let size = 8 + body.len() as u64;
+    if size > u64::from(u32::MAX) {
+        // The promotion grew a box past the 32-bit box limit; extremely
+        // unlikely in practice (moov is capped at 64 MiB), but fail loudly
+        // instead of emitting an invalid file.
+        return Err("moov grew past the 32-bit box limit after patching".to_string());
+    }
+    // A promoted stco becomes co64: same flow, wider entries.
+    let out_typ: &[u8; 4] = if &node.typ == b"stco" && node.promote_to_co64 {
+        b"co64"
+    } else {
+        &node.typ
+    };
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(&(size as u32).to_be_bytes());
+    out.extend_from_slice(out_typ);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Everything the rebuild pass learned, ready to write to disk.
+struct RebuiltMp4 {
+    /// Payload start in the dump (where the original file's byte 0 lives
+    /// once `moov`'s chunk tables agree with its size).
+    payload_start: u64,
+    /// Payload length (bytes before `moov`).
+    payload_len: u64,
+    /// End of the original `moov` box in the dump (start of any trailer).
+    moov_end: u64,
+    /// Serialized `moov` box with patched chunk offsets.
+    moov: Vec<u8>,
+    /// Total size of the rebuilt file.
+    rebuilt_len: u64,
+    sha256: String,
+    entropy: f64,
+    trailer_offset: Option<u64>,
+    trailer_len: Option<u64>,
+    trailer_sha256: Option<String>,
+    trailer_preview: Option<String>,
+    notes: String,
+}
+
+/// The regenerated `ftyp` + `mdat` header bytes. `payload_len` picks the
+/// 8- vs 16-byte `mdat` header form.
+fn rebuilt_header(payload_len: u64) -> Vec<u8> {
+    let mut header = FTYP_BOX.to_vec();
+    if payload_len >= MDAT_LARGE_THRESHOLD {
+        header.extend_from_slice(&(payload_len + 16).to_be_bytes());
+        header.extend_from_slice(b"mdat");
+    } else {
+        header.extend_from_slice(&((payload_len + 8) as u32).to_be_bytes());
+        header.extend_from_slice(b"mdat");
+    }
+    header
+}
+
+/// Shake out an `moov` box found at `position` (the offset of the `moov`
+/// fourcc, i.e. where the 4-byte box size sits just before it) and compute
+/// everything the rebuilt file needs. `Ok(Err(reason))` = the moov is not
+/// usable and the candidate is rejected with a reason; `Ok(Ok(_))` =
+/// rebuild ready.
+fn mp4_rebuild(
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+    covered: &[(u64, u64)],
+) -> io::Result<Result<RebuiltMp4, String>> {
+    if position < 4 {
+        return Ok(Err("moov fourcc at the very start of the dump".to_string()));
+    }
+    let box_at = position - 4;
+    let Some(header) = salvage_read(file, box_at, 16, file_len)? else {
+        return Ok(Err("moov header does not fit in the dump".to_string()));
+    };
+    if &header[4..8] != b"moov" {
+        return Ok(Err(
+            "moov fourcc is not at the box type position".to_string()
+        ));
+    }
+    let size32 = u32::from_be_bytes(header[0..4].try_into().unwrap()) as u64;
+    let (header_len, moov_len) = if size32 == 1 {
+        let large = u64::from_be_bytes(header[8..16].try_into().unwrap());
+        if large < 16 {
+            return Ok(Err(
+                "moov extended box size is smaller than its header".to_string()
+            ));
+        }
+        (16u64, large)
+    } else if size32 == 0 {
+        (8, file_len - box_at)
+    } else {
+        if size32 < 8 {
+            return Ok(Err("moov box size is smaller than its header".to_string()));
+        }
+        (8, size32)
+    };
+    if moov_len > MAX_MOOV_READ {
+        return Ok(Err(
+            "moov box is larger than the 64 MiB rebuild limit".to_string()
+        ));
+    }
+    let Some(moov_end) = box_at.checked_add(moov_len) else {
+        return Ok(Err("moov box size wraps around".to_string()));
+    };
+    if moov_end > file_len {
+        return Ok(Err("moov box extends past the end of the dump".to_string()));
+    }
+    let _ = header_len;
+
+    // A moov inside a region the header pass already carved is not ours.
+    if covered
+        .iter()
+        .any(|&(start, end)| start <= box_at && box_at < end)
+    {
+        return Ok(Err("moov already belongs to a carved file".to_string()));
+    }
+    let prior_end = covered
+        .iter()
+        .filter(|&&(start, _)| start < box_at)
+        .map(|&(_, end)| end)
+        .max()
+        .unwrap_or(0);
+
+    let Some(moov_bytes) = salvage_read(file, box_at, moov_len as usize, file_len)? else {
+        return Ok(Err("moov box could not be read back".to_string()));
+    };
+    let (e, tracks) = match analyze_moov(&moov_bytes) {
+        Ok(ok) => ok,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    // E is the original file's mdat end; the original file started at
+    // box_at - E in this dump (moov sits right after mdat).
+    let Some(payload_start) = box_at.checked_sub(e) else {
+        return Ok(Err(
+            "moov chunk tables point past the start of this dump (moov-first layout?)".to_string(),
+        ));
+    };
+    if payload_start < prior_end {
+        return Ok(Err(
+            "rebuilt payload overlaps a file the carver already wrote".to_string(),
+        ));
+    }
+    if covered
+        .iter()
+        .any(|&(start, end)| start < box_at && end > payload_start)
+    {
+        return Ok(Err(
+            "rebuilt payload overlaps a file the carver already wrote".to_string(),
+        ));
+    }
+    let payload_len = box_at - payload_start;
+    let large = payload_len >= MDAT_LARGE_THRESHOLD;
+    let shift = FTYP_BOX.len() as u64 + if large { 16 } else { 8 };
+    if shift + payload_len + moov_len > max_size {
+        return Ok(Err("rebuilt file would exceed --carve-max-size".to_string()));
+    }
+
+    // Promote stco tables that overflow, then serialize with the shift.
+    let mut root = match parse_mp4_box(&moov_bytes, 0, moov_bytes.len(), 0, &mut 0u64) {
+        Ok((node, _)) => node,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let promoted = promote_overflowing_stco(&mut root, shift);
+    let moov_new = match serialize_moov(&root, shift) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok(Err(reason)),
+    };
+
+    // Post-condition: the rebuilt moov must parse cleanly and its end-of-mdat
+    // must land exactly on the moov box start of the rebuilt file.
+    match analyze_moov(&moov_new) {
+        Ok((e_new, _)) => {
+            if e_new != shift + payload_len {
+                return Ok(Err(
+                    "rebuilt moov does not add up (shift mismatch)".to_string()
+                ));
+            }
+        }
+        Err(reason) => return Ok(Err(reason)),
+    }
+
+    // Second pass over the dump: hash and entropy of the rebuilt bytes.
+    let header = rebuilt_header(payload_len);
+    let mut sha = Sha256::new();
+    let mut counts = [0u64; 256];
+    let mut total = 0u64;
+    let mut account = |bytes: &[u8]| {
+        sha.update(bytes);
+        for &byte in bytes {
+            counts[byte as usize] += 1;
+        }
+        total += bytes.len() as u64;
+    };
+    account(&header);
+    stream_region(file, payload_start, payload_len, |chunk| {
+        account(chunk);
+        Ok(())
+    })?;
+    account(&moov_new);
+    let rebuilt_len = total;
+    let entropy = entropy(&counts, total);
+
+    // Trailer after moov: whatever the ransomware appended. Recorded in the
+    // index, cut out of the rebuilt file.
+    let trailer_full = file_len - moov_end;
+    let trailer_len = trailer_full.min(MP4_TRAILER_CAP);
+    let (trailer_offset, trailer_len_out, trailer_sha, trailer_preview) = if trailer_full > 0 {
+        let Some(trailer) = salvage_read(file, moov_end, trailer_len as usize, file_len)? else {
+            return Ok(Err("trailer could not be read back".to_string()));
+        };
+        let digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(&trailer);
+            hex(&hasher.finalize())
+        };
+        let preview_bytes = &trailer[..trailer.len().min(64)];
+        let ascii: String = preview_bytes
+            .iter()
+            .map(|&byte| {
+                if (0x20..=0x7e).contains(&byte) {
+                    byte as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        let preview = format!("{} | {ascii}", hex(preview_bytes));
+        (
+            Some(moov_end),
+            Some(trailer_len),
+            Some(digest),
+            Some(preview),
+        )
+    } else {
+        (None, None, None, None)
+    };
+
+    // When the payload does not start at byte 0 of the input, the input is
+    // treated as a disk image (file starts inside it) or as a file with a
+    // free/skip box before moov: either way the head bytes at the start of
+    // the payload are preserved verbatim, and the rebuilt file is only as
+    // good as the frame structure behind it.
+    let start_confidence = if payload_start == 0 { "high" } else { "low" };
+    let mut notes = format!(
+        "rebuild: ftyp+mdat header regenerated (shift={shift}); moov preserved with chunk offsets +={shift}; payload at 0x{payload_start:x} ({payload_len} B); {tracks} track(s); start_confidence={start_confidence}"
+    );
+    if promoted > 0 {
+        notes.push_str(&format!("; {promoted} stco table(s) promoted to co64"));
+    }
+    if trailer_full > MP4_TRAILER_CAP {
+        notes.push_str(&format!("; trailer after moov (first {MP4_TRAILER_CAP} of {trailer_full} B) cut from the file, recorded in the index"));
+    } else if trailer_full > 0 {
+        notes.push_str(&format!(
+            "; trailer after moov ({trailer_full} B) cut from the file, recorded in the index"
+        ));
+    }
+
+    Ok(Ok(RebuiltMp4 {
+        payload_start,
+        payload_len,
+        moov_end,
+        moov: moov_new,
+        rebuilt_len,
+        sha256: hex(&sha.finalize()),
+        entropy,
+        trailer_offset,
+        trailer_len: trailer_len_out,
+        trailer_sha256: trailer_sha,
+        trailer_preview,
+        notes,
+    }))
 }
 
 /// Adjust a raw needle match to the candidate's true start. TAR has no
@@ -3773,7 +4854,8 @@ fn carve_mp4(source: &mut Source<'_>) -> io::Result<Verdict> {
                 "MP4 declares more data than the dump has".to_string(),
             ));
         }
-        source.skip(size - 8)?;
+        // peek_array does not consume the header; move past the whole box.
+        source.skip(size)?;
         boxes += 1;
         // Stop after the first real payload box or the movie box; we don't
         // need to walk the entire file.
@@ -6713,6 +7795,338 @@ mod tests {
         out
     }
 
+    /// A minimal MP4: `ftyp` + `mdat` (two chunks of pseudo-random video
+    /// data) + `moov`. Chunk offsets default to the file's own layout;
+    /// `stco` values can be overridden to build hostile tables.
+    ///
+    /// Returns `(file_bytes, moov_offset, moov_box_len)`.
+    fn synthetic_mp4_with_stco(
+        stco: (u32, u32),
+        extra_moov_children: &[&[u8]],
+    ) -> (Vec<u8>, usize, usize) {
+        let payload_size = 8192usize;
+        let mut file = Vec::new();
+        file.extend_from_slice(FTYP_BOX); // 24 B, same brand the rebuild uses
+        file.extend_from_slice(&((payload_size + 8) as u32).to_be_bytes());
+        file.extend_from_slice(b"mdat");
+        file.extend_from_slice(&pseudo_random(payload_size, 0xFEED_F00D_1234_5678));
+
+        let bx = |typ: &[u8; 4], body: &[u8]| {
+            let mut out = Vec::with_capacity(8 + body.len());
+            out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+            out.extend_from_slice(typ);
+            out.extend_from_slice(body);
+            out
+        };
+        let u32be = |value: u32| value.to_be_bytes().to_vec();
+        // stsd: one avc1 sample entry, 32 bytes.
+        let mut stsd = Vec::new();
+        stsd.extend_from_slice(&u32be(0)); // version/flags
+        stsd.extend_from_slice(&u32be(1)); // entry_count
+        stsd.extend_from_slice(&u32be(32)); // entry size
+        stsd.extend_from_slice(b"avc1");
+        stsd.extend_from_slice(&[0u8; 24]);
+        // stts: 1 entry, 2 samples of delta 1000.
+        let mut stts = Vec::new();
+        stts.extend_from_slice(&u32be(0)); // version/flags
+        stts.extend_from_slice(&u32be(1)); // entry_count
+        stts.extend_from_slice(&u32be(2)); // sample_count
+        stts.extend_from_slice(&u32be(1000)); // sample_delta
+                                              // stsc: 1 entry, every chunk holds 1 sample.
+        let mut stsc = Vec::new();
+        stsc.extend_from_slice(&u32be(0)); // version/flags
+        stsc.extend_from_slice(&u32be(1)); // entry_count
+        stsc.extend_from_slice(&u32be(1)); // first_chunk
+        stsc.extend_from_slice(&u32be(1)); // samples_per_chunk
+        stsc.extend_from_slice(&u32be(1)); // sample_description_index
+                                           // stsz: variable sizes, 2 entries.
+        let mut stsz = Vec::new();
+        stsz.extend_from_slice(&u32be(0)); // version/flags
+        stsz.extend_from_slice(&u32be(0)); // sample_size (0 = variable)
+        stsz.extend_from_slice(&u32be(2)); // entry_count
+        stsz.extend_from_slice(&u32be(4096));
+        stsz.extend_from_slice(&u32be(4096));
+        // stco: the two chunk offsets, in file order.
+        let chunk1 = 24 + 8;
+        let chunk2 = chunk1 + 4096;
+        let _ = (chunk1, chunk2); // kept for clarity; values come from `stco` argument
+        let mut stco_box = Vec::new();
+        stco_box.extend_from_slice(&u32be(0)); // version/flags
+        stco_box.extend_from_slice(&u32be(2)); // entry_count
+        stco_box.extend_from_slice(&u32be(stco.0));
+        stco_box.extend_from_slice(&u32be(stco.1));
+
+        let stbl = bx(
+            b"stbl",
+            &[
+                bx(b"stsd", &stsd),
+                bx(b"stts", &stts),
+                bx(b"stsc", &stsc),
+                bx(b"stsz", &stsz),
+                bx(b"stco", &stco_box),
+            ]
+            .concat(),
+        );
+        let minf = bx(b"minf", &stbl);
+        let mdia = bx(b"mdia", &minf);
+        let trak = bx(b"trak", &mdia);
+        let mut moov_body = trak;
+        for extra in extra_moov_children {
+            moov_body.extend_from_slice(extra);
+        }
+        let moov = bx(b"moov", &moov_body);
+        let moov_offset = file.len();
+        let moov_len = moov.len();
+        file.extend_from_slice(&moov);
+        (file, moov_offset, moov_len)
+    }
+
+    fn synthetic_mp4() -> (Vec<u8>, usize, usize) {
+        let chunk1 = 24 + 8;
+        let chunk2 = chunk1 + 4096;
+        synthetic_mp4_with_stco((chunk1 as u32, chunk2 as u32), &[])
+    }
+
+    #[test]
+    fn a_ruined_head_with_a_surviving_moov_rebuilds_the_container() {
+        // The classic partial-encryption leftover for a phone video: ftyp and
+        // mdat header gone, moov (at the end) intact, plus a ransomware
+        // trailer. Expect a fresh ftyp+mdat header, chunk offsets shifted by
+        // 32, and the trailer recorded in the index fields.
+        let (orig, moov_offset, moov_len) = synthetic_mp4();
+        let mut dump = vec![0xAAu8; 64]; // ruined ftyp + mdat header + start of payload
+        dump.extend_from_slice(&orig[64..]);
+        dump.extend_from_slice(b"VICTIM-ID-777"); // ransomware trailer
+        let path = write_dump("mp4-rebuild", &dump);
+        let out_dir = temp_dir("mp4-rebuild-out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.kind, CarveKind::Mp4);
+        assert_eq!(file.role, CarveRole::Rebuilt);
+        assert!(!file.complete, "{file:?}");
+        assert_eq!(file.offset, 0, "the original file started at dump byte 0");
+        // ftyp (24) + mdat header (8) + payload (8224) + moov (unchanged).
+        let expected_len = 32 + 8224 + moov_len as u64;
+        assert_eq!(file.size, expected_len, "{file:?}");
+        assert_eq!(file.corrupted_offset, Some(0));
+        assert!(file.evidence.contains(&"moov_ok"));
+        assert!(file.evidence.contains(&"tables_cross_ok"));
+        assert!(file.evidence.contains(&"chunk_range_ok"));
+        assert!(file.notes.contains("rebuild"), "{}", file.notes);
+        assert!(file.notes.contains("shift=32"), "{}", file.notes);
+        assert!(file.notes.contains("13 B"), "{}", file.notes);
+        let moov_end = (moov_offset + moov_len) as u64;
+        assert_eq!(file.trailer_offset, Some(moov_end));
+        assert_eq!(file.trailer_len, Some(13)); // "VICTIM-ID-777" is 13 bytes
+        assert!(file.trailer_sha256.is_some());
+        let preview = file.trailer_preview.as_deref().unwrap_or("");
+        assert!(preview.contains("VICTIM-ID-777"), "{preview}");
+
+        // The rebuilt file on disk must pass our own MP4 validator and carry
+        // the shifted chunk offsets.
+        let out_path = file.path.clone().expect("written to disk");
+        let bytes = std::fs::read(&out_path).unwrap();
+        assert_eq!(bytes.len() as u64, file.size);
+        let mut rebuilt_file = std::fs::File::open(&out_path).unwrap();
+        let mut cursor = Source::new(&mut rebuilt_file, 0, bytes.len() as u64);
+        match carve_mp4(&mut cursor) {
+            Ok(Verdict::Valid) => {}
+            Ok(Verdict::Truncated(_)) => panic!("rebuilt file must validate: truncated"),
+            Ok(Verdict::Invalid(reason)) => panic!("rebuilt file must validate: {reason}"),
+            Err(error) => panic!("rebuilt file must validate: {error}"),
+        }
+        // The rebuilt moov sits at 32 + 8224 and its end-of-mdat lands on it.
+        let moov_in_rebuilt = 32 + 8224;
+        let (e_new, _) = analyze_moov(&bytes[moov_in_rebuilt..]).expect("rebuilt moov parses");
+        assert_eq!(
+            e_new, moov_in_rebuilt as u64,
+            "end-of-mdat must shift with the header"
+        );
+        let _ = moov_offset;
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn an_moov_with_non_monotonic_chunk_offsets_is_rejected() {
+        // stco claims chunk 2 sits before chunk 1: impossible on disk, so the
+        // table is corrupt and the moov is not usable.
+        let chunk1 = (24 + 8) as u32;
+        let chunk2 = chunk1 + 4096;
+        let (misordered, _, _) = synthetic_mp4_with_stco((chunk2, chunk1), &[]);
+        let path = write_dump("mp4-misordered", &misordered);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(report.files.is_empty(), "{report:?}");
+        assert!(
+            report
+                .rejected_details
+                .iter()
+                .any(|detail| detail.contains("mp4")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_fragmented_moov_is_rejected() {
+        // mvex present: movie fragments, not supported by the rebuild (8.11.1).
+        // An mvex container with no children is enough to mark the file as
+        // fragmented (8.11.1: rejected unsupported).
+        let mvex = {
+            let mut out = Vec::new();
+            out.extend_from_slice(&8u32.to_be_bytes()); // box size
+            out.extend_from_slice(b"mvex");
+            out
+        };
+        let chunk1 = (24 + 8) as u32;
+        let chunk2 = chunk1 + 4096;
+        let (file, _, _) = synthetic_mp4_with_stco((chunk1, chunk2), &[&mvex]);
+        let path = write_dump("mp4-fragmented", &file);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(report.files.is_empty(), "{report:?}");
+        assert!(
+            report
+                .rejected_details
+                .iter()
+                .any(|detail| detail.contains("mvex")),
+            "{report:?}"
+        );
+    }
+
+    /// Depth-first search for a box of type `want` between `from` and `to`.
+    fn find_box(data: &[u8], from: usize, to: usize, want: &[u8; 4]) -> Option<usize> {
+        let mut pos = from;
+        while pos + 8 <= to {
+            let size = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            let typ: &[u8] = &data[pos + 4..pos + 8];
+            if typ == want {
+                return Some(pos);
+            }
+            if size == 0 || size < 8 || pos + size > to {
+                return None;
+            }
+            if matches!(
+                typ,
+                b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"dinf" | b"mvex"
+            ) {
+                if let Some(at) = find_box(data, pos + 8, pos + size, want) {
+                    return Some(at);
+                }
+            }
+            pos += size;
+        }
+        None
+    }
+
+    #[test]
+    fn an_stsz_that_disagrees_with_stts_is_rejected() {
+        // stts says 2 samples, stsz says 3: the tables cannot both be right.
+        let chunk1 = (24 + 8) as u32;
+        let chunk2 = chunk1 + 4096;
+        let (file, _, _) = synthetic_mp4_with_stco((chunk1, chunk2), &[]);
+        let mut file = file;
+        let at = find_box(&file, 0, file.len(), b"stsz").expect("stsz present");
+        // box header (8) + version/flags (4) + sample_size (4) + entry_count.
+        file[at + 16..at + 20].copy_from_slice(&3u32.to_be_bytes());
+        let path = write_dump("mp4-stsz-mismatch", &file);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert!(report.files.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn an_stco_table_that_would_overflow_is_promoted_to_co64() {
+        // Unit test of the patcher: an stco entry near u32::MAX cannot hold
+        // `entry + 32`, so the table is rewritten as co64 and the shift is
+        // applied exactly once.
+        let stco = MoovBox {
+            typ: *b"stco",
+            data: {
+                let mut data = vec![0u8; 4]; // version/flags
+                data.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+                data.extend_from_slice(&0xFFFF_FFFEu32.to_be_bytes());
+                data
+            },
+            children: Vec::new(),
+            promote_to_co64: false,
+        };
+        let mut root = MoovBox {
+            typ: *b"moov",
+            data: Vec::new(),
+            children: vec![stco],
+            promote_to_co64: false,
+        };
+        let promoted = promote_overflowing_stco(&mut root, 32);
+        assert_eq!(promoted, 1);
+        let out = serialize_moov(&root, 32).unwrap();
+        let at = out.windows(4).position(|window| window == b"co64").unwrap();
+        let body = &out[at + 4..];
+        assert_eq!(&body[0..4], &[0, 0, 0, 0]); // version/flags
+        assert_eq!(u32::from_be_bytes(body[4..8].try_into().unwrap()), 1); // count
+        assert_eq!(
+            u64::from_be_bytes(body[8..16].try_into().unwrap()),
+            0xFFFF_FFFE_u64 + 32,
+            "the shift is applied exactly once"
+        );
+    }
+
+    #[test]
+    fn an_moov_whose_size_exceeds_the_dump_is_rejected_gracefully() {
+        let (mut file, moov_offset, _) = synthetic_mp4();
+        // Claim the moov is ~4 GiB: unreadable, must not panic or allocate.
+        file[moov_offset..moov_offset + 4].copy_from_slice(&0xFFFF_FFF0u32.to_be_bytes());
+        let path = write_dump("mp4-huge-moov", &file);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert!(report.files.is_empty(), "{report:?}");
+    }
+
     #[test]
     fn a_partial_encrypted_zip_with_only_the_header_left_reports_corruption_and_spike_offsets() {
         // Case "con header": the local header survived but the central
@@ -7993,6 +9407,10 @@ mod evidence_tests {
             corrupted_offset: None,
             entropy_spike_at: None,
             partial_encryption: None,
+            trailer_offset: None,
+            trailer_len: None,
+            trailer_sha256: None,
+            trailer_preview: None,
             ext: ext.to_string(),
             ext_source: "kind".to_string(),
             role,

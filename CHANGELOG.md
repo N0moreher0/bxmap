@@ -6,6 +6,38 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **MP4/MOV rebuild from a surviving `moov` (ROADMAP 8.11, P1)**. When the
+  original `ftyp`/`mdat` header is encrypted but the `moov` box (usually at
+  the end of the file) survived, bxmap now parses `moov` (`mvhd`, tracks,
+  `stbl` with `stsd`, `stts`, `stsc`, `stsz` or `stz2`, `stco` or `co64`),
+  cross-checks the tables (`stts` total samples == `stsz` entry count;
+  `stsc` covers every chunk; chunk offsets strictly non-decreasing;
+  samples accounted for exactly once), and writes a **fresh `ftyp` +
+  `mdat` header with every chunk offset shifted by 32**. A `stco` table
+  whose entries would overflow 32 bits after the shift is promoted to
+  `co64` (no 4 GB limit like the reference repair tools). The rebuilt
+  file replaces only the header: the encrypted head stays garbage, the
+  rest of the video plays. The rebuilt file re-passes bxmap's own MP4
+  validator before it is handed out; failures are rejected with a reason,
+  never written. The ransomware trailer after `moov` (often a victim ID)
+  is cut out of the rebuilt file and recorded in the index. Fragmented
+  MP4s (`mvex`) and compressed moovs (`cmov`) are rejected. New
+  `CarveRole::Rebuilt` (index `role: "rebuilt"`), `.mp4.rebuilt.carved`
+  naming, tier 2, `confidence: medium`, evidence
+  `moov_ok`/`tables_cross_ok`/`chunk_range_ok`, and index fields
+  `trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview`
+  (hex + ASCII, capped at 1 MiB; `null` for other roles). mp4 salvage
+  runs inside `--carve` whenever a valid `moov` is found — no new flag.
+
+### Fixed
+- **`carve_mp4` walked boxes 8 bytes short** (`skip(size - 8)` although
+  `peek_array` does not consume): almost every structurally valid MP4
+  was carved as `Truncated` and landed in `partial/` instead of being
+  validated. `carves_mp4_file` only passed by accident of the
+  `size == 0` branch. MP4 files now validate at the correct box
+  boundaries.
+
+### Added
 - **Periodic partial-encryption heuristic** (`ROADMAP 8.7.3`). Carved files
   whose 4 KiB windows show a repeating high-entropy phase (e.g. every 4th
   block, 1:3 duty) now carry `suspected-partial-encryption` in the carve
