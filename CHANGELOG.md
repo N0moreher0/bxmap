@@ -66,6 +66,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fields and dedupe semantics match the rebuilt record.
 
 ### Fixed
+- **PE and ELF carves are sized and labelled from their headers.** The PE validator
+  used to check `MZ` + `PE\0\0`, skip a fixed 4 KiB and report the file as
+  complete (tier 1, `high`, `terminator_ok`), so real 40-360 KB executables
+  were cut to the header yet claimed as intact. It now reads the COFF /
+  optional header and section table (PE32 and PE32+), ends the file at the
+  furthest `PointerToRawData + SizeOfRawData` or certificate table, and only
+  then reports `complete`. A cut PE, or one whose headers cannot be
+  validated, is carved as before (never the whole window) but reported as
+  incomplete (`medium`, `PE header only` / `PE section data runs past the end
+  of the carve window`). An overlay appended after the last section is not
+  declared by the headers and is not counted. ELF got the same treatment: it
+  used to skip a fixed 4 KiB and report `complete`; it now ends at the furthest
+  of the section header table and every program header's file image
+  (ELF32/ELF64, either byte order), and falls back to `medium` /
+  `ELF header only` when the headers do not hold together.
 - **XZ and BZIP2 carves no longer swallow the dump up to the candidate
   window.** Both used to validate only the header and run to the end of the
   window (64 MB), so an 18 KB `readme.md.xz` produced a pseudo-file that

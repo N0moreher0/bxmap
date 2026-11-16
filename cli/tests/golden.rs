@@ -1762,13 +1762,19 @@ fn golden_carve_extension_alias_selects_the_container_kind() {
 }
 
 fn bare_pe_fixture(characteristics: u16) -> Vec<u8> {
+    // A minimal valid PE32 (one empty section, 96-byte optional header): the
+    // carver walks the headers and finds the file complete. A header with no
+    // section table is a header-only fragment and is written as partial.
     let mut pe = Vec::new();
     pe.extend_from_slice(b"MZ");
     pe.extend_from_slice(&[0u8; 0x3a]);
     pe.extend_from_slice(&0x40u32.to_le_bytes());
     pe.extend_from_slice(b"PE\0\0");
-    pe.extend_from_slice(&[0u8; 64]);
+    pe.extend_from_slice(&[0u8; 20 + 96 + 40]);
+    pe[0x40 + 6..0x40 + 8].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections
+    pe[0x40 + 20..0x40 + 22].copy_from_slice(&96u16.to_le_bytes()); // SizeOfOptionalHeader
     pe[0x40 + 22..0x40 + 24].copy_from_slice(&characteristics.to_le_bytes());
+    pe[0x40 + 24..0x40 + 26].copy_from_slice(&0x10bu16.to_le_bytes()); // PE32 magic
     pe
 }
 

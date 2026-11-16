@@ -5677,10 +5677,133 @@ fn carve_pe(source: &mut Source<'_>) -> io::Result<Verdict> {
     if sig != *b"PE\0\0" {
         return Ok(Verdict::Invalid("missing PE signature".to_string()));
     }
-    // PE file size cannot be determined from the header alone; skip a
-    // reasonable amount so the carver writes a non-trivial file.
-    source.skip(4096u64.min(source.end.saturating_sub(source.abs())))?;
-    Ok(Verdict::Valid)
+    // The file ends where the furthest raw data its headers declare ends:
+    // every section's `PointerToRawData + SizeOfRawData`, the certificate
+    // table and the headers themselves. An overlay appended after the last
+    // section is not declared anywhere, so it is not counted.
+    let table = source.peek(PE_HEADERS_PEEK)?.to_vec();
+    let layout = match pe_layout(&table, e_lfanew) {
+        Ok(layout) => layout,
+        Err(reason) => return pe_header_only(source, reason),
+    };
+    let window = source.end.saturating_sub(source.origin);
+    let extent = layout
+        .data_ends
+        .iter()
+        .copied()
+        .fold(layout.headers_end, u64::max);
+    if extent <= window {
+        source.skip(extent.saturating_sub(e_lfanew))?;
+        return Ok(Verdict::Valid);
+    }
+    // The headers promise more than the carve window holds: either the dump
+    // cuts the file, or this is a false positive with wild offsets. Keep only
+    // what the headers vouch for inside the window and never the whole window,
+    // so a bogus PE cannot swallow the items behind it.
+    let kept = layout
+        .data_ends
+        .iter()
+        .copied()
+        .filter(|&end| end <= window)
+        .fold(layout.headers_end.min(window), u64::max)
+        .max((e_lfanew + PE_HEADER_ONLY_BYTES).min(window));
+    source.skip(kept.saturating_sub(e_lfanew))?;
+    Ok(Verdict::Truncated(
+        "PE section data runs past the end of the carve window".to_string(),
+    ))
+}
+
+/// Bytes read from the PE signature on: signature (4), COFF header (20), an
+/// optional header of at most 1024 bytes and 96 section headers (the
+/// loader's maximum) of 40 bytes each.
+const PE_HEADERS_PEEK: usize = 4 + 20 + 1024 + 96 * 40;
+
+/// What a PE whose section table cannot be validated is cut to, as before the
+/// section table was walked.
+const PE_HEADER_ONLY_BYTES: u64 = 4096;
+
+/// Where a PE's declared contents end, as offsets from the start of the file.
+struct PeLayout {
+    /// End of the headers (signature, COFF, optional header, section table).
+    headers_end: u64,
+    /// End of each piece of raw data the headers declare: the sections that
+    /// have any, and the certificate table.
+    data_ends: Vec<u64>,
+}
+
+fn pe_u16(bytes: &[u8], at: usize) -> u64 {
+    u64::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
+}
+
+fn pe_u32(bytes: &[u8], at: usize) -> u64 {
+    u64::from(u32::from_le_bytes([
+        bytes[at],
+        bytes[at + 1],
+        bytes[at + 2],
+        bytes[at + 3],
+    ]))
+}
+
+/// Parse the headers in `table` (which starts at the `PE\0\0` signature, at
+/// file offset `e_lfanew`). Errs with the reason when they are not a
+/// structurally sound PE32 / PE32+ header set.
+fn pe_layout(table: &[u8], e_lfanew: u64) -> Result<PeLayout, &'static str> {
+    if table.len() < 24 {
+        return Err("dump ended inside the COFF header");
+    }
+    let sections = pe_u16(table, 6) as usize;
+    let opt_size = pe_u16(table, 20) as usize;
+    if sections == 0 || sections > 96 {
+        return Err("implausible section count");
+    }
+    if !(96..=1024).contains(&opt_size) {
+        return Err("implausible optional header size");
+    }
+    let table_start = 24 + opt_size;
+    let table_end = table_start + sections * 40;
+    if table.len() < table_end {
+        return Err("dump ended inside the section table");
+    }
+    let opt = &table[24..table_start];
+    // PE32 (0x10b) keeps its data directories at 96, PE32+ (0x20b) at 112.
+    let (directories_at, count_at) = match pe_u16(opt, 0) {
+        0x10b => (96, 92),
+        0x20b => (112, 108),
+        _ => return Err("unknown optional header magic"),
+    };
+    let size_of_headers = pe_u32(opt, 60);
+    if size_of_headers > 1 << 20 {
+        return Err("implausible SizeOfHeaders");
+    }
+    let mut data_ends = Vec::with_capacity(sections + 1);
+    for index in 0..sections {
+        let at = table_start + index * 40;
+        let raw_size = pe_u32(table, at + 16);
+        let raw_ptr = pe_u32(table, at + 20);
+        if raw_size > 0 {
+            data_ends.push(raw_ptr + raw_size);
+        }
+    }
+    // Data directory 4 is the certificate table; unlike the others its
+    // address is a file offset, not an RVA.
+    if pe_u32(opt, count_at) > 4 && opt.len() >= directories_at + 5 * 8 {
+        let cert_offset = pe_u32(opt, directories_at + 4 * 8);
+        let cert_size = pe_u32(opt, directories_at + 4 * 8 + 4);
+        if cert_size > 0 {
+            data_ends.push(cert_offset + cert_size);
+        }
+    }
+    Ok(PeLayout {
+        headers_end: (e_lfanew + table_end as u64).max(size_of_headers),
+        data_ends,
+    })
+}
+
+/// A PE whose section table could not be validated is still worth carving,
+/// but only as far as the header: the verdict says it was not walked.
+fn pe_header_only(source: &mut Source<'_>, reason: &str) -> io::Result<Verdict> {
+    source.skip(PE_HEADER_ONLY_BYTES.min(source.end.saturating_sub(source.abs())))?;
+    Ok(Verdict::Truncated(format!("PE header only: {reason}")))
 }
 
 fn carve_elf(source: &mut Source<'_>) -> io::Result<Verdict> {
@@ -5709,10 +5832,145 @@ fn carve_elf(source: &mut Source<'_>) -> io::Result<Verdict> {
     if header[6] != 1 {
         return Ok(Verdict::Invalid("implausible ELF version".to_string()));
     }
-    // ELF file size cannot be determined from the header alone; skip a
-    // reasonable amount so the carver writes a non-trivial file.
-    source.skip(4096u64.min(source.end.saturating_sub(source.abs())))?;
-    Ok(Verdict::Valid)
+    // The file ends where the furthest data its headers declare ends: the
+    // section header table, the program header table and every segment's
+    // file image. Bytes appended after that are not declared anywhere.
+    let head = source.peek(64)?.to_vec();
+    let fields = match elf_header(&head) {
+        Ok(fields) => fields,
+        Err(reason) => return elf_header_only(source, reason),
+    };
+    let window = source.end.saturating_sub(source.origin);
+    let table_len = fields.phnum * fields.phentsize;
+    let mut ends = vec![fields.header_size];
+    if table_len > 0 {
+        ends.push(fields.phoff + table_len);
+    }
+    if fields.shnum > 0 {
+        ends.push(fields.shoff + fields.shnum * fields.shentsize);
+    }
+    if table_len > 0 && fields.phoff + table_len <= window {
+        // Segments sit at arbitrary offsets: read the program headers where
+        // they are, then come back to the start of the candidate.
+        let start = source.abs();
+        source.skip(fields.phoff)?;
+        let table = source.peek(table_len as usize)?.to_vec();
+        source.rewind_to(start);
+        for entry in table.chunks_exact(fields.phentsize as usize) {
+            let (offset_at, size_at, width) = if fields.wide { (8, 32, 8) } else { (4, 16, 4) };
+            let offset = elf_uint(entry, offset_at, width, fields.little);
+            let size = elf_uint(entry, size_at, width, fields.little);
+            if size > 0 {
+                ends.push(offset.saturating_add(size));
+            }
+        }
+    }
+    let extent = ends.iter().copied().max().unwrap_or(fields.header_size);
+    if extent <= window {
+        source.skip(extent)?;
+        return Ok(Verdict::Valid);
+    }
+    // The headers promise more than the carve window holds: either the dump
+    // cuts the file, or this is a false positive with wild offsets. Keep only
+    // what the headers vouch for inside the window, never the whole window.
+    let kept = ends
+        .iter()
+        .copied()
+        .filter(|&end| end <= window)
+        .max()
+        .unwrap_or(0)
+        .max(ELF_HEADER_ONLY_BYTES.min(window));
+    source.skip(kept)?;
+    Ok(Verdict::Truncated(
+        "ELF segments or section table run past the end of the carve window".to_string(),
+    ))
+}
+
+/// What an ELF whose headers cannot be validated is cut to, as before the
+/// program and section headers were read.
+const ELF_HEADER_ONLY_BYTES: u64 = 4096;
+
+/// The ELF header fields that locate the rest of the file.
+struct ElfFields {
+    /// 64-bit class (`ELFCLASS64`).
+    wide: bool,
+    /// Little-endian data encoding.
+    little: bool,
+    header_size: u64,
+    phoff: u64,
+    phnum: u64,
+    phentsize: u64,
+    shoff: u64,
+    shnum: u64,
+    shentsize: u64,
+}
+
+/// Unsigned integer of `width` bytes (2, 4 or 8) at `at`, in the file's byte
+/// order. The caller has checked the bounds.
+fn elf_uint(bytes: &[u8], at: usize, width: usize, little: bool) -> u64 {
+    let mut value = 0u64;
+    for index in 0..width {
+        let byte = if little {
+            bytes[at + width - 1 - index]
+        } else {
+            bytes[at + index]
+        };
+        value = (value << 8) | u64::from(byte);
+    }
+    value
+}
+
+/// Read the table locations out of the ELF header in `head` (the first 64
+/// bytes of the candidate). Errs with the reason when they make no sense.
+fn elf_header(head: &[u8]) -> Result<ElfFields, &'static str> {
+    let wide = head.get(4) == Some(&2);
+    let little = head.get(5) == Some(&1);
+    let header_size = if wide { 64 } else { 52 };
+    if head.len() < header_size {
+        return Err("dump ended inside the ELF header");
+    }
+    let word = if wide { 8 } else { 4 };
+    let (phoff_at, shoff_at, sizes_at) = if wide { (32, 40, 54) } else { (28, 32, 42) };
+    let phoff = elf_uint(head, phoff_at, word, little);
+    let shoff = elf_uint(head, shoff_at, word, little);
+    let phentsize = elf_uint(head, sizes_at, 2, little);
+    let phnum = elf_uint(head, sizes_at + 2, 2, little);
+    let shentsize = elf_uint(head, sizes_at + 4, 2, little);
+    let shnum = elf_uint(head, sizes_at + 6, 2, little);
+    if phnum == 0 && shnum == 0 {
+        return Err("no program or section headers");
+    }
+    if phnum > 1024 {
+        return Err("implausible program header count");
+    }
+    if phnum > 0 && phentsize != if wide { 56 } else { 32 } {
+        return Err("unexpected program header size");
+    }
+    if shnum > 0 && shentsize != if wide { 64 } else { 40 } {
+        return Err("unexpected section header size");
+    }
+    // Offsets this large are noise, and would overflow the sums below.
+    if phoff >= 1 << 48 || shoff >= 1 << 48 {
+        return Err("implausible header table offset");
+    }
+    Ok(ElfFields {
+        wide,
+        little,
+        header_size: header_size as u64,
+        phoff,
+        phnum,
+        phentsize,
+        shoff,
+        shnum,
+        shentsize,
+    })
+}
+
+/// An ELF whose headers could not be validated is still worth carving, but
+/// only as far as the header: the verdict says it was not walked.
+fn elf_header_only(source: &mut Source<'_>, reason: &str) -> io::Result<Verdict> {
+    source.skip(ELF_HEADER_ONLY_BYTES.min(source.end.saturating_sub(source.abs())))?;
+    Ok(Verdict::Truncated(format!("ELF header only: {reason}")))
 }
 
 // --- hashing / writing -------------------------------------------------------
@@ -9739,6 +9997,121 @@ mod tests {
         assert!(report.files.is_empty(), "{report:?}");
     }
 
+    /// A structurally sound PE32+ whose sections are `(PointerToRawData,
+    /// SizeOfRawData)`, padded out to the end of the last one.
+    fn minimal_pe(sections: &[(u32, u32)]) -> Vec<u8> {
+        const E_LFANEW: usize = 0x40;
+        const OPT: usize = E_LFANEW + 24;
+        const OPT_SIZE: usize = 240; // PE32+: 112 bytes + 16 data directories
+        let headers = OPT + OPT_SIZE + sections.len() * 40;
+        let size_of_headers = headers.next_multiple_of(0x200);
+        let mut pe = vec![0u8; size_of_headers];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&(E_LFANEW as u32).to_le_bytes());
+        pe[E_LFANEW..E_LFANEW + 4].copy_from_slice(b"PE\0\0");
+        pe[E_LFANEW + 6..E_LFANEW + 8].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        pe[E_LFANEW + 20..E_LFANEW + 22].copy_from_slice(&(OPT_SIZE as u16).to_le_bytes());
+        pe[OPT..OPT + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        pe[OPT + 60..OPT + 64].copy_from_slice(&(size_of_headers as u32).to_le_bytes());
+        pe[OPT + 108..OPT + 112].copy_from_slice(&16u32.to_le_bytes());
+        for (index, &(ptr, size)) in sections.iter().enumerate() {
+            let at = OPT + OPT_SIZE + index * 40;
+            pe[at..at + 5].copy_from_slice(b".text");
+            pe[at + 16..at + 20].copy_from_slice(&size.to_le_bytes());
+            pe[at + 20..at + 24].copy_from_slice(&ptr.to_le_bytes());
+        }
+        let end = sections
+            .iter()
+            .map(|&(ptr, size)| (ptr + size) as usize)
+            .max()
+            .unwrap_or(0)
+            .max(pe.len());
+        pe.resize(end, 0xCC);
+        pe
+    }
+
+    #[test]
+    fn pe_size_follows_the_section_table_and_is_complete() {
+        let pe = minimal_pe(&[(0x200, 0x1000), (0x1200, 0x800)]);
+        assert_eq!(pe.len(), 0x1a00);
+        let mut dump = vec![0u8; 32];
+        dump.extend_from_slice(&pe);
+        dump.extend_from_slice(&[0u8; 8192]);
+        let path = write_dump("pe-sections", &dump);
+        let report = Carver::new(CarveOptions::default())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!((file.kind, file.offset), (CarveKind::Pe, 32));
+        assert_eq!(file.size, pe.len() as u64);
+        assert!(file.complete, "{report:?}");
+        assert_eq!(file.confidence, CarveConfidence::High);
+    }
+
+    #[test]
+    fn pe_certificate_table_extends_the_size() {
+        let mut pe = minimal_pe(&[(0x200, 0x1000)]);
+        let cert_at = pe.len() as u32;
+        pe.resize(pe.len() + 0x400, 0xEE);
+        // Data directory 4 (certificate table): file offset, then size.
+        let directory = 0x40 + 24 + 112 + 4 * 8;
+        pe[directory..directory + 4].copy_from_slice(&cert_at.to_le_bytes());
+        pe[directory + 4..directory + 8].copy_from_slice(&0x400u32.to_le_bytes());
+        let mut dump = pe.clone();
+        dump.extend_from_slice(&[0u8; 8192]);
+        let path = write_dump("pe-cert", &dump);
+        let report = Carver::new(CarveOptions::default())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert_eq!(report.files[0].size, pe.len() as u64);
+        assert!(report.files[0].complete);
+    }
+
+    #[test]
+    fn pe_cut_inside_a_section_is_not_claimed_complete() {
+        let pe = minimal_pe(&[(0x200, 0x1000), (0x1200, 0x800)]);
+        // The dump ends in the middle of the second section.
+        let path = write_dump("pe-cut", &pe[..0x1500]);
+        let report = Carver::new(CarveOptions::default())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert!(!file.complete, "{report:?}");
+        assert!(file.notes.contains("runs past"), "{}", file.notes);
+        assert_eq!(file.confidence, CarveConfidence::Medium);
+        // The whole first section is vouched for by the headers; the cut
+        // second one is not.
+        assert!(file.size >= 0x1200 && file.size <= 0x1500, "{}", file.size);
+    }
+
+    #[test]
+    fn pe_with_a_bad_section_table_stays_header_only() {
+        let mut pe = minimal_pe(&[(0x200, 0x1000)]);
+        pe[0x40 + 24] = 0xFF; // optional header magic no longer 0x10b / 0x20b
+        let path = write_dump("pe-bad-table", &pe);
+        let report = Carver::new(CarveOptions::default())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert!(!file.complete);
+        assert!(file.notes.contains("PE header only"), "{}", file.notes);
+        assert_eq!(file.confidence, CarveConfidence::Medium);
+        // Not the whole dump: the same 4 KiB as before the table was walked.
+        assert!(file.size <= 0x40 + 4096, "{}", file.size);
+    }
+
     #[test]
     fn carves_pe_executable() {
         // Minimal PE: MZ + e_lfanew pointing to PE\0\0 signature.
@@ -9760,7 +10133,11 @@ mod tests {
 
         assert_eq!(report.files.len(), 1, "{report:?}");
         assert_eq!(report.files[0].kind, CarveKind::Pe);
-        assert!(report.files[0].complete);
+        // This fixture has no section table, so nothing past the header was
+        // validated: it is carved, but not claimed complete.
+        assert!(!report.files[0].complete, "{report:?}");
+        assert!(report.files[0].notes.contains("PE header only"));
+        assert_eq!(report.files[0].confidence, CarveConfidence::Medium);
 
         // MZ without PE signature is rejected.
         let mut bad = vec![0u8; 64];
@@ -9772,6 +10149,111 @@ mod tests {
             .unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
         assert!(report.files.is_empty(), "{report:?}");
+    }
+
+    /// A structurally sound ELF with one segment and two section headers; its
+    /// size is `0x400 + 2 * section header size`.
+    fn minimal_elf(wide: bool, little: bool) -> Vec<u8> {
+        fn put(elf: &mut [u8], little: bool, at: usize, width: usize, value: u64) {
+            let bytes = if little {
+                value.to_le_bytes()[..width].to_vec()
+            } else {
+                value.to_be_bytes()[8 - width..].to_vec()
+            };
+            elf[at..at + width].copy_from_slice(&bytes);
+        }
+        let (header, phsize, shsize) = if wide { (64, 56, 64) } else { (52, 32, 40) };
+        let data_end = 0x400usize;
+        let mut elf = vec![0u8; data_end + 2 * shsize];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = if wide { 2 } else { 1 };
+        elf[5] = if little { 1 } else { 2 };
+        elf[6] = 1;
+        let image = (header + phsize) as u64;
+        let image_len = data_end as u64 - image;
+        if wide {
+            put(&mut elf, little, 32, 8, header as u64);
+            put(&mut elf, little, 40, 8, data_end as u64);
+            put(&mut elf, little, 54, 2, phsize as u64);
+            put(&mut elf, little, 56, 2, 1);
+            put(&mut elf, little, 58, 2, shsize as u64);
+            put(&mut elf, little, 60, 2, 2);
+            put(&mut elf, little, header + 8, 8, image);
+            put(&mut elf, little, header + 32, 8, image_len);
+        } else {
+            put(&mut elf, little, 28, 4, header as u64);
+            put(&mut elf, little, 32, 4, data_end as u64);
+            put(&mut elf, little, 42, 2, phsize as u64);
+            put(&mut elf, little, 44, 2, 1);
+            put(&mut elf, little, 46, 2, shsize as u64);
+            put(&mut elf, little, 48, 2, 2);
+            put(&mut elf, little, header + 4, 4, image);
+            put(&mut elf, little, header + 16, 4, image_len);
+        }
+        for byte in &mut elf[header + phsize..data_end] {
+            *byte = 0x90;
+        }
+        elf
+    }
+
+    #[test]
+    fn elf_size_follows_the_headers_for_every_class_and_byte_order() {
+        for (wide, little) in [(true, true), (false, true), (false, false), (true, false)] {
+            let elf = minimal_elf(wide, little);
+            let mut dump = vec![0u8; 32];
+            dump.extend_from_slice(&elf);
+            dump.extend_from_slice(&[0u8; 8192]);
+            let path = write_dump("elf-headers", &dump);
+            let report = Carver::new(CarveOptions::default())
+                .scan(path.to_str().unwrap())
+                .unwrap();
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+            assert_eq!(
+                report.files.len(),
+                1,
+                "wide={wide} little={little} {report:?}"
+            );
+            let file = &report.files[0];
+            assert_eq!((file.kind, file.offset), (CarveKind::Elf, 32));
+            assert_eq!(file.size, elf.len() as u64, "wide={wide} little={little}");
+            assert!(file.complete, "wide={wide} little={little} {report:?}");
+            assert_eq!(file.confidence, CarveConfidence::High);
+        }
+    }
+
+    #[test]
+    fn elf_cut_inside_its_segment_is_not_claimed_complete() {
+        let elf = minimal_elf(true, true);
+        let path = write_dump("elf-cut", &elf[..0x200]);
+        let report = Carver::new(CarveOptions::default())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert!(!file.complete, "{report:?}");
+        assert!(file.notes.contains("run past"), "{}", file.notes);
+        assert_eq!(file.confidence, CarveConfidence::Medium);
+        assert!(file.size <= 0x200, "{}", file.size);
+    }
+
+    #[test]
+    fn elf_with_a_wrong_header_entry_size_stays_header_only() {
+        let mut elf = minimal_elf(true, true);
+        elf[54..56].copy_from_slice(&7u16.to_le_bytes()); // e_phentsize
+        let path = write_dump("elf-bad-phentsize", &elf);
+        let report = Carver::new(CarveOptions::default())
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert!(!file.complete);
+        assert!(file.notes.contains("ELF header only"), "{}", file.notes);
+        assert_eq!(file.confidence, CarveConfidence::Medium);
     }
 
     #[test]
@@ -9794,7 +10276,11 @@ mod tests {
 
         assert_eq!(report.files.len(), 1, "{report:?}");
         assert_eq!(report.files[0].kind, CarveKind::Elf);
-        assert!(report.files[0].complete);
+        // No program or section headers: nothing past the header was
+        // validated, so it is carved but not claimed complete.
+        assert!(!report.files[0].complete, "{report:?}");
+        assert!(report.files[0].notes.contains("ELF header only"));
+        assert_eq!(report.files[0].confidence, CarveConfidence::Medium);
 
         // Bad ELF class is rejected.
         let mut bad = Vec::new();
