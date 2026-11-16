@@ -2265,8 +2265,38 @@ const EXTRA_SIGNATURES: &[Signature] = &[
         kind: "OLE compound file",
         carve: Some("ole"),
     },
+    // `ftyp` box sizes seen in the wild: 0x14 (QuickTime), 0x18 (phones:
+    // `isom` + one compatible brand), 0x1c, 0x20 (ffmpeg/`isom`+`mp42`), 0x24,
+    // 0x28. The box size is part of the needle, so each needs its own entry;
+    // matching only 0x20 sent every real 24-byte-`ftyp` MP4 down the rebuild
+    // path. `carve_mp4` walks boxes generically, so any size validates.
+    Signature {
+        bytes: b"\x00\x00\x00\x14ftyp",
+        kind: "MP4/QuickTime media",
+        carve: Some("mp4"),
+    },
+    Signature {
+        bytes: b"\x00\x00\x00\x18ftyp",
+        kind: "MP4/QuickTime media",
+        carve: Some("mp4"),
+    },
+    Signature {
+        bytes: b"\x00\x00\x00\x1cftyp",
+        kind: "MP4/QuickTime media",
+        carve: Some("mp4"),
+    },
     Signature {
         bytes: b"\x00\x00\x00\x20ftyp",
+        kind: "MP4/QuickTime media",
+        carve: Some("mp4"),
+    },
+    Signature {
+        bytes: b"\x00\x00\x00\x24ftyp",
+        kind: "MP4/QuickTime media",
+        carve: Some("mp4"),
+    },
+    Signature {
+        bytes: b"\x00\x00\x00\x28ftyp",
         kind: "MP4/QuickTime media",
         carve: Some("mp4"),
     },
@@ -5567,6 +5597,12 @@ fn carve_sqlite(source: &mut Source<'_>) -> io::Result<Verdict> {
 /// Maximum MP4 boxes to walk before giving up (prevents hostile loops).
 const MAX_MP4_BOXES: usize = 1000;
 
+/// Top-level box types that may follow the payload of an ISO-BMFF file.
+const MP4_TOP_LEVEL: &[&[u8]] = &[
+    b"ftyp", b"styp", b"moov", b"mdat", b"free", b"skip", b"wide", b"uuid", b"meta", b"moof",
+    b"mfra", b"sidx", b"ssix", b"pdin", b"junk", b"udta", b"pnot",
+];
+
 fn carve_ole(source: &mut Source<'_>) -> io::Result<Verdict> {
     // OLE Compound File Binary Format (.doc, .xls, .ppt pre-2007).
     // Signature: D0 CF 11 E0 A1 B1 1A E1.
@@ -5601,23 +5637,36 @@ fn carve_mp4(source: &mut Source<'_>) -> io::Result<Verdict> {
     // boxes so hostile input cannot loop forever.
     let mut boxes = 0usize;
     let mut found_payload = false;
+    let mut seen_moov = false;
+    let mut seen_mdat = false;
+    let mut seen_moof = false;
     while boxes < MAX_MP4_BOXES {
         let Some(header) = peek_array::<8>(source)? else {
+            if seen_mdat || seen_moov {
+                // The file ended exactly after its payload box.
+                break;
+            }
             return Ok(Verdict::Truncated(
                 "dump ended inside an MP4 box header".to_string(),
             ));
         };
         let mut size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
         let box_type = &header[4..8];
+        // Once a payload box is in, only a known top-level box may continue
+        // the file; anything else is whatever follows it in the dump.
+        if (seen_mdat || seen_moov) && !MP4_TOP_LEVEL.contains(&box_type) {
+            break;
+        }
         if size == 1 {
             // 64-bit extended size follows the box type.
-            let Some(ext) = peek_array::<8>(source)? else {
+            let Some(wide) = peek_array::<16>(source)? else {
                 return Ok(Verdict::Truncated(
                     "dump ended inside an MP4 extended box size".to_string(),
                 ));
             };
+            // `peek_array` starts at the box header, so the size is bytes 8..16.
             size = u64::from_be_bytes([
-                ext[0], ext[1], ext[2], ext[3], ext[4], ext[5], ext[6], ext[7],
+                wide[8], wide[9], wide[10], wide[11], wide[12], wide[13], wide[14], wide[15],
             ]);
             if size < 16 {
                 return Ok(Verdict::Invalid(
@@ -5631,6 +5680,17 @@ fn carve_mp4(source: &mut Source<'_>) -> io::Result<Verdict> {
         } else if size < 8 {
             return Ok(Verdict::Invalid("MP4 box size too small".to_string()));
         }
+        let remaining = source.end.saturating_sub(source.abs());
+        if (seen_mdat || seen_moov) && size > remaining {
+            // A box cut off by the window after the payload: a short `moov`
+            // means the file is incomplete, anything else just ends here.
+            if box_type == *b"moov" {
+                return Ok(Verdict::Truncated(
+                    "MP4 moov box runs past the end of the candidate window".to_string(),
+                ));
+            }
+            break;
+        }
         if size > source.end.saturating_sub(source.origin) {
             return Ok(Verdict::Truncated(
                 "MP4 declares more data than the dump has".to_string(),
@@ -5639,10 +5699,24 @@ fn carve_mp4(source: &mut Source<'_>) -> io::Result<Verdict> {
         // peek_array does not consume the header; move past the whole box.
         source.skip(size)?;
         boxes += 1;
-        // Stop after the first real payload box or the movie box; we don't
-        // need to walk the entire file.
-        if box_type == *b"mdat" || box_type == *b"moov" {
-            found_payload = true;
+        // The file is complete once both payload (`mdat`) and index (`moov`)
+        // are in, whichever order they come in (`moov` is last unless the file
+        // was fast-started). Stopping at the first of the two used to cut a
+        // non-fast-start file off before its `moov`. A fragmented file
+        // (`moof` seen) keeps walking until the next box is not a known one.
+        match box_type {
+            b if b == *b"mdat" => {
+                seen_mdat = true;
+                found_payload = true;
+            }
+            b if b == *b"moov" => {
+                seen_moov = true;
+                found_payload = true;
+            }
+            b if b == *b"moof" => seen_moof = true,
+            _ => {}
+        }
+        if seen_moov && seen_mdat && !seen_moof {
             break;
         }
     }
@@ -9146,6 +9220,34 @@ mod tests {
     }
 
     #[test]
+    fn an_intact_mp4_with_a_24_byte_ftyp_is_carved_whole() {
+        // Phone/ffmpeg MP4s usually carry a 24-byte ftyp; the header needle used
+        // to match only the 32-byte form, so every such file went down the
+        // rebuild path instead of being carved as itself.
+        let (orig, _, _) = synthetic_mp4();
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&orig);
+        dump.extend_from_slice(&[0u8; 64]);
+        let path = write_dump("mp4-intact-24", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.role, CarveRole::Whole, "{file:?}");
+        assert_eq!(file.offset, 64);
+        assert_eq!(file.size, orig.len() as u64, "{file:?}");
+        assert!(file.complete, "{file:?}");
+    }
+
+    #[test]
     fn a_ruined_head_with_a_surviving_moov_rebuilds_the_container() {
         // The classic partial-encryption leftover for a phone video: ftyp and
         // mdat header gone, moov (at the end) intact, plus a ransomware
@@ -9223,7 +9325,7 @@ mod tests {
         let mut frames = sample_frames();
         frames[0][0] ^= 0xFF; // the NAL length MSB: an absurd length
         let dump = mp4_nal_fixture(b"avc1", &frames, Some(&[1, 3]));
-        let path = write_dump("mp4-oracle-partial", &dump);
+        let path = write_dump("mp4-oracle-partial", &without_ftyp(dump));
         let options = CarveOptions {
             kinds: vec![CarveKind::Mp4],
             min_size: 0,
@@ -9262,7 +9364,7 @@ mod tests {
     #[test]
     fn a_fully_intact_track_scores_confidence_high() {
         let dump = mp4_nal_fixture(b"avc1", &sample_frames(), Some(&[1, 3]));
-        let path = write_dump("mp4-oracle-intact", &dump);
+        let path = write_dump("mp4-oracle-intact", &without_ftyp(dump));
         let options = CarveOptions {
             kinds: vec![CarveKind::Mp4],
             min_size: 0,
@@ -9291,7 +9393,7 @@ mod tests {
         let mut frames = sample_frames();
         frames[0][0] ^= 0xFF;
         let dump = mp4_nal_fixture(b"avc1", &frames, None);
-        let path = write_dump("mp4-oracle-no-stss", &dump);
+        let path = write_dump("mp4-oracle-no-stss", &without_ftyp(dump));
         let options = CarveOptions {
             kinds: vec![CarveKind::Mp4],
             min_size: 0,
@@ -9319,7 +9421,7 @@ mod tests {
     fn an_audio_track_or_a_missing_configuration_record_skips_the_oracle() {
         // mp4a: no AVC/HEVC codec, so nothing is checked and the notes say so.
         let dump = mp4_nal_fixture(b"mp4a", &sample_frames(), None);
-        let path = write_dump("mp4-oracle-audio", &dump);
+        let path = write_dump("mp4-oracle-audio", &without_ftyp(dump));
         let options = CarveOptions {
             kinds: vec![CarveKind::Mp4],
             min_size: 0,
@@ -9346,7 +9448,10 @@ mod tests {
         // edit list; the full rebuild is kept alongside.
         let mut frames = sample_frames();
         frames[0][0] ^= 0xFF;
-        let dump = mp4_nal_fixture(b"avc1", &frames, Some(&[1, 3]));
+        let mut dump = mp4_nal_fixture(b"avc1", &frames, Some(&[1, 3]));
+        // The ftyp is gone (what the rebuild path is for); an intact ftyp now
+        // carves as a whole file instead.
+        dump[4..8].copy_from_slice(&[0xAA; 4]);
         let path = write_dump("mp4-cut", &dump);
         let root = path.parent().unwrap().to_path_buf();
         let out_dir = root.join("out");
@@ -9428,9 +9533,10 @@ mod tests {
 
     #[test]
     fn a_fully_intact_mp4_gets_no_cut_sibling() {
-        // Everything intact and the first sync sample is sample 1 (t = 0):
-        // there is nothing to skip, so no cut is emitted.
-        let dump = mp4_nal_fixture(b"avc1", &sample_frames(), Some(&[1, 3]));
+        // Ftyp ruined, everything else intact and the first sync sample is
+        // sample 1 (t = 0): there is nothing to skip, so no cut is emitted.
+        let mut dump = mp4_nal_fixture(b"avc1", &sample_frames(), Some(&[1, 3]));
+        dump[4..8].copy_from_slice(&[0xAA; 4]);
         let path = write_dump("mp4-cut-skip", &dump);
         let root = path.parent().unwrap().to_path_buf();
         let out_dir = root.join("out");
@@ -9478,7 +9584,7 @@ mod tests {
         let chunk1 = (24 + 8) as u32;
         let chunk2 = chunk1 + 4096;
         let (misordered, _, _) = synthetic_mp4_with_stco((chunk2, chunk1), &[]);
-        let path = write_dump("mp4-misordered", &misordered);
+        let path = write_dump("mp4-misordered", &without_ftyp(misordered));
         let options = CarveOptions {
             kinds: vec![CarveKind::Mp4],
             min_size: 0,
@@ -9514,7 +9620,7 @@ mod tests {
         let chunk1 = (24 + 8) as u32;
         let chunk2 = chunk1 + 4096;
         let (file, _, _) = synthetic_mp4_with_stco((chunk1, chunk2), &[&mvex]);
-        let path = write_dump("mp4-fragmented", &file);
+        let path = write_dump("mp4-fragmented", &without_ftyp(file));
         let options = CarveOptions {
             kinds: vec![CarveKind::Mp4],
             min_size: 0,
@@ -9534,6 +9640,53 @@ mod tests {
                 .any(|detail| detail.contains("mvex")),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn an_mp4_with_a_64_bit_mdat_size_is_carved_whole() {
+        // size == 1 means the real size follows the type as a u64. The walk
+        // used to re-read the 8 header bytes instead, so every box with an
+        // extended size was mis-parsed.
+        let mut mp4 = Vec::new();
+        mp4.extend_from_slice(&24u32.to_be_bytes());
+        mp4.extend_from_slice(b"ftypisom");
+        mp4.extend_from_slice(&0u32.to_be_bytes());
+        mp4.extend_from_slice(b"isommp42");
+        let payload = [0x5Au8; 200];
+        mp4.extend_from_slice(&1u32.to_be_bytes());
+        mp4.extend_from_slice(b"mdat");
+        mp4.extend_from_slice(&(16 + payload.len() as u64).to_be_bytes());
+        mp4.extend_from_slice(&payload);
+        mp4.extend_from_slice(&8u32.to_be_bytes());
+        mp4.extend_from_slice(b"moov");
+        let mut dump = vec![0u8; 64];
+        dump.extend_from_slice(&mp4);
+        dump.extend_from_slice(&[0u8; 64]);
+        let path = write_dump("mp4-ext-size", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert_eq!(file.role, CarveRole::Whole, "{file:?}");
+        assert_eq!(file.offset, 64);
+        assert_eq!(file.size, mp4.len() as u64, "{file:?}");
+        assert!(file.complete, "{file:?}");
+    }
+
+    /// Ruins the `ftyp` type of a fixture, the way a partial encryption does.
+    /// Fixtures that exercise the rebuild path need this: an intact `ftyp` +
+    /// `mdat` + `moov` is carved as a whole file and never reaches the rebuild.
+    fn without_ftyp(mut dump: Vec<u8>) -> Vec<u8> {
+        dump[4..8].copy_from_slice(&[0xAA; 4]);
+        dump
     }
 
     /// Depth-first search for a box of type `want` between `from` and `to`.
@@ -9571,7 +9724,7 @@ mod tests {
         let at = find_box(&file, 0, file.len(), b"stsz").expect("stsz present");
         // box header (8) + version/flags (4) + sample_size (4) + entry_count.
         file[at + 16..at + 20].copy_from_slice(&3u32.to_be_bytes());
-        let path = write_dump("mp4-stsz-mismatch", &file);
+        let path = write_dump("mp4-stsz-mismatch", &without_ftyp(file));
         let options = CarveOptions {
             kinds: vec![CarveKind::Mp4],
             min_size: 0,
@@ -9626,7 +9779,7 @@ mod tests {
         let (mut file, moov_offset, _) = synthetic_mp4();
         // Claim the moov is ~4 GiB: unreadable, must not panic or allocate.
         file[moov_offset..moov_offset + 4].copy_from_slice(&0xFFFF_FFF0u32.to_be_bytes());
-        let path = write_dump("mp4-huge-moov", &file);
+        let path = write_dump("mp4-huge-moov", &without_ftyp(file));
         let options = CarveOptions {
             kinds: vec![CarveKind::Mp4],
             min_size: 0,

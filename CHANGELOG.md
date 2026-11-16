@@ -66,6 +66,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fields and dedupe semantics match the rebuilt record.
 
 ### Fixed
+- **Intact MP4/MOV files are carved as themselves, not rebuilt.** The `ftyp`
+  header needle only matched the 32-byte box, so the far more common 24-byte
+  form (phones, ffmpeg) never matched and every intact file was reached only
+  through its `moov`, i.e. always taken down the rebuild path and written as a
+  `rebuilt` sibling. `ftyp` boxes of 0x14, 0x18, 0x1c, 0x20, 0x24 and 0x28
+  bytes now match. The box walk also continues past `mdat` to the trailing
+  `moov` (and through fragmented `moof` runs), so a normal non-fast-start file
+  is one `whole`/`complete`/`high` carve, and the rebuild only runs when the
+  head is actually gone. A box with a 64-bit size (`size == 1`) read the 8
+  header bytes again instead of the 8 after the type and was mis-parsed; it
+  now reads the extended size correctly.
 - **PE and ELF carves are sized and labelled from their headers.** The PE validator
   used to check `MZ` + `PE\0\0`, skip a fixed 4 KiB and report the file as
   complete (tier 1, `high`, `terminator_ok`), so real 40-360 KB executables
