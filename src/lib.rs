@@ -56,6 +56,7 @@ pub mod carve;
 mod carve_ext;
 pub mod chunk;
 pub mod classifier;
+pub(crate) mod jpeg_scan;
 pub use classifier::{
     classify, detect_bitlocker_header, detect_encryption_shell, detect_luks_header,
     detect_openssl_encrypted, detect_pgp_container, detect_secrets, detect_secrets_detailed,

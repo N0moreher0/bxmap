@@ -6,6 +6,59 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **JPEG whose head was destroyed but whose table chain survives is rebuilt
+  exactly (ROADMAP 8.12.2, P1)**. When ransomware destroyed only the
+  leading `APP0`/`EXIF` region (the corruption shape the bench's `head4k`
+  reproduces on real camera images), the `DQT* SOF0/1 DHT* DRI?` chain sits
+  right before the `SOS` and survives intact. `--carve` now reconstructs
+  the file instead of only salvaging a tail: candidate chains are walked
+  forward from every plausible start marker within ~8 KiB before the
+  surviving `SOS` (each segment's own length field is walked:
+  `DQT`* (ids tracked, ≤ 4 sub-tables each) → `SOF0/1` (P=8, X/Y>0, 1..4
+  components with h,v ∈ 1..4, every referenced `DQT` present) → `DHT`*
+  (each sub-table ≤ 256 symbols, symbol count == sum of counts) → optional
+  `DRI` (exactly 4 bytes)); the chain must land exactly on the `SOS`
+  marker. The `SOS` is cross-checked too: component table matches SOF,
+  `Ss=0`/`Se=63`/`Ah=0`/`Al=0`, every referenced Huffman table present.
+  The rebuilt file is `SOI` + a minimal JFIF `APP0` + the surviving
+  segments **verbatim** + the `SOS`..`EOI` region **verbatim**: every
+  byte is either a known table segment or entropy data the decoder proved
+  correct. Post-checks both must pass: the own JPEG validator
+  (`carve_jpeg` = `Valid`, checked on the rebuilt bytes via a temporary
+  file) and the new MCU walker (`src/jpeg_scan.rs`, ROADMAP 8.12.3's
+  core: baseline/sequential Huffman, SOF0/SOF1, 8-bit, restart support,
+  ≤ 7 padding bits of 1s expected at the end of scan, every table read
+  from the file's own `DHT`, never Annex K) which must decode the scan
+  to exactly `cols × rows` MCUs ending at `EOI`. On success the file goes
+  to the **main folder** as `<offset>-jpeg-<hash>.jpg.rebuilt.carved`
+  (`offset` = the `SOS` offset per ROADMAP 8.12.7) with `role: rebuilt`,
+  `complete: true`, tier 1, `confidence: high`, `corrupted_offset` =
+  first surviving chain segment, evidence
+  `stuffing_run`, `sof:sequential`, `tables_exact`, `seg_chain_ok`,
+  `mcu_walk_ok`, plus any trailer bytes found after the `FF D9` (same
+  trailer handling as the MP4/JPEG-tail paths). On any failure the scan
+  falls back to the 8.12.1 tail path (`partial/`), so nothing is lost
+  relative to before. No new flag; the MCU walker is a private module
+  (pixel decoding stays out of scope).
+  Prerequisite fix (found while bringing this up): the stuffing oracle
+  that unstuffs `FF 00` in the entropy data incorrectly emitted a zero
+  byte instead of the stuffed `FF` byte, shifting every stuffed entropy
+  byte by one and desynchronising the Huffman decode; the 8.12.1 tail
+  path was unaffected (it walks raw `FF`-pairs and never unstuffs) but
+  the MCU walker depends on the unstuffed bitstream; fixed before commit.
+  Unit tests cover a real baseline fixture with a ruined head (rebuilt
+  and decoded) and a fully destroyed chain (refused; nothing emitted).
+  Verification: end-to-end via the CLI on a synthetic camera-like JPEG
+  (EXIF `APP1` ~20 KB ahead of the tables, 4 KiB of head overwritten
+  with random data): rebuilt, decoded with PIL to exactly 640×480,
+  **pixel-identical** to the intact original (0/921,600 channel
+  differences), `complete: true`, tier 1, `confidence: high`. Bench
+  (388 MB) and Lab 6 (1.61 GiB) both unchanged vs 8.12.1 — the bench
+  corpus contains no APP0-loss-only camera-like JPEG (its single ruined
+  JPEG is an APP0-only file whose tables all die with a 4 KiB head
+  loss; the 8.12.1 tail salvage still applies, COVERAGE 96%); see
+  ROADMAP 8.12.2 for details.
+
 - **JPEG entropy-coded scan survives while the head is destroyed: `--carve`
   now salvages a JPEG tail (ROADMAP 8.12.1, P1)**. A bare `FF D9` footer is
   not a trustworthy footer, so the salvage pass only accepts one when the

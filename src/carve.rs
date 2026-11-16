@@ -1859,6 +1859,130 @@ impl Carver {
                         }
                     }
                 }
+                // ROADMAP 8.12.2: exact rebuild when the surviving head
+                // tables are intact; fall back to the tail salvage when they
+                // are not. Progressive/arithmetic JPEGs never reach the
+                // rebuild's checks (the SOF/DRI gates reject them).
+                if kind == CarveKind::Jpeg {
+                    match jpeg_exact_rebuild(
+                        &mut source,
+                        position,
+                        file_len,
+                        self.options.max_size,
+                        &covered,
+                    ) {
+                        Ok(Ok(rebuilt)) => {
+                            let size = rebuilt.bytes.len() as u64;
+                            if size >= self.options.min_size {
+                                let sha256 = rebuilt.sha256.clone();
+                                let entropy = rebuilt.entropy;
+                                let notes = rebuilt.notes.clone();
+                                if !self.ext_filter.allows(CarveKind::Jpeg, "jpg") {
+                                    covered.push((rebuilt.chain_start, rebuilt.chain_end));
+                                    report.filtered += 1;
+                                    continue;
+                                }
+                                covered.push((rebuilt.chain_start, rebuilt.chain_end));
+                                if let Some(&index) = by_hash.get(&sha256) {
+                                    report.duplicates += 1;
+                                    report.duplicate_bytes += size;
+                                    report.files[index].duplicates.push(rebuilt.scan_start);
+                                    continue;
+                                }
+                                let path = match out_dir {
+                                    Some(dir) => {
+                                        // A rebuilt JPEG passes the own
+                                        // validator and the MCU walker, so
+                                        // it goes in the main folder with
+                                        // the other complete files.
+                                        let name = carved_file_name_with_ext(
+                                            rebuilt.scan_start,
+                                            CarveKind::Jpeg,
+                                            "jpg",
+                                            CarveRole::Rebuilt,
+                                            &sha256,
+                                        );
+                                        let path = dir.join(&name);
+                                        if path.exists() {
+                                            failure = Some(io::Error::new(
+                                                io::ErrorKind::AlreadyExists,
+                                                format!(
+                                                    "refusing to overwrite '{}'; use a fresh --carve-out",
+                                                    path.display()
+                                                ),
+                                            ));
+                                            return false;
+                                        }
+                                        if let Err(error) = std::fs::write(&path, &rebuilt.bytes) {
+                                            failure = Some(error);
+                                            return false;
+                                        }
+                                        Some(path)
+                                    }
+                                    None => None,
+                                };
+                                by_hash.insert(sha256.clone(), report.files.len());
+                                report.bytes_written += size;
+                                let trailer = rebuilt.trailer;
+                                report.files.push(CarvedFile {
+                                    offset: rebuilt.scan_start,
+                                    kind: CarveKind::Jpeg,
+                                    size,
+                                    complete: true,
+                                    sha256,
+                                    entropy,
+                                    notes,
+                                    path,
+                                    duplicates: Vec::new(),
+                                    corrupted_offset: Some(rebuilt.chain_start),
+                                    entropy_spike_at: None,
+                                    partial_encryption: None,
+                                    trailer_offset: trailer.0,
+                                    trailer_len: trailer.1,
+                                    trailer_sha256: trailer.2,
+                                    trailer_preview: trailer.3,
+                                    tracks_intact: None,
+                                    ext: "jpg".to_string(),
+                                    ext_source: "kind".to_string(),
+                                    role: CarveRole::Rebuilt,
+                                    tier: 1,
+                                    evidence: vec![
+                                        "stuffing_run",
+                                        "sof:sequential",
+                                        "tables_exact",
+                                        "seg_chain_ok",
+                                        "mcu_walk_ok",
+                                    ],
+                                    confidence: CarveConfidence::High,
+                                });
+                                if self.options.max_files != 0
+                                    && report.files.len() >= self.options.max_files
+                                {
+                                    report.truncated = true;
+                                    stop = true;
+                                    return false;
+                                }
+                                if self.options.max_total != 0
+                                    && report.bytes_written >= self.options.max_total
+                                {
+                                    report.truncated = true;
+                                    stop = true;
+                                    return false;
+                                }
+                                continue;
+                            }
+                        }
+                        // Rebuild impossible (no SOS/chain, or the bytes
+                        // fail the own validator or the MCU walker): fall
+                        // through to the tail salvage below, which writes a
+                        // partial/ file instead.
+                        Ok(Err(_)) => {}
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    }
+                }
                 let tail = match salvage_tail(
                     kind,
                     &mut source,
@@ -4162,13 +4286,38 @@ fn png_previous_idat(buffer: &[u8], boundary: usize) -> Option<usize> {
 /// violation inside the damaged region). The run's content is NOT fake
 /// -verified: it is labelled a low-confidence tail, never complete, never
 /// decoded as-is.
-fn salvage_jpeg_tail(
+/// A stuffing-clean run ending at a JPEG EOI, as found by the backward
+/// oracle shared by the tail salvage (8.12.1) and the exact rebuild
+/// (8.12.2).
+struct JpegRun {
+    /// Absolute offset of the first byte after the run (`violation + 2`,
+    /// or `prior_end` when the run reaches it).
+    start: u64,
+    /// Absolute offset just past the EOI (`eoi + 2`).
+    end: u64,
+    /// Absolute offset of the `FF` that terminated the backward walk,
+    /// `None` when the run reaches `prior_end`.
+    violation: Option<u64>,
+    /// Byte after the violating `FF` (e.g. `0xDA` for an SOS boundary);
+    /// `0` when there is no violation.
+    marker: u8,
+    /// Restart markers appeared inside the run.
+    rst_seen: bool,
+}
+
+/// Backward stuffing-clean walk from the JPEG EOI at `position` (the `FF`
+/// byte of the `FF D9` terminator). Shared by `salvage_jpeg_tail` and the
+/// exact rebuild: same oracle, same constants; `min_run` is the caller's
+/// noise floor (8 KiB for the tail heuristic, 64 bytes for the exact
+/// rebuild, which is proven by the own validator and the MCU walk).
+fn jpeg_stuffing_run(
     file: &mut File,
     position: u64,
     file_len: u64,
     max_size: u64,
     prior_end: u64,
-) -> io::Result<Option<SalvageTail>> {
+    min_run: u64,
+) -> io::Result<Option<JpegRun>> {
     let end = position + 2;
     if end > file_len {
         return Ok(None);
@@ -4256,7 +4405,7 @@ fn salvage_jpeg_tail(
         Some(violation) => violation + 2,
         None => lower,
     };
-    if end - start < JPEG_RUN_MIN {
+    if end - start < min_run {
         return Ok(None);
     }
     // Zero-filled regions pass the stuffing oracle trivially; they are not
@@ -4264,6 +4413,32 @@ fn salvage_jpeg_tail(
     if nuls * 100 > JPEG_NUL_PERCENT * (end - start) {
         return Ok(None);
     }
+    Ok(Some(JpegRun {
+        start,
+        end,
+        violation: last_violation,
+        marker: violation_marker.unwrap_or(0),
+        rst_seen,
+    }))
+}
+
+fn salvage_jpeg_tail(
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+    prior_end: u64,
+) -> io::Result<Option<SalvageTail>> {
+    let Some(run) = jpeg_stuffing_run(file, position, file_len, max_size, prior_end, JPEG_RUN_MIN)?
+    else {
+        return Ok(None);
+    };
+    let end = run.end;
+    let start = run.start;
+    let rst_seen = run.rst_seen;
+    // Byte after the `FF` at the last violation (e.g. `0xDA` for an SOS
+    // scan boundary), used to label a multi-scan/progressive tail.
+    let violation_marker = run.violation.map(|_| run.marker);
     // The coding process decides whether a tail is allowed at all:
     // progressive/arithmetic scans stop at the last scan boundary under a
     // backward walk and the Huffman walker would not apply either.
@@ -4306,6 +4481,455 @@ fn salvage_jpeg_tail(
             "salvage:tail: JPEG entropy-coded run (stuffing-clean) + EOI at {position:#x}; SOI..SOS missing ({sof_note}){scan_note}"
         ),
         extra_evidence,
+        trailer,
+    }))
+}
+
+// ===========================================================================
+// ROADMAP 8.12.2 — exact rebuild from a surviving table chain.
+//
+// When ransomware only destroyed the leading APP0/EXIF/thumbnail region, the
+// chain `DQT* SOF0/1 DHT* DRI?` right before the `SOS` survives intact. The
+// rebuilt file is `SOI` + minimal APP0 + the surviving segments verbatim +
+// the scan (from SOS to EOI) verbatim: every byte is either a known segment
+// validated by walking its own length fields, or the scan, which the MCU
+// walker then proves decodes to exactly `cols × rows` MCUs ending at EOI.
+// Nothing is guessed.
+
+/// Minimal JFIF APP0 segment for the rebuilt header (keeps strict viewers
+/// happy; the original APP0 almost never survives).
+const JFIF_APP0: [u8; 18] = [
+    0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01,
+    0x00, 0x00,
+];
+
+/// A JPEG bought back from a surviving table chain (ROADMAP 8.12.2).
+struct JpegRebuilt {
+    /// The rebuilt JPEG: `SOI` + minimal APP0 + surviving segments + scan
+    /// up to and including the `FF D9`.
+    bytes: Vec<u8>,
+    /// Dump offset of the surviving `SOS` marker — the naming offset per
+    /// ROADMAP 8.12.7 (`...-jpeg-<hash>.jpg.rebuilt.carved`).
+    scan_start: u64,
+    /// Absolute dump offset of the first surviving chain segment.
+    chain_start: u64,
+    /// Absolute dump offset just past the `FF D9`.
+    chain_end: u64,
+    sha256: String,
+    entropy: f64,
+    notes: String,
+    /// Any bytes that followed the EOI in the dump (recorded in the index
+    /// like the tail path does).
+    trailer: (Option<u64>, Option<u64>, Option<String>, Option<String>),
+}
+
+/// The surviving segments of a valid `DQT`* `SOF0/1` `DHT`* `DRI`? chain.
+/// The segment dump ranges are returned separately by
+/// [`jpeg_chain_segments`].
+/// The surviving segments of a valid `DQT`* `SOF0/1` `DHT`* `DRI`? chain.
+/// Window-relative ranges of the segments as returned by [`jpeg_chain_try`].
+type ChainTry = (usize, Vec<(usize, usize)>, JpegChain);
+
+/// The chain as returned by [`jpeg_chain_segments`]: absolute dump ranges of
+/// the surviving segments plus the parsed chain metadata.
+type JpegChainFound = (Vec<(u64, u64)>, JpegChain);
+
+struct JpegChain {
+    /// Huffman table ids seen in DHTs (`id + class * 4`, 0..3 DC, 4..7 AC).
+    dht_ids: [bool; 8],
+    /// Dimensions from the SOF.
+    width: u16,
+    height: u16,
+    /// Component ids from the SOF, in SOF order.
+    sof_ids: Vec<u8>,
+}
+
+/// Walk a candidate chain in `window` starting at `start`. The chain must
+/// land exactly on `window.len()` (the SOS marker offset relative to the
+/// window) with every segment validated. Returns window-relative segment
+/// ranges, or `None`.
+fn jpeg_chain_try(bytes: &[u8], start: usize) -> Option<ChainTry> {
+    let mut segments = Vec::with_capacity(8);
+    let mut index = start;
+    let mut saw_sof = false;
+    let mut saw_dqt = 0usize;
+    let mut saw_dht = 0usize;
+    let mut saw_dri = false;
+    let mut dqt_ids = [false; 4];
+    let mut dht_ids = [false; 8];
+    let mut sof_ids: Vec<u8> = Vec::new();
+    let mut width = 0u16;
+    let mut height = 0u16;
+    while index < bytes.len() {
+        let segment_start = index;
+        if bytes[index] != 0xFF || index + 4 > bytes.len() {
+            return None;
+        }
+        let marker = bytes[index + 1];
+        let length = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
+        if length < 2 || index.checked_add(2 + length)? > bytes.len() {
+            return None;
+        }
+        let payload = index + 4;
+        let segment_end = index + 2 + length;
+        match marker {
+            0xDB => {
+                // DQT* only before the SOF (libjpeg layout).
+                if saw_sof {
+                    return None;
+                }
+                let mut inner = payload;
+                while inner < segment_end {
+                    let pq_tq = bytes[inner];
+                    inner += 1;
+                    let precision = pq_tq >> 4;
+                    let id = pq_tq & 0x0F;
+                    if precision > 1 || id > 3 {
+                        return None;
+                    }
+                    dqt_ids[id as usize] = true;
+                    let table_bytes = if precision == 0 { 64 } else { 128 };
+                    if inner + table_bytes > segment_end {
+                        return None;
+                    }
+                    inner += table_bytes;
+                }
+                saw_dqt += 1;
+            }
+            0xC0 | 0xC1 => {
+                if saw_sof {
+                    return None;
+                }
+                let precision = bytes[payload];
+                if precision != 8 {
+                    return None;
+                }
+                let h = u16::from_be_bytes([bytes[payload + 1], bytes[payload + 2]]);
+                let w = u16::from_be_bytes([bytes[payload + 3], bytes[payload + 4]]);
+                if h == 0 || w == 0 {
+                    return None;
+                }
+                let count = bytes[payload + 5] as usize;
+                if !(1..=4).contains(&count) || payload + 6 + 3 * count != segment_end {
+                    return None;
+                }
+                let mut ids = Vec::with_capacity(count);
+                for k in 0..count {
+                    let base = payload + 6 + 3 * k;
+                    let sampling = bytes[base + 1];
+                    let sh = sampling >> 4;
+                    let sv = sampling & 0x0F;
+                    if sh == 0 || sv == 0 || sh > 4 || sv > 4 {
+                        return None;
+                    }
+                    let tq = bytes[base + 2];
+                    if tq > 3 || !dqt_ids[tq as usize] {
+                        return None;
+                    }
+                    ids.push(bytes[base]);
+                }
+                saw_sof = true;
+                width = w;
+                height = h;
+                sof_ids = ids;
+            }
+            0xC4 => {
+                if !saw_sof {
+                    return None;
+                }
+                let mut inner = payload;
+                while inner < segment_end {
+                    let tc_th = bytes[inner];
+                    inner += 1;
+                    let class = tc_th >> 4;
+                    let id = tc_th & 0x0F;
+                    if class > 1 || id > 3 {
+                        return None;
+                    }
+                    if inner + 16 > segment_end {
+                        return None;
+                    }
+                    let counts = &bytes[inner..inner + 16];
+                    inner += 16;
+                    let total: usize = counts.iter().map(|&b| b as usize).sum();
+                    if total == 0 || total > 256 {
+                        return None;
+                    }
+                    if inner + total > segment_end {
+                        return None;
+                    }
+                    inner += total;
+                    dht_ids[(class as usize) * 4 + id as usize] = true;
+                }
+                saw_dht += 1;
+            }
+            0xDD => {
+                // DRI, at most once, after the SOF (libjpeg puts it right
+                // before the SOS).
+                if !saw_sof || saw_dri || length != 4 {
+                    return None;
+                }
+                saw_dri = true;
+            }
+            _ => return None,
+        }
+        segments.push((segment_start, segment_end));
+        index = segment_end;
+    }
+    if !saw_sof || saw_dqt == 0 || saw_dht == 0 {
+        return None;
+    }
+    Some((
+        start,
+        segments,
+        JpegChain {
+            dht_ids,
+            width,
+            height,
+            sof_ids,
+        },
+    ))
+}
+
+/// Find the longest surviving `DQT`* `SOF0/1` `DHT`* `DRI`? chain ending
+/// exactly at the SOS marker at `sos_abs`. The window spans at most 8 KiB
+/// before the SOS.
+fn jpeg_chain_segments(
+    file: &mut File,
+    sos_abs: u64,
+    prior_end: u64,
+    file_len: u64,
+) -> io::Result<Result<JpegChainFound, String>> {
+    let window = (sos_abs.saturating_sub(prior_end)).min(8 * 1024);
+    let win_start = sos_abs - window;
+    let Some(bytes) = salvage_read(file, win_start, window as usize, file_len)? else {
+        return Ok(Err("cannot read the window before SOS".to_string()));
+    };
+    // Earliest valid chain wins (longest surviving data).
+    let mut index = 0usize;
+    let mut best: Option<ChainTry> = None;
+    while index + 4 <= bytes.len() {
+        if bytes[index] != 0xFF {
+            index += 1;
+            continue;
+        }
+        let marker = bytes[index + 1];
+        if matches!(marker, 0xDB | 0xC0 | 0xC1 | 0xC4 | 0xDD) {
+            if let Some(found) = jpeg_chain_try(&bytes, index) {
+                if best
+                    .as_ref()
+                    .map_or(true, |(best_start, _, _)| found.0 < *best_start)
+                {
+                    best = Some(found);
+                }
+                break;
+            }
+        }
+        index += 1;
+    }
+    let Some((_chain_rel_start, segments, chain)) = best else {
+        return Ok(Err(
+            "no surviving DQT/SOF/DHT chain immediately before SOS".to_string()
+        ));
+    };
+    let segments = segments
+        .into_iter()
+        .map(|(start, end)| (win_start + start as u64, win_start + end as u64))
+        .collect();
+    Ok(Ok((segments, chain)))
+}
+
+/// Cross-check the SOS against the chain: component count, Ss/Se/Ah/Al and
+/// that every referenced Huffman table exists.
+fn jpeg_sos_check(
+    file: &mut File,
+    sos_abs: u64,
+    file_len: u64,
+    chain: &JpegChain,
+) -> io::Result<Result<(), String>> {
+    let Some(head) = salvage_read(file, sos_abs, 4, file_len)? else {
+        return Ok(Err(
+            "SOS vanishes before the chain could be checked".to_string()
+        ));
+    };
+    if head[0] != 0xFF || head[1] != 0xDA {
+        return Ok(Err("SOS marker mismatch".to_string()));
+    }
+    let length = u16::from_be_bytes([head[2], head[3]]) as usize;
+    if length < 6 {
+        return Ok(Err("SOS length is implausibly small".to_string()));
+    }
+    let Some(sos) = salvage_read(file, sos_abs, 2 + length, file_len)? else {
+        return Ok(Err("dump ends inside the SOS header".to_string()));
+    };
+    let count = sos[4] as usize;
+    if count == 0 || 6 + 2 * count != length {
+        return Ok(Err(
+            "SOS length does not match its component count".to_string()
+        ));
+    }
+    let base = 4 + 1 + 2 * count;
+    if base + 3 != sos.len() {
+        return Ok(Err("SOS header is malformed".to_string()));
+    }
+    let ss = sos[base];
+    let se = sos[base + 1];
+    let ah_al = sos[base + 2];
+    if ss != 0 || se != 63 || ah_al != 0 {
+        return Ok(Err(
+            "SOS is not a full baseline scan (Ss/Se/Ah/Al)".to_string()
+        ));
+    }
+    for k in 0..count {
+        let entry = 4 + 1 + 2 * k;
+        let cs = sos[entry];
+        let td_ta = sos[entry + 1];
+        let td = td_ta >> 4;
+        let ta = td_ta & 0x0F;
+        if !chain.sof_ids.contains(&cs) {
+            return Ok(Err(
+                "SOS references a component missing from the SOF".to_string()
+            ));
+        }
+        if td > 3 || ta > 3 {
+            return Ok(Err("SOS Huffman table id out of range".to_string()));
+        }
+        if !chain.dht_ids[td as usize] {
+            return Ok(Err(
+                "SOS DC table is not among the surviving DHT tables".to_string()
+            ));
+        }
+        if !chain.dht_ids[4 + ta as usize] {
+            return Ok(Err(
+                "SOS AC table is not among the surviving DHT tables".to_string()
+            ));
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// End-to-end post-check of a just-built JPEG: it must pass our own JPEG
+/// validator. The bytes are written to a temporary file (the validator
+/// needs a `File`), validated, then removed.
+fn check_carved_jpeg_bytes(bytes: &[u8]) -> io::Result<CarvedCheck> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = std::env::temp_dir().join(format!(
+        "bxmap-jpeg-check-{}-{}.tmp",
+        std::process::id(),
+        unique
+    ));
+    std::fs::write(&temp, bytes)?;
+    let mut file = File::open(&temp)?;
+    let mut source = Source::new(&mut file, 0, bytes.len() as u64);
+    let verdict = carve_jpeg(&mut source);
+    std::fs::remove_file(&temp).ok();
+    Ok(match verdict? {
+        Verdict::Valid => CarvedCheck::Ok,
+        Verdict::Truncated(reason) | Verdict::Invalid(reason) => CarvedCheck::Rejected(reason),
+    })
+}
+
+/// Exact rebuild (ROADMAP 8.12.2): the head tables survive, so the file is
+/// deterministic. Returns `Ok(Err(reason))` when any step fails (the caller
+/// then falls back to the tail salvage) or `Err(io)` on real I/O failure.
+fn jpeg_exact_rebuild(
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+    covered: &[(u64, u64)],
+) -> io::Result<Result<JpegRebuilt, String>> {
+    let bail = |msg: &str| Ok(Err(msg.to_string()));
+    let prior_end = covered
+        .iter()
+        .filter(|&&(start, _)| start < position)
+        .map(|&(_, end)| end)
+        .max()
+        .unwrap_or(0);
+    let Some(run) = jpeg_stuffing_run(file, position, file_len, max_size, prior_end, 64)? else {
+        return bail("no stuffing-clean run behind the EOI");
+    };
+    if run.marker != 0xDA {
+        // SOS marker is the boundary; progressive scans stop there too and
+        // both are refused at the coding-process gate.
+        return bail("SOS marker did not survive; exact rebuild needs the whole SOS segment");
+    }
+    let Some(sos_abs) = run.violation else {
+        return bail("no SOS marker to anchor the rebuild");
+    };
+    let end = run.end;
+    let (segments, chain) = match jpeg_chain_segments(file, sos_abs, prior_end, file_len)? {
+        Ok(pair) => pair,
+        Err(reason) => return bail(&reason),
+    };
+    if let Err(reason) = jpeg_sos_check(file, sos_abs, file_len, &chain)? {
+        return bail(&reason);
+    }
+    let chain_start = segments.first().map(|&(start, _)| start).unwrap_or(sos_abs);
+    let mut bytes = Vec::with_capacity(((end - chain_start) as usize) + 2 + JFIF_APP0.len());
+    bytes.extend_from_slice(&[0xFF, 0xD8]);
+    bytes.extend_from_slice(&JFIF_APP0);
+    for &(segment_start, segment_end) in &segments {
+        let segment = salvage_read(
+            file,
+            segment_start,
+            (segment_end - segment_start) as usize,
+            file_len,
+        )?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "chain segment vanished mid-rebuild",
+            )
+        })?;
+        bytes.extend_from_slice(&segment);
+    }
+    let scan = salvage_read(file, sos_abs, (end - sos_abs) as usize, file_len)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "scan vanished mid-rebuild"))?;
+    bytes.extend_from_slice(&scan);
+    // Post-check 1: own JPEG validator on the rebuilt bytes.
+    match check_carved_jpeg_bytes(&bytes)? {
+        CarvedCheck::Ok => {}
+        CarvedCheck::Rejected(reason) => {
+            return bail(&format!("rebuilt file fails own validator: {reason}"));
+        }
+    }
+    // Post-check 2: MCU walker — the scan must decode to exactly
+    // `cols x rows` MCUs and end with <= 7 padding bits of 1s.
+    let stats = match crate::jpeg_scan::verify_scan(&bytes) {
+        Ok(stats) => stats,
+        Err(error) => return bail(&format!("MCU walk failed: {error}")),
+    };
+    let sha256 = {
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hex(&hasher.finalize())
+    };
+    let entropy = {
+        let mut counts = [0u64; 256];
+        for &byte in &bytes {
+            counts[byte as usize] += 1;
+        }
+        entropy(&counts, bytes.len() as u64)
+    };
+    let trailer = jpeg_trailer(file, end, file_len)?;
+    let notes = format!(
+        "rebuild: JPEG scan at {sos_abs:#x}; tables exact; {}x{}; EXIF/APP lost; {} MCUs; built from stuffing-clean run",
+        chain.width,
+        chain.height,
+        stats.mcus,
+    );
+    Ok(Ok(JpegRebuilt {
+        bytes,
+        scan_start: sos_abs,
+        chain_start,
+        chain_end: end,
+        sha256,
+        entropy,
+        notes,
         trailer,
     }))
 }
@@ -10488,6 +11112,89 @@ mod tests {
         assert!(tail.notes.contains("3 chunk(s)"), "{}", tail.notes);
         assert_eq!(tail.offset, 32 + ruined as u64);
         assert_eq!(tail.size, (png.len() - ruined) as u64);
+    }
+
+    /// 8.12.2: ruin only the head of a real baseline JPEG (SOI + APP0);
+    /// the DQT/SOF/DHT chain and the entropy-coded scan survive. The
+    /// rebuilt file must pass the own validator and the MCU walker, land in
+    /// the main folder with role `Rebuilt`, and decode to exactly cols x rows
+    /// MCUs.
+    #[test]
+    fn rebuild_restores_a_jpeg_with_a_ruined_head() {
+        const RGB: &[u8] = include_bytes!("../tests/fixtures/baseline_160x120_q75.jpg");
+        // Overwrite SOI + APP0 only; the table chain starts at 0x14.
+        let mut dump = vec![0x41u8; 18];
+        dump.extend_from_slice(&RGB[18..]);
+        let path = write_dump("jpeg-exact-rebuild", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let out_dir = root.join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Jpeg],
+            min_size: 1,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        let rebuilt = report
+            .files
+            .iter()
+            .find(|file| file.kind == CarveKind::Jpeg)
+            .expect("the JPEG must be recovered");
+        assert_eq!(rebuilt.role, CarveRole::Rebuilt, "{rebuilt:?}");
+        assert!(rebuilt.complete);
+        assert_eq!(rebuilt.tier, 1);
+        assert_eq!(rebuilt.confidence, CarveConfidence::High);
+        assert!(rebuilt.evidence.contains(&"tables_exact"), "{rebuilt:?}");
+        assert!(rebuilt.evidence.contains(&"mcu_walk_ok"), "{rebuilt:?}");
+        let carved = rebuilt.path.as_ref().expect("a file in the main folder");
+        assert_eq!(carved.parent().unwrap(), out_dir);
+        assert!(
+            carved.to_string_lossy().ends_with(".jpg.rebuilt.carved"),
+            "{carved:?}"
+        );
+        let bytes = std::fs::read(carved).unwrap();
+        assert_eq!(&bytes[0..2], &[0xFF, 0xD8]);
+        assert!(bytes.starts_with(&[0xFF, 0xD8, 0xFF, 0xE0]), "SOI + APP0");
+        let stats = crate::jpeg_scan::verify_scan(&bytes).expect("rebuilt scan must decode");
+        assert_eq!(stats.mcus, 10 * 8);
+        assert!(
+            !bytes.windows(6).any(|window| window == [0x41u8; 6]),
+            "the ruined head must not be carried over"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// When the damage also destroys the table chain, the rebuild must
+    /// refuse; nothing with role `Rebuilt` may be emitted.
+    #[test]
+    fn rebuild_refuses_a_fully_destroyed_chain() {
+        const RGB: &[u8] = include_bytes!("../tests/fixtures/baseline_160x120_q75.jpg");
+        // Destroy the first 512 bytes: APP0, both DQTs and the SOF are all
+        // gone. The scan and the EOI survive.
+        let mut dump = vec![0x41u8; 512];
+        dump.extend_from_slice(&RGB[512..]);
+        let path = write_dump("jpeg-chain-destroyed", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let out_dir = root.join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Jpeg],
+            min_size: 1,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|file| file.role != CarveRole::Rebuilt),
+            "{report:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A stuffing-clean pseudo-random scan: bytes from `pseudo_random`
