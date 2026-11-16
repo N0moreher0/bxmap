@@ -2377,8 +2377,8 @@ fn golden_carve_recovers_a_pdf_tail_after_partial_encryption() {
     assert_eq!(partial, 1, "the salvaged tail belongs in partial/");
 }
 
-/// Minimal MP4: `ftyp` + `mdat` (two 4 KiB chunks of synthetic video data)
-/// + `moov` with a single avc1 track. Returns (bytes, moov_offset,
+/// Minimal MP4: `ftyp`, `mdat` (two 4 KiB chunks of synthetic video data)
+/// and `moov` with a single avc1 track. Returns (bytes, moov_offset,
 /// moov_len). Mirrors the lib fixture; the rebuild path never sees the
 /// header once it is ruined.
 fn mp4_with_moov() -> (Vec<u8>, usize, usize) {

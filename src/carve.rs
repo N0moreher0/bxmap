@@ -149,6 +149,7 @@ impl CarveConfidence {
 /// * tier 2: header valid but the structure stops early, or a tail found from
 ///   its footer (head missing);
 /// * tier 3: no structural evidence, only readable text.
+///
 /// Attach the partial-encryption hint to the evidence list when present.
 fn with_suspect(
     mut evidence: Vec<&'static str>,
@@ -9963,7 +9964,7 @@ mod tests {
             bmp.extend_from_slice(&vec![0u8; SPIKE_WINDOW * 3]);
             bmp.extend_from_slice(&pseudo_random(SPIKE_WINDOW, 0x1234_5678 + window as u64));
         }
-        assert_eq!(bmp.len(), size as usize);
+        assert_eq!(bmp.len(), size);
 
         let path = write_dump("periodic-bmp", &bmp);
         let report = Carver::new(CarveOptions::default())
@@ -11541,7 +11542,7 @@ mod evidence_tests {
         mask[17] = true;
         assert_eq!(detect_periodic_high(&mask), None);
         // Not enough windows for 8 full cycles of any period.
-        assert_eq!(detect_periodic_high(&vec![true, false, true, false]), None);
+        assert_eq!(detect_periodic_high(&[true, false, true, false]), None);
         // No bucket reaches the 80% hot threshold for any period:
         // high windows at scattered indices with no common residue class.
         let mut mask = vec![false; 64];
