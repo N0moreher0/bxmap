@@ -228,7 +228,8 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   Each record has `offset`, `offset_hex`, `type`, `size`, `sha256`, `entropy`,
   `complete`, `corrupted_offset`, `entropy_spike_at`, `partial_encryption`,
   `trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview`,
-  `notes`, `path`, and `duplicates`. For incomplete files `corrupted_offset`
+  `tracks_intact`, `notes`, `path`, and `duplicates`. For incomplete files
+  `corrupted_offset`
   is where structural validation stopped and `entropy_spike_at` is the first
   4 KiB window that jumps to >= 7.8 bits/byte after structured data (both
   `null` otherwise). `partial_encryption` is `null`, or an object
@@ -242,15 +243,29 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   64 bytes) are non-null only for `role: "rebuilt"` files: they describe
   the ransomware trailer that followed the original `moov` box, cut out of
   the rebuilt file (len capped at 1 MiB of the source remainder); every
-  other role gets `null`.
+  other role gets `null`. `tracks_intact` is `null` outside rebuilt MP4s,
+  and an array of per-video-track verdicts otherwise:
+  `{ "codec": "avc1", "samples": N, "intact": N, "intact_ratio": 0-1,
+  "broken_prefix_samples": N, "first_intact_sync_sample": N|null,
+  "first_intact_sync_time": seconds|null }`. The NAL oracle checks that
+  every NAL in the sample is exactly consumed - the encoder's own
+  guarantee, so an intact frame parses cleanly and an encrypted one almost
+  never does. `first_intact_sync_sample` comes from `stss` (absent table =
+  every sample counts as sync) and `first_intact_sync_time` from the
+  `mvhd` timescale + `stts` deltas. Audio tracks are not checked (no
+  oracle) and are absent from the array. `confidence` is `high` only when
+  every checked video track is 100% intact at dump offset 0, `low` when
+  nothing survived.
   Records also carry the evidence behind each file, so scripts do not have to
   parse the name: `file_name`, `ext` and `ext_source` (`kind`,
   `sniff:<rule>` or `fallback`), `role` (`whole`, `tail`, `reassembled`, `rebuilt`),
   `tier` (1 = structure validated to the terminator, 2 = header valid but
   incomplete or a footer-found tail, 3 = readable text only), `evidence` (the
   checks that back it: `magic`, `structure_ok`, `terminator_ok`,
-  `structure_partial`, `footer`, `text_ratio`, `sniff:<rule>`, and
-  `suspected-partial-encryption` when the periodic heuristic matched) and
+  `structure_partial`, `footer`, `text_ratio`, `sniff:<rule>`,
+  `suspected-partial-encryption` when the periodic heuristic matched,
+  `moov_ok`, `tables_cross_ok`, `chunk_range_ok` on rebuilt MP4s, and
+  `nal_oracle` when the NAL scan ran) and
   `confidence` (`high`, `medium`, `low`). `--report summary` adds the file
   count per tier and per extension, e.g. `(tier T1=3 T2=1; ext docx=3 png=1)`.
 - Incomplete files (`complete: false`) are always written into a `partial/`

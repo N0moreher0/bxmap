@@ -482,11 +482,11 @@ Bối cảnh: ransomware mã hoá một phần ghi đè phần đầu video, là
 - [x] Brand: mặc định `isom`/`mp42`; tuỳ chọn sau cho `.mov` (`qt  `) nếu nguồn cho biết đuôi gốc (không tự suy ra).
 - [x] **Trailer sau `moov`** (ID nạn nhân/chân ransomware): cắt khỏi file dựng, nhưng ghi vào index `trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview` (tối đa 64 byte, hex + ASCII) để analyst tra ID Ransomware / NoMoreRansom. Chỉ là dữ liệu trong dump, không lưu thành bí mật. (Cap 1 MiB cho phần trailer ghi index.)
 
-**8.11.4 Nhận biết khung còn nguyên (công cụ tham khảo không có)**
-- [ ] Track video AVC/HEVC (nhận từ `stsd`: `avc1/avc3/hvc1/hev1`; độ dài trường NAL từ `lengthSizeMinusOne` ở `avcC/hvcC`): mẫu hợp lệ nếu độ dài NAL đầu mẫu (big-endian) ≤ `sample_size − len_field` và byte header NAL có `forbidden_zero_bit = 0`, `nal_unit_type` hợp lệ. Dữ liệu đã mã hoá lọt qua kiểm tra này với xác suất rất thấp.
-- [ ] Kết quả: `intact_ratio` theo track, các dải mẫu nguyên/hỏng, `first_intact_sync_sample` (qua `stss`) kèm mốc thời gian; ví dụ "mẫu 0..N hỏng (~X MB đầu), từ mẫu N+1 nguyên". Audio (AAC...) không có oracle → ghi "không kiểm".
-- [ ] Đây là **heuristic có nhãn tin cậy**, không phán quyết. **Không dùng entropy** để phân biệt (video nén vốn ~7.9 bit/byte như đã chốt ở 8.8); oracle dựa trên cấu trúc.
-- [ ] Ý nghĩa thực tế: nếu chỉ phần đầu bị mã hoá thì phần sau có thể xem được; công cụ tham khảo chỉ nói chung chung là "khung vẫn mã hoá".
+**8.11.4 Nhận biết khung còn nguyên (công cụ tham khảo không có) · XONG (code 2026-11-16)**
+- [x] Track video AVC/HEVC (nhận từ `stsd`: `avc1/avc3/hvc1/hev1`; độ dài trường NAL từ `lengthSizeMinusOne` ở `avcC/hvcC`): mẫu hợp lệ nếu độ dài NAL đầu mẫu (big-endian) ≤ `sample_size − len_field` và byte header NAL có `forbidden_zero_bit = 0`, `nal_unit_type` hợp lệ. Dữ liệu đã mã hoá lọt qua kiểm tra này với xác suất rất thấp. (Codec lấy từ `stsd` entry đầu tiên; length size từ `avcC` byte 4 / `hvcC` byte 21 (`& 0x03 + 1`). Kiểm **toàn bộ** NAL trong mẫu: mọi NAL phải vừa khớp `stsz` tuyệt đối (cộng dồn đúng tới hết mẫu) — điều kiện mạnh nhất. AVC header: bit cấm = 0 + type ≠ 0; HEVC: bits 7,0 = 0.)
+- [x] Kết quả: `intact_ratio` theo track, các dải mẫu nguyên/hỏng, `first_intact_sync_sample` (qua `stss`) kèm mốc thời gian; ví dụ "mẫu 0..N hỏng (~X MB đầu), từ mẫu N+1 nguyên". Audio (AAC...) không có oracle → ghi "không kiểm". (`tracks_intact` trong index: `codec`, `samples`, `intact`, `intact_ratio`, `broken_prefix_samples`, `first_intact_sync_sample` (stss; không có bảng → mọi mẫu đều sync), `first_intact_sync_time` (mvhd timescale + stts deltas, giây). Notes ghi tóm tắt từng video track (`avc1 75.0% samples intact (from sample 3, t~2.00s)`); audio → note `no oracle`.)
+- [x] Đây là **heuristic có nhãn tin cậy**, không phán quyết. **Không dùng entropy** để phân biệt (video nén vốn ~7.9 bit/byte như đã chốt ở 8.8); oracle dựa trên cấu trúc. (Không có entropy nào tham gia; evidence `nal_oracle`; confidence high chỉ khi mọi video track 100% intact ở dump offset 0, low khi không mẫu nào nguyên.)
+- [x] Ý nghĩa thực tế: nếu chỉ phần đầu bị mã hoá thì phần sau có thể xem được; công cụ tham khảo chỉ nói chung chung là "khung vẫn mã hoá". (`broken_prefix_samples` cho biết chính xác dải đầu hỏng; sample đầu tiên nguyên + mốc thời gian qua `stss`/`mvhd` → analyst biết video xem được từ đâu.)
 
 **8.11.5 Bản chơi được từ khung nguyên đầu tiên · P2**
 - [ ] Tuỳ chọn ghi thêm bản cắt bảng mẫu bắt đầu từ sync sample nguyên đầu tiên (hoặc dùng `elst` bỏ đoạn đầu); luôn đi kèm bản dựng đầy đủ. Chỉ làm sau khi 8.11.1–8.11.4 vững; cần sửa `stts/stsc/stsz/stco/stss` nhất quán.
@@ -505,14 +505,16 @@ Bối cảnh: ransomware mã hoá một phần ghi đè phần đầu video, là
 - [x] Biến thể: `co64`; tràn u32 bằng test số học (không tạo 4 GB thật); `moov` bị mã hoá → từ chối rõ lý do; fragmented/`cmov` → từ chối + note. (Unit test promotion; parse lỗi → rejected_details có lý do, không panic.)
 - [x] Golden CLI cho `--carve mp4` trên dump tổng hợp (có padding hai đầu); đối chiếu bằng `ffprobe` nếu máy có (tuỳ chọn, không bắt buộc cho CI). (`golden_carve_mp4_rebuilds_a_ruined_head_and_records_the_trailer`: index role/rebuilt/size 8448/trailer_len 13/corrupted_offset 0/file_name .mp4.rebuilt.carved; file ghi ra parse đúng; ffprobe chưa chạy (không bắt buộc).)
 
+**Ghi chú thực hiện 8.11.4 (2026-11-16, sau khi M1–M3 xong):** refactor `parse_stbl_tables` (dùng chung bởi `analyze_stbl` và oracle; thêm `stss` parse ascending). Oracle đọc từng mẫu qua con trỏ file (mỗi mẫu realloc nhỏ); AVC/HEVC qua `avcC`/`hvcC`; mọi NAL phải vừa khớp `stsz` tuyệt đối. Tests: fixture `mp4_nal_fixture` (mvhd timescale 1000, stsc 2/chunk, stss tùy chọn) — broken-prefix + first intact sync (Some(3) @ t=2.0s với stss [1,3] và sample 1 hỏng), fully-intact → confidence High, không stss → mọi mẫu sync (Some(2) @ t=1.0s), mp4a → không oracle + note, unit `sample_nals_intact` (độ dài rác/header cấm/cắt ngắn/zero-length). Golden CLI: fixture có avcC → index `tracks_intact` + evidence `nal_oracle` (payload random → 0 intact, confidence low). Lib 217 pass.
+
 **Ghi chú thực hiện 8.11 (2026-11-16):** M1–M3 xong; **đầu vào 2026-11-16**: lib carve_mp4 **bug thật** được tìm thấy — box walker đi thiếu 8 byte (`skip(size - 8)` trong khi `peek_array` không tiêu thụ) khiến hầu hết MP4 hợp lệ bị ghi nhận `Truncated` (chỉ `carves_mp4_file` pass nhờ nhánh `size == 0`); đã sửa (`skip(size)`), kèm test validate đúng box boundary. `FTYP_BOX` 24 B (`isom` + minor 0 + compat `isom`,`mp42`) → shift=32 (hoặc 40 với largesize mdat), lệch so với phác 20 B/28 — ghi nhận rõ ở trên. Golden test `golden_carve_mp4_rebuilds_a_ruined_head_and_records_the_trailer` + lib tests hostile (`misordered chunk`, `mvex`, `stsz≠stts`, `stco overflow→co64`, `huge moov size`, `ruined head happy path`). **Chưa làm:** M4 (oracle NAL — `avcC`/`hvcC`, intact_ratio, `stss`, `first_intact_sync_sample`); M5 đã có HELP/README/CHANGELOG/golden; M6 (P2) chưa. Fuzz moov chưa chuyên biệt (unit hostile phủ phần lớn). Đối chiếu Lab 6 cho MP4 chưa đo (Lab 6 có thể không có video bị cắt đầu — không có hit `ftyp`).
 
 **8.11.9 Thứ tự làm**
 1. M1: parser `moov` + kiểm chéo bảng + fuzz (chưa ghi file).
 2. M2: dựng lại (shift, `co64`, trailer, kiểm sau cùng).
-3. M3: tìm đầu file từ `E`, tích hợp footer-first vào `--carve`, `CarveRole::Rebuilt`.
-4. M4: oracle NAL + trường index.
-5. M5: HELP/README/CHANGELOG/golden.
+3. M1→M3: xong 2026-11-16 (commit deac587).
+4. M4: oracle NAL + trường index — XONG 2026-11-16 (lib 217 pass, golden 112 pass).
+5. M5: HELP/README/CHANGELOG/golden — XONG 2026-11-16.
 6. M6 (P2): bản cắt từ khung nguyên đầu tiên.
 Độc lập với B2–B7 của 8.10 nhưng dùng `CarveRole` (B1, đã xong) và các trường index của B3.
 

@@ -2392,13 +2392,21 @@ fn mp4_with_moov() -> (Vec<u8>, usize, usize) {
         out.extend_from_slice(&body);
         out
     };
-    // stsd: one avc1 sample entry (32 bytes).
+    // stsd: one avc1 sample entry with an avcC configuration record, so
+    // the NAL oracle has something to work on.
+    let avcc_body: &[u8] = &[1, 100, 0, 30, 0xFF, 0xFE, 0xF2, 0x00];
+    let mut avcc = Vec::new();
+    avcc.extend_from_slice(&((8 + avcc_body.len()) as u32).to_be_bytes());
+    avcc.extend_from_slice(b"avcC");
+    avcc.extend_from_slice(avcc_body);
     let mut stsd = Vec::new();
     stsd.extend_from_slice(&u32be(0));
     stsd.extend_from_slice(&u32be(1));
-    stsd.extend_from_slice(&u32be(32));
-    stsd.extend_from_slice(b"avc1");
-    stsd.extend_from_slice(&[0u8; 24]);
+    let mut entry = Vec::new();
+    entry.extend_from_slice(&((8 + avcc.len()) as u32).to_be_bytes());
+    entry.extend_from_slice(b"avc1");
+    entry.extend_from_slice(&avcc);
+    stsd.extend_from_slice(&entry);
     // stts: 1 entry, 2 samples.
     let mut stts = Vec::new();
     stts.extend_from_slice(&u32be(0));
@@ -2490,11 +2498,20 @@ fn golden_carve_mp4_rebuilds_a_ruined_head_and_records_the_trailer() {
     assert!(records.contains(".mp4.rebuilt.carved\""), "{records}");
     assert!(records.contains("\"complete\":false"), "{records}");
     assert!(
-        records.contains("\"evidence\":[\"moov_ok\",\"tables_cross_ok\",\"chunk_range_ok\"]"),
+        records.contains(
+            "\"evidence\":[\"moov_ok\",\"tables_cross_ok\",\"chunk_range_ok\",\"nal_oracle\"]"
+        ),
         "{records}"
     );
-    // Shift 32 = ftyp (24) + mdat header (8); payload length 8224.
-    assert!(records.contains("\"size\":8448"), "{records}");
+    // The NAL oracle ran (payload is random, so no frame survives it).
+    assert!(
+        records.contains("\"tracks_intact\":[{\"codec\":\"avc1\""),
+        "{records}"
+    );
+    assert!(records.contains("\"intact\":0"), "{records}");
+    // Shift 32 = ftyp (24) + mdat header (8); payload length 8224; the
+    // avcC-carrying sample entry shrinks moov to 184 bytes.
+    assert!(records.contains("\"size\":8440"), "{records}");
     assert!(records.contains("\"trailer_len\":13"), "{records}");
     assert!(records.contains("VICTIM-ID-777"), "{records}");
     assert!(records.contains("\"corrupted_offset\":0"), "{records}");

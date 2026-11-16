@@ -28,6 +28,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview`
   (hex + ASCII, capped at 1 MiB; `null` for other roles). mp4 salvage
   runs inside `--carve` whenever a valid `moov` is found — no new flag.
+- **NAL validity oracle for rebuilt MP4s (ROADMAP 8.11.4, P1)**. Every
+  video track (AVC/HEVC: `avc1`/`avc3`/`hvc1`/`hev1`) is checked sample by
+  sample: each NAL must be exactly consumed, including the header byte's
+  forbidden zero bit — an intact frame passes, an encrypted one almost
+  never does, and a frame whose NALs add up to exactly `stsz` wins
+  overwhelmingly. `tracks_intact` in the index records `codec`, `samples`,
+  `intact`, `intact_ratio`, `broken_prefix_samples`,
+  `first_intact_sync_sample` (via `stss`; no table = all samples are sync)
+  and `first_intact_sync_time` (`mvhd` timescale + `stts` deltas, seconds).
+  Sample sizes still come from the moov (intact even for encrypted frames,
+  so the oracle needs no decode and no IDCT). Rebuilt files whose every
+  checked video track is 100% intact at dump offset 0 get
+  `confidence: high`; nothing surviving gets `low`; otherwise `medium`.
+  Audio tracks are not checked (no oracle) and the notes say so. Evidence
+  gains `nal_oracle`; the entropy-coded video bytes are never used as a
+  signal (video looks random either way).
 
 ### Fixed
 - **`carve_mp4` walked boxes 8 bytes short** (`skip(size - 8)` although

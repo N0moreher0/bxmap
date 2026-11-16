@@ -824,6 +824,9 @@ pub struct CarvedFile {
     pub trailer_len: Option<u64>,
     pub trailer_sha256: Option<String>,
     pub trailer_preview: Option<String>,
+    /// Per-track NAL oracle verdicts (ROADMAP 8.11.4); `None` outside
+    /// rebuilt MP4s and for tracks with no AVC/HEVC video codec.
+    pub tracks_intact: Option<Vec<TrackIntact>>,
     /// Extension carried before `.carved`: the kind's default, or a more
     /// specific one proven by the content sniff (ROADMAP 8.10.3).
     pub ext: String,
@@ -1212,6 +1215,7 @@ impl Carver {
                     trailer_len: None,
                     trailer_sha256: None,
                     trailer_preview: None,
+                    tracks_intact: None,
                     ext: choice.ext.to_string(),
                     ext_source: choice.source.to_string(),
                     role: CarveRole::Whole,
@@ -1424,10 +1428,32 @@ impl Carver {
                     };
                     by_hash.insert(sha256.clone(), report.files.len());
                     report.bytes_written += size;
-                    let (tier, evidence, confidence) =
+                    let (tier, mut evidence, mut confidence) =
                         evidence_for(CarveRole::Rebuilt, CarveKind::Mp4, false, "kind");
+                    // Confidence reflects the NAL oracle when it could check
+                    // a track: high only when every checked video track is
+                    // intact and the head sits at byte 0; low when no video
+                    // track survived at all.
+                    if !rebuilt.tracks_intact.is_empty() {
+                        evidence.push("nal_oracle");
+                        let all_intact = rebuilt
+                            .tracks_intact
+                            .iter()
+                            .all(|track| track.intact == track.samples);
+                        let any_intact = rebuilt.tracks_intact.iter().any(|track| track.intact > 0);
+                        if rebuilt.payload_start == 0 && all_intact {
+                            confidence = CarveConfidence::High;
+                        } else if !any_intact {
+                            confidence = CarveConfidence::Low;
+                        }
+                    }
                     let entropy_spike_at = None;
                     let partial_encryption = None;
+                    let tracks_intact = if rebuilt.tracks_intact.is_empty() {
+                        None
+                    } else {
+                        Some(rebuilt.tracks_intact)
+                    };
                     report.files.push(CarvedFile {
                         offset: rebuilt.payload_start,
                         kind: CarveKind::Mp4,
@@ -1445,6 +1471,7 @@ impl Carver {
                         trailer_len: rebuilt.trailer_len,
                         trailer_sha256: rebuilt.trailer_sha256,
                         trailer_preview: rebuilt.trailer_preview,
+                        tracks_intact,
                         ext: "mp4".to_string(),
                         ext_source: "kind".to_string(),
                         role: CarveRole::Rebuilt,
@@ -1567,6 +1594,7 @@ impl Carver {
                     trailer_len: None,
                     trailer_sha256: None,
                     trailer_preview: None,
+                    tracks_intact: None,
                     ext: kind.default_ext().to_string(),
                     ext_source: "kind".to_string(),
                     role: CarveRole::Tail,
@@ -1702,6 +1730,7 @@ impl Carver {
                 trailer_len: None,
                 trailer_sha256: None,
                 trailer_preview: None,
+                tracks_intact: None,
                 ext: CarveKind::Text.default_ext().to_string(),
                 ext_source: "kind".to_string(),
                 role: CarveRole::Whole,
@@ -1826,6 +1855,7 @@ impl Carver {
                     trailer_len: None,
                     trailer_sha256: None,
                     trailer_preview: None,
+                    tracks_intact: None,
                     ext: CarveKind::Bin.default_ext().to_string(),
                     ext_source: "kind".to_string(),
                     role: CarveRole::Whole,
@@ -3204,10 +3234,26 @@ impl<'a> ChunkOffsets<'a> {
     }
 }
 
-/// One `stbl` box, fully cross-checked against `stsz`/`stts` (8.11.1).
-/// Returns `E`, the highest end offset of any chunk (original-file
-/// coordinates).
-fn analyze_stbl(stbl: &MoovBox) -> Result<u64, String> {
+/// One `stbl` box, parsed and cross-checked (8.11.1). Raw tables are kept
+/// for the NAL oracle (8.11.4).
+struct StblTables<'a> {
+    /// Raw `stsd` box bytes: version/flags + entry_count + sample entries.
+    stsd: &'a [u8],
+    total_samples: u64,
+    /// `(sample_count, sample_delta)` pairs from `stts`.
+    stts: Vec<(u32, u32)>,
+    /// `(first_chunk, samples_per_chunk)` pairs from `stsc`.
+    stsc: Vec<(u32, u32)>,
+    sizes: SampleSizeCursor<'a>,
+    chunks: ChunkOffsets<'a>,
+    /// `stss` sample numbers (1-based, ascending), when the table exists.
+    stss: Option<Vec<u32>>,
+}
+
+/// Parse and fully cross-check one `stbl` (8.11.1): `stsd`, `stts`, `stsc`,
+/// `stsz`/`stz2`, `stco`/`co64`. Shared by [`analyze_stbl`] (rebuild) and
+/// the NAL oracle (8.11.4).
+fn parse_stbl_tables(stbl: &MoovBox) -> Result<StblTables<'_>, String> {
     let find = |typ: &[u8; 4]| stbl.children.iter().find(|child| &child.typ == typ);
 
     // stsd must exist and hold at least one sample entry.
@@ -3232,14 +3278,17 @@ fn analyze_stbl(stbl: &MoovBox) -> Result<u64, String> {
     if stts.data.len() != 8 + 8 * stts_entries as usize {
         return Err("stts size does not match its entry count".to_string());
     }
+    let mut stts_table: Vec<(u32, u32)> = Vec::with_capacity(stts_entries as usize);
     let mut total_samples = 0u64;
     for index in 0..stts_entries {
         let base = 8 + index as usize * 8;
-        let count = u32::from_be_bytes(stts.data[base..base + 4].try_into().unwrap()) as u64;
-        total_samples += count;
+        let count = u32::from_be_bytes(stts.data[base..base + 4].try_into().unwrap());
+        let delta = u32::from_be_bytes(stts.data[base + 4..base + 8].try_into().unwrap());
+        total_samples += u64::from(count);
         if total_samples > MAX_SAMPLES {
             return Err("track has too many samples".to_string());
         }
+        stts_table.push((count, delta));
     }
 
     // stsc: (first_chunk, samples_per_chunk) pairs, strictly increasing.
@@ -3277,7 +3326,7 @@ fn analyze_stbl(stbl: &MoovBox) -> Result<u64, String> {
     // stsz or stz2: one of them, exactly.
     let stsz = find(b"stsz");
     let stz2 = find(b"stz2");
-    let mut sizes = match (stsz, stz2) {
+    let sizes = match (stsz, stz2) {
         (Some(stsz), None) => {
             if stsz.data.len() < 12 {
                 return Err("stsz truncated".to_string());
@@ -3393,31 +3442,81 @@ fn analyze_stbl(stbl: &MoovBox) -> Result<u64, String> {
         (None, None) => return Err("stbl has neither stco nor co64".to_string()),
     };
 
+    // stss: optional sync-sample table (ascending sample numbers, 1-based).
+    let stss = match find(b"stss") {
+        Some(stss_box) => {
+            if stss_box.data.len() < 8 {
+                return Err("stss truncated".to_string());
+            }
+            let count = u64::from(u32::from_be_bytes(stss_box.data[4..8].try_into().unwrap()));
+            if count > MAX_SAMPLES {
+                return Err("stss has too many entries".to_string());
+            }
+            if stss_box.data.len() != 8 + 4 * count as usize {
+                return Err("stss size does not match its entry count".to_string());
+            }
+            let mut table = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let base = 8 + index as usize * 4;
+                let sample = u32::from_be_bytes(stss_box.data[base..base + 4].try_into().unwrap());
+                if sample == 0 || u64::from(sample) > total_samples {
+                    return Err("stss sample number outside the track".to_string());
+                }
+                if let Some(&previous) = table.last() {
+                    if sample <= previous {
+                        return Err("stss sample numbers are not increasing".to_string());
+                    }
+                }
+                table.push(sample);
+            }
+            Some(table)
+        }
+        None => None,
+    };
+
+    Ok(StblTables {
+        stsd: &stsd.data,
+        total_samples,
+        stts: stts_table,
+        stsc: stsc_table,
+        sizes,
+        chunks: offsets,
+        stss,
+    })
+}
+
+/// One `stbl` box, fully cross-checked against `stsz`/`stts` (8.11.1).
+/// Returns `E`, the highest end offset of any chunk (original-file
+/// coordinates).
+fn analyze_stbl(stbl: &MoovBox) -> Result<u64, String> {
+    let mut tables = parse_stbl_tables(stbl)?;
+
     // Walk chunks in order, summing sample sizes into chunk lengths; every
     // offset must be non-decreasing and every sample must find its chunk.
     let mut e = 0u64;
     let mut sample_index = 0u64;
     let mut previous_offset = 0u64;
     let mut stsc_index = 0usize;
-    for chunk in 1..=offsets.count() {
-        while stsc_index + 1 < stsc_table.len() && u64::from(stsc_table[stsc_index + 1].0) <= chunk
+    for chunk in 1..=tables.chunks.count() {
+        while stsc_index + 1 < tables.stsc.len()
+            && u64::from(tables.stsc[stsc_index + 1].0) <= chunk
         {
             stsc_index += 1;
         }
-        let samples_in_chunk = u64::from(stsc_table[stsc_index].1);
-        let offset = offsets.get(chunk - 1)?;
+        let samples_in_chunk = u64::from(tables.stsc[stsc_index].1);
+        let offset = tables.chunks.get(chunk - 1)?;
         if offset < previous_offset {
             return Err("chunk offsets decrease inside a track".to_string());
         }
         previous_offset = offset;
         let mut chunk_len = 0u64;
         for _ in 0..samples_in_chunk {
-            chunk_len += sizes.next()?;
+            chunk_len += tables.sizes.next()?;
         }
         sample_index += samples_in_chunk;
         e = e.max(offset + chunk_len);
     }
-    if sample_index != total_samples {
+    if sample_index != tables.total_samples {
         return Err("chunk tables and stsz disagree on the sample count".to_string());
     }
     Ok(e)
@@ -3463,6 +3562,296 @@ fn analyze_moov(bytes: &[u8]) -> Result<(u64, usize), String> {
         return Err("moov has an implausible number of tracks".to_string());
     }
     Ok((e, tracks))
+}
+
+// --- NAL validity oracle (ROADMAP 8.11.4) -----------------------------------
+
+/// What the NAL scan learned about one video track. `None` for every role
+/// other than rebuilt MP4s; per-track details for video tracks with a
+/// usable configuration record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackIntact {
+    /// Fourcc of the first sample entry (`avc1`, `hvc1`...).
+    pub codec: String,
+    /// Total samples in the track.
+    pub samples: u64,
+    /// Samples whose NAL walk consumed the sample exactly.
+    pub intact: u64,
+    /// Fraction of intact samples (1.0 when the track has no samples).
+    pub intact_ratio: f64,
+    /// Consecutive broken samples from the start of the track.
+    pub broken_prefix: u64,
+    /// 1-based sample number of the first intact sync sample, if any.
+    pub first_intact_sync_sample: Option<u64>,
+    /// Seconds from the start of the track to the first intact sync sample
+    /// (mvhd timescale + stts deltas), when both are known.
+    pub first_intact_sync_time: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+enum NalKind {
+    Avc,
+    Hevc,
+}
+
+/// NAL header byte acceptance: AVC clears forbidden_zero_bit and the type is
+/// not `unspecified`; HEVC clears forbidden_zero_bit and reserved_zero_bit.
+fn valid_nal_header(byte: u8, kind: NalKind) -> bool {
+    match kind {
+        NalKind::Avc => (byte & 0x80) == 0 && (byte & 0x1f) != 0,
+        NalKind::Hevc => (byte & 0x81) == 0,
+    }
+}
+
+/// Walk the NALs of one sample. `true` when the NAL lengths consume the
+/// sample exactly (every header valid) — the encoder's own guarantee, so a
+/// "perfect" parse is overwhelming evidence the sample survived.
+fn sample_nals_intact(sample: &[u8], kind: NalKind, length_size: usize) -> bool {
+    let mut pos = 0usize;
+    while pos < sample.len() {
+        if pos + length_size > sample.len() {
+            return false;
+        }
+        let mut len = 0usize;
+        for &byte in &sample[pos..pos + length_size] {
+            len = (len << 8) | byte as usize;
+        }
+        pos += length_size;
+        if len == 0 || pos + len > sample.len() {
+            return false;
+        }
+        if !valid_nal_header(sample[pos], kind) {
+            return false;
+        }
+        pos += len;
+    }
+    pos == sample.len()
+}
+
+/// The NAL length-prefix size from `avcC`/`hvcC` inside a sample entry.
+fn nal_length_size(entry: &[u8], kind: NalKind) -> Option<u8> {
+    let mut pos = 8usize;
+    while pos + 8 <= entry.len() {
+        let size = u32::from_be_bytes(entry[pos..pos + 4].try_into().unwrap()) as usize;
+        let typ: &[u8] = &entry[pos + 4..pos + 8];
+        if size < 8 || pos + size > entry.len() {
+            return None;
+        }
+        if matches!(typ, b"avcC" | b"hvcC") {
+            let body = &entry[pos + 8..pos + size];
+            return match kind {
+                NalKind::Avc => body.get(4).map(|byte| (byte & 0x03) + 1),
+                NalKind::Hevc => body.get(21).map(|byte| (byte & 0x03) + 1),
+            };
+        }
+        pos += size;
+    }
+    None
+}
+
+/// First sample entry of an stsd plus its fourcc.
+fn first_sample_entry(stsd: &[u8]) -> Option<(&[u8], [u8; 4])> {
+    if stsd.len() < 16 {
+        return None;
+    }
+    let entry = &stsd[8..];
+    if entry.len() < 8 {
+        return None;
+    }
+    let codec: [u8; 4] = entry[4..8].try_into().unwrap();
+    Some((entry, codec))
+}
+
+fn find_box_tree<'a>(node: &'a MoovBox, want: &[u8; 4]) -> Option<&'a MoovBox> {
+    if &node.typ == want {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| find_box_tree(child, want))
+}
+
+/// `mvhd` timescale (ISO 14496-12: v0 at 12..16, v1 at 24..28).
+fn mvhd_timescale(mvhd: &MoovBox) -> Option<u32> {
+    let data = &mvhd.data;
+    let scale = if data.len() >= 20 && data[0] == 0 {
+        u32::from_be_bytes(data[12..16].try_into().unwrap())
+    } else if data.len() >= 28 && data[0] == 1 {
+        u32::from_be_bytes(data[24..28].try_into().unwrap())
+    } else {
+        return None;
+    };
+    (1..=10_000_000).contains(&scale).then_some(scale)
+}
+
+/// `stss` sample numbers are ascending (parse enforces it); membership with a
+/// moving cursor.
+struct StssCursor<'a> {
+    table: &'a [u32],
+    index: usize,
+}
+
+impl<'a> StssCursor<'a> {
+    fn is_sync(&mut self, sample: u64) -> bool {
+        while self.index < self.table.len() && u64::from(self.table[self.index]) < sample {
+            self.index += 1;
+        }
+        self.index < self.table.len() && u64::from(self.table[self.index]) == sample
+    }
+}
+
+/// Run the NAL scan over every track. Returns the video-track verdicts and
+/// note fragments for anything that could not be checked (audio, missing
+/// configuration, container trouble).
+fn nal_oracle(
+    file: &mut File,
+    payload_start: u64,
+    file_len: u64,
+    moov_bytes: &[u8],
+) -> (Vec<TrackIntact>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut notes = Vec::new();
+    let mut seen = 0u64;
+    let Ok((root, _)) = parse_mp4_box(moov_bytes, 0, moov_bytes.len(), 0, &mut seen) else {
+        return (out, notes);
+    };
+    let timescale = find_box_tree(&root, b"mvhd").and_then(mvhd_timescale);
+    if timescale.is_none() {
+        notes.push("mvhd missing: timestamps unavailable".to_string());
+    }
+    let mut stack: Vec<&MoovBox> = vec![&root];
+    while let Some(node) = stack.pop() {
+        if &node.typ == b"stbl" {
+            match nal_oracle_track(file, payload_start, file_len, node, timescale) {
+                Ok(verdict) => out.push(verdict),
+                Err(reason) => notes.push(reason),
+            }
+        }
+        stack.extend(node.children.iter());
+    }
+    (out, notes)
+}
+
+fn nal_oracle_track(
+    file: &mut File,
+    payload_start: u64,
+    file_len: u64,
+    stbl: &MoovBox,
+    timescale: Option<u32>,
+) -> Result<TrackIntact, String> {
+    let tables = parse_stbl_tables(stbl)?;
+    let (entry, codec) = first_sample_entry(tables.stsd)
+        .ok_or_else(|| "oracle: stsd sample entry not parseable".to_string())?;
+    let kind = match &codec {
+        b"avc1" | b"avc3" => NalKind::Avc,
+        b"hvc1" | b"hev1" => NalKind::Hevc,
+        other => {
+            return Err(format!(
+                "{} ({}): no oracle (not AVC/HEVC video)",
+                String::from_utf8_lossy(other),
+                String::from_utf8_lossy(other)
+            ))
+        }
+    };
+    let length_size = nal_length_size(entry, kind).ok_or_else(|| {
+        format!(
+            "{}: oracle unavailable (no avcC/hvcC configuration record)",
+            String::from_utf8_lossy(&codec)
+        )
+    })? as usize;
+
+    let total = tables.total_samples;
+    let mut intact = 0u64;
+    let mut broken_prefix = 0u64;
+    let mut in_prefix = true;
+    let mut first_intact_sync: Option<(u64, u64)> = None;
+    let mut sample_number = 0u64;
+    let mut time_units = 0u64;
+    let mut sizes = tables.sizes;
+    let mut stsc_index = 0usize;
+    let mut stts_index = 0usize;
+    let mut stts_left = tables
+        .stts
+        .first()
+        .map(|&(count, _)| u64::from(count))
+        .unwrap_or(0);
+    let mut stss_cursor = tables
+        .stss
+        .as_deref()
+        .map(|table| StssCursor { table, index: 0 });
+
+    for chunk in 1..=tables.chunks.count() {
+        while stsc_index + 1 < tables.stsc.len()
+            && u64::from(tables.stsc[stsc_index + 1].0) <= chunk
+        {
+            stsc_index += 1;
+        }
+        let samples_in_chunk = u64::from(tables.stsc[stsc_index].1);
+        let chunk_offset = tables.chunks.get(chunk - 1)?;
+        let mut offset = chunk_offset;
+        for _ in 0..samples_in_chunk {
+            let size = sizes.next()? as usize;
+            let sample_abs = payload_start + offset;
+            let ok = match salvage_read(file, sample_abs, size, file_len)
+                .map_err(|error| format!("oracle: read failed: {error}"))?
+            {
+                Some(bytes) => sample_nals_intact(&bytes, kind, length_size),
+                None => {
+                    return Err("oracle: sample extends past the payload".to_string());
+                }
+            };
+            sample_number += 1;
+            if ok {
+                intact += 1;
+                in_prefix = false;
+                let is_sync = match &mut stss_cursor {
+                    Some(cursor) => cursor.is_sync(sample_number),
+                    None => true,
+                };
+                if is_sync && first_intact_sync.is_none() {
+                    first_intact_sync = Some((sample_number, time_units));
+                }
+            } else if in_prefix {
+                broken_prefix += 1;
+            }
+            let delta = loop {
+                if stts_index >= tables.stts.len() {
+                    break 0u64;
+                }
+                if stts_left == 0 {
+                    stts_index += 1;
+                    stts_left = tables
+                        .stts
+                        .get(stts_index)
+                        .map(|&(count, _)| u64::from(count))
+                        .unwrap_or(0);
+                    continue;
+                }
+                stts_left -= 1;
+                break u64::from(tables.stts[stts_index].1);
+            };
+            time_units += delta;
+            offset += size as u64;
+        }
+    }
+
+    let intact_ratio = if total == 0 {
+        1.0
+    } else {
+        intact as f64 / total as f64
+    };
+    let first_intact_sync_sample = first_intact_sync.map(|(sample, _)| sample);
+    let first_intact_sync_time =
+        first_intact_sync.and_then(|(_, units)| timescale.map(|scale| units as f64 / scale as f64));
+    Ok(TrackIntact {
+        codec: String::from_utf8_lossy(&codec).into_owned(),
+        samples: total,
+        intact,
+        intact_ratio,
+        broken_prefix,
+        first_intact_sync_sample,
+        first_intact_sync_time,
+    })
 }
 
 /// Mark `stco` tables whose entries overflow 32 bits once `shift` is added;
@@ -3578,6 +3967,9 @@ struct RebuiltMp4 {
     trailer_sha256: Option<String>,
     trailer_preview: Option<String>,
     notes: String,
+    /// NAL oracle verdicts for the track(s) with an AVC/HEVC video codec
+    /// (8.11.4); empty when nothing could be checked.
+    tracks_intact: Vec<TrackIntact>,
 }
 
 /// The regenerated `ftyp` + `mdat` header bytes. `payload_len` picks the
@@ -3796,6 +4188,41 @@ fn mp4_rebuild(
         ));
     }
 
+    // NAL oracle (8.11.4): which frames survived?
+    let (tracks_intact, oracle_notes) = nal_oracle(file, payload_start, file_len, &moov_bytes);
+    for note in oracle_notes {
+        notes.push_str("; ");
+        notes.push_str(&note);
+    }
+    if !tracks_intact.is_empty() {
+        let summary = tracks_intact
+            .iter()
+            .map(|track| {
+                let ratio = if track.samples == 0 {
+                    100.0
+                } else {
+                    100.0 * track.intact as f64 / track.samples as f64
+                };
+                match track.first_intact_sync_sample {
+                    Some(sample) => {
+                        let at = track
+                            .first_intact_sync_time
+                            .map(|t| format!(", t~{t:.2}s"))
+                            .unwrap_or_default();
+                        format!(
+                            "{} {:.1}% samples intact (from sample {sample}{at})",
+                            track.codec, ratio
+                        )
+                    }
+                    None => format!("{} {:.1}% samples intact", track.codec, ratio),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        notes.push_str("; video: ");
+        notes.push_str(&summary);
+    }
+
     Ok(Ok(RebuiltMp4 {
         payload_start,
         payload_len,
@@ -3809,6 +4236,7 @@ fn mp4_rebuild(
         trailer_sha256: trailer_sha,
         trailer_preview,
         notes,
+        tracks_intact,
     }))
 }
 
@@ -7887,6 +8315,129 @@ mod tests {
         synthetic_mp4_with_stco((chunk1 as u32, chunk2 as u32), &[])
     }
 
+    /// One NAL sample: `[len][header][payload]`, len = 1 + payload.
+    fn nal_sample(header: u8, payload_len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload_len);
+        out.extend_from_slice(&((1 + payload_len) as u32).to_be_bytes());
+        out.push(header);
+        out.extend_from_slice(&vec![0x5A; payload_len]);
+        out
+    }
+
+    /// A minimal AVC/HEVC MP4 with `stss` and an mvhd (timescale 1000),
+    /// built from ready-made samples. One track, two chunks, two samples
+    /// per chunk. `codec` is `avc1` or `mp4a` (audio, no oracle).
+    fn mp4_nal_fixture(codec: &[u8; 4], frames: &[Vec<u8>], stss: Option<&[u32]>) -> Vec<u8> {
+        let payload_len: usize = frames.iter().map(Vec::len).sum();
+        let u32be = |value: u32| value.to_be_bytes().to_vec();
+        let bx = |typ: &[u8; 4], body: Vec<u8>| {
+            let mut out = Vec::with_capacity(8 + body.len());
+            out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+            out.extend_from_slice(typ);
+            out.extend_from_slice(&body);
+            out
+        };
+        let mut file = Vec::new();
+        file.extend_from_slice(FTYP_BOX); // 24 B
+        file.extend_from_slice(&((payload_len + 8) as u32).to_be_bytes());
+        file.extend_from_slice(b"mdat");
+        let payload_at = file.len();
+        for frame in frames {
+            file.extend_from_slice(frame);
+        }
+        // stsd: one avc1/mp4a sample entry with avcC inside it.
+        let avcc = bx(b"avcC", vec![1, 100, 0, 30, 0xFF, 0xFE, 0xF2, 0x00]);
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&((8 + avcc.len()) as u32).to_be_bytes());
+        entry.extend_from_slice(codec);
+        entry.extend_from_slice(&avcc);
+        let mut stsd = Vec::new();
+        stsd.extend_from_slice(&u32be(0));
+        stsd.extend_from_slice(&u32be(1)); // entry_count
+        stsd.extend_from_slice(&entry);
+        // stts: 1 entry, delta 1000 per sample.
+        let mut stts = Vec::new();
+        stts.extend_from_slice(&u32be(0));
+        stts.extend_from_slice(&u32be(1));
+        stts.extend_from_slice(&u32be(frames.len() as u32));
+        stts.extend_from_slice(&u32be(1000));
+        // stsc: one entry, two samples per chunk.
+        let mut stsc = Vec::new();
+        stsc.extend_from_slice(&u32be(0));
+        stsc.extend_from_slice(&u32be(1));
+        stsc.extend_from_slice(&u32be(1));
+        stsc.extend_from_slice(&u32be(2));
+        stsc.extend_from_slice(&u32be(1));
+        // stsz: per-sample sizes.
+        let mut stsz = Vec::new();
+        stsz.extend_from_slice(&u32be(0));
+        stsz.extend_from_slice(&u32be(0)); // variable sizes
+        stsz.extend_from_slice(&u32be(frames.len() as u32));
+        for frame in frames {
+            stsz.extend_from_slice(&u32be(frame.len() as u32));
+        }
+        // stco: two chunks.
+        let mut stco = Vec::new();
+        stco.extend_from_slice(&u32be(0));
+        stco.extend_from_slice(&u32be(2));
+        let per_chunk = 2usize;
+        let mut chunk_starts = Vec::new();
+        let mut running = payload_at;
+        for (index, frame) in frames.iter().enumerate() {
+            if index % per_chunk == 0 {
+                chunk_starts.push(running as u32);
+            }
+            running += frame.len();
+        }
+        stco.extend_from_slice(&u32be(chunk_starts[0]));
+        stco.extend_from_slice(&u32be(chunk_starts[1]));
+        // stss: sync table when asked.
+        let stss_box = stss.map(|table| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&u32be(0)); // version/flags
+            body.extend_from_slice(&u32be(table.len() as u32));
+            for &sample in table {
+                body.extend_from_slice(&u32be(sample));
+            }
+            bx(b"stss", body)
+        });
+        let stbl_body: Vec<u8> = [
+            bx(b"stsd", stsd),
+            bx(b"stts", stts),
+            bx(b"stsc", stsc),
+            bx(b"stsz", stsz),
+            bx(b"stco", stco),
+        ]
+        .into_iter()
+        .chain(stss_box)
+        .collect::<Vec<_>>()
+        .concat();
+        let stbl = bx(b"stbl", stbl_body);
+        let minf = bx(b"minf", stbl);
+        let mdia = bx(b"mdia", minf);
+        let trak = bx(b"trak", mdia);
+        // mvhd: timescale 1000.
+        let mut mvhd = Vec::new();
+        mvhd.extend_from_slice(&u32be(0)); // version/flags
+        mvhd.extend_from_slice(&u32be(0)); // creation
+        mvhd.extend_from_slice(&u32be(0)); // modification
+        mvhd.extend_from_slice(&u32be(1000)); // timescale
+        mvhd.extend_from_slice(&u32be(10_000)); // duration
+        mvhd.extend_from_slice(&u32be(0x0001_0000)); // rate
+        let moov = bx(b"moov", [bx(b"mvhd", mvhd), trak].concat());
+        file.extend_from_slice(&moov);
+        file
+    }
+
+    fn sample_frames() -> Vec<Vec<u8>> {
+        vec![
+            nal_sample(0x67, 15), // IDR
+            nal_sample(0x61, 15), // non-IDR
+            nal_sample(0x61, 15),
+            nal_sample(0x61, 15),
+        ]
+    }
+
     #[test]
     fn a_ruined_head_with_a_surviving_moov_rebuilds_the_container() {
         // The classic partial-encryption leftover for a phone video: ftyp and
@@ -7955,6 +8506,142 @@ mod tests {
         let _ = moov_offset;
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
         std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn the_nal_oracle_marks_the_broken_prefix_and_finds_the_first_intact_sync() {
+        // Sample 1 (the IDR) is corrupted: the NAL oracle must call it
+        // broken, keep the other 3, notice the broken prefix, and report
+        // sample 3 as the first intact sync sample (syncs are 1 and 3).
+        let mut frames = sample_frames();
+        frames[0][0] ^= 0xFF; // the NAL length MSB: an absurd length
+        let dump = mp4_nal_fixture(b"avc1", &frames, Some(&[1, 3]));
+        let path = write_dump("mp4-oracle-partial", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        let tracks = file.tracks_intact.as_ref().expect("oracle ran");
+        assert_eq!(tracks.len(), 1);
+        let track = &tracks[0];
+        assert_eq!(track.codec, "avc1");
+        assert_eq!(track.samples, 4);
+        assert_eq!(track.intact, 3);
+        assert_eq!(track.broken_prefix, 1);
+        assert!((track.intact_ratio - 0.75).abs() < 1e-9);
+        assert_eq!(track.first_intact_sync_sample, Some(3));
+        assert_eq!(track.first_intact_sync_time, Some(2.0)); // (1000+1000)/1000
+        assert!(file.evidence.contains(&"nal_oracle"));
+        assert_eq!(file.confidence, CarveConfidence::Medium);
+        assert!(file.notes.contains("avc1"), "{}", file.notes);
+        assert!(file.notes.contains("75.0%"), "{}", file.notes);
+    }
+
+    #[test]
+    fn a_fully_intact_track_scores_confidence_high() {
+        let dump = mp4_nal_fixture(b"avc1", &sample_frames(), Some(&[1, 3]));
+        let path = write_dump("mp4-oracle-intact", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        let tracks = file.tracks_intact.as_ref().expect("oracle ran");
+        assert_eq!(tracks[0].intact, 4);
+        assert_eq!(tracks[0].intact_ratio, 1.0);
+        assert_eq!(tracks[0].first_intact_sync_sample, Some(1));
+        assert_eq!(tracks[0].first_intact_sync_time, Some(0.0));
+        assert_eq!(file.confidence, CarveConfidence::High);
+    }
+
+    #[test]
+    fn the_first_sync_sample_is_found_without_an_stss_table() {
+        // stss missing: every sample counts as sync, so the first intact
+        // one after the broken prefix is sample 2.
+        let mut frames = sample_frames();
+        frames[0][0] ^= 0xFF;
+        let dump = mp4_nal_fixture(b"avc1", &frames, None);
+        let path = write_dump("mp4-oracle-no-stss", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let track = &report.files[0].tracks_intact.as_ref().unwrap()[0];
+        assert_eq!(track.broken_prefix, 1);
+        assert_eq!(track.first_intact_sync_sample, Some(2));
+        assert_eq!(track.first_intact_sync_time, Some(1.0)); // one delta before it
+    }
+
+    #[test]
+    fn an_audio_track_or_a_missing_configuration_record_skips_the_oracle() {
+        // mp4a: no AVC/HEVC codec, so nothing is checked and the notes say so.
+        let dump = mp4_nal_fixture(b"mp4a", &sample_frames(), None);
+        let path = write_dump("mp4-oracle-audio", &dump);
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .scan(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        let file = &report.files[0];
+        assert!(file.tracks_intact.is_none(), "{file:?}");
+        assert!(!file.evidence.contains(&"nal_oracle"));
+        assert!(file.notes.contains("no oracle"), "{}", file.notes);
+        assert_eq!(file.confidence, CarveConfidence::Medium);
+    }
+
+    #[test]
+    fn sample_nals_intact_rejects_garbage_lengths_and_headers() {
+        let good = nal_sample(0x67, 15);
+        assert!(sample_nals_intact(&good, NalKind::Avc, 4));
+        // Corrupted length: absurd, overruns the sample.
+        let mut bad_len = good.clone();
+        bad_len[0] = 0xFF;
+        assert!(!sample_nals_intact(&bad_len, NalKind::Avc, 4));
+        // NAL header with the forbidden bit set.
+        let mut bad_header = good.clone();
+        bad_header[4] = 0x80;
+        assert!(!sample_nals_intact(&bad_header, NalKind::Avc, 4));
+        // Truncated sample: length points past the end.
+        assert!(!sample_nals_intact(&good[..10], NalKind::Avc, 4));
+        // Zero-length NAL is rejected.
+        let mut zero_len = good.clone();
+        zero_len[0] = 0;
+        zero_len[1] = 0;
+        zero_len[2] = 0;
+        zero_len[3] = 0;
+        assert!(!sample_nals_intact(&zero_len, NalKind::Avc, 4));
     }
 
     #[test]
@@ -9411,6 +10098,7 @@ mod evidence_tests {
             trailer_len: None,
             trailer_sha256: None,
             trailer_preview: None,
+            tracks_intact: None,
             ext: ext.to_string(),
             ext_source: "kind".to_string(),
             role,

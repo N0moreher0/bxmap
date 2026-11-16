@@ -452,7 +452,15 @@ Recover structured files directly from a raw dump. The carver:
   an MP4 whose head was encrypted but whose `moov` survived is rebuilt with a
   fresh `ftyp`/`mdat` header (offsets shifted, `co64` promotion when needed)
   and named `.mp4.rebuilt.carved` — the frames that were encrypted are
-  garbage, the rest can play.
+  garbage, the rest can play. The rebuild also runs a **NAL oracle** per
+  video track (AVC/HEVC): each sample's NALs must be exactly consumed, so a
+  surviving frame parses cleanly and a broken one almost never does this.
+  The index records `tracks_intact` with `intact`, `intact_ratio`,
+  `broken_prefix_samples`, `first_intact_sync_sample` (via `stss`, absent =
+  all samples) and `first_intact_sync_time` (mvhd timescale + stts deltas),
+  plus `evidence: nal_oracle`; confidence is `high` only when every checked
+  video track is 100% intact at dump offset 0, `low` when nothing survived.
+  Audio tracks are not checked (no oracle) and the notes say so.
   `.carved` is always the last extension so nothing auto-executes or auto-opens.
   `ext` is a static string, never taken from the file.
 - Refines the extension from content (bounded sniff: ZIP central directory, OLE
