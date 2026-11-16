@@ -213,6 +213,13 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   moovs (`cmov`) are rejected with a reason. Rebuilt files are labelled
   `role: "rebuilt"`, land in `partial/` (`complete: false`), tier 2,
   `confidence: medium`, named `{offset:08x}-mp4-{sha8}.mp4.rebuilt.carved`.
+  When the NAL oracle finds a surviving sync sample, an edit-list cut is
+  written alongside it: `role: "cut"`, same payload and sample tables,
+  but each `trak` gains an `edts`→`elst` pair with `media_time` at the
+  first intact sync sample (`segment_duration` `0xFFFFFFFF`, rate 1.0) so
+  playback starts where the video is intact. Named
+  `{offset:08x}-mp4-{sha8}.mp4.cut.carved`, evidence gains `elst_cut`;
+  the full rebuilt file is always kept and no flag is needed.
   Tails are cut out and written to `partial/` with notes starting
   `salvage:tail`. A tail is walked back until the first high-entropy window
   (>= 7.8 bits/byte), a file already carved, or `--carve-max-size`.
@@ -240,10 +247,10 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   scores as high entropy. Fully structured and uniformly high (compressed or
   encrypted end to end) files produce `null`. `trailer_offset`,
   `trailer_len`, `trailer_sha256` and `trailer_preview` (hex + ASCII, max
-  64 bytes) are non-null only for `role: "rebuilt"` files: they describe
+  64 bytes) are non-null only for `role: "rebuilt"` and `role: "cut"` files: they describe
   the ransomware trailer that followed the original `moov` box, cut out of
   the rebuilt file (len capped at 1 MiB of the source remainder); every
-  other role gets `null`. `tracks_intact` is `null` outside rebuilt MP4s,
+  other role gets `null`. `tracks_intact` is `null` outside rebuilt/cut MP4s,
   and an array of per-video-track verdicts otherwise:
   `{ "codec": "avc1", "samples": N, "intact": N, "intact_ratio": 0-1,
   "broken_prefix_samples": N, "first_intact_sync_sample": N|null,
@@ -255,16 +262,24 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   `mvhd` timescale + `stts` deltas. Audio tracks are not checked (no
   oracle) and are absent from the array. `confidence` is `high` only when
   every checked video track is 100% intact at dump offset 0, `low` when
-  nothing survived.
+  nothing survived. When at least one video track has a surviving sync
+  sample, a `role: "cut"` sibling is written alongside the full rebuild
+  as `.mp4.cut.carved`: identical payload and sample tables, but every
+  `trak` carries an `edts` -> `elst` pair whose `media_time` (in each
+  track's `mdhd` timescale) starts presentation at the first intact
+  sync sample, so the encrypted head is never decoded.
+  `segment_duration` is `0xFFFFFFFF` (rest of the track) and rate is
+  1.0. Evidence gains `elst_cut`; the full rebuilt file is always kept
+  next to it, and no flag is needed.
   Records also carry the evidence behind each file, so scripts do not have to
   parse the name: `file_name`, `ext` and `ext_source` (`kind`,
-  `sniff:<rule>` or `fallback`), `role` (`whole`, `tail`, `reassembled`, `rebuilt`),
+  `sniff:<rule>` or `fallback`), `role` (`whole`, `tail`, `reassembled`, `rebuilt`, `cut`),
   `tier` (1 = structure validated to the terminator, 2 = header valid but
   incomplete or a footer-found tail, 3 = readable text only), `evidence` (the
   checks that back it: `magic`, `structure_ok`, `terminator_ok`,
   `structure_partial`, `footer`, `text_ratio`, `sniff:<rule>`,
   `suspected-partial-encryption` when the periodic heuristic matched,
-  `moov_ok`, `tables_cross_ok`, `chunk_range_ok` on rebuilt MP4s, and
+  `moov_ok`, `tables_cross_ok`, `chunk_range_ok` on rebuilt MP4s, `elst_cut` on cut MP4s, and
   `nal_oracle` when the NAL scan ran) and
   `confidence` (`high`, `medium`, `low`). `--report summary` adds the file
   count per tier and per extension, e.g. `(tier T1=3 T2=1; ext docx=3 png=1)`.

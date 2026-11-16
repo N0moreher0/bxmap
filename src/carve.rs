@@ -101,6 +101,12 @@ pub enum CarveRole {
     /// fresh `ftyp`/`mdat` headers, sample tables shifted. Frames in the
     /// still-encrypted head may be unusable.
     Rebuilt,
+    /// MP4 rebuilt like [`CarveRole::Rebuilt`] plus an edit list that
+    /// starts playback at the first intact sync sample (ROADMAP 8.11.5).
+    /// Same payload and sample tables; each `trak` gains an `edts`→`elst`
+    /// with `media_time` set to the first intact sync sample's time.
+    /// Emitted alongside the full rebuild, never instead of it.
+    Cut,
 }
 
 impl CarveRole {
@@ -111,6 +117,7 @@ impl CarveRole {
             CarveRole::Tail => "tail",
             CarveRole::Reassembled => "reassembled",
             CarveRole::Rebuilt => "rebuilt",
+            CarveRole::Cut => "cut",
         }
     }
 }
@@ -170,6 +177,13 @@ fn evidence_for(
             vec!["moov_ok", "tables_cross_ok", "chunk_range_ok"],
             CarveConfidence::Medium,
         ),
+        // Same checks plus the edit list that starts playback at the
+        // first intact sync sample.
+        CarveRole::Cut => (
+            2,
+            vec!["moov_ok", "tables_cross_ok", "chunk_range_ok", "elst_cut"],
+            CarveConfidence::Medium,
+        ),
         CarveRole::Whole if kind == CarveKind::Text => {
             (3, vec!["text_ratio"], CarveConfidence::Low)
         }
@@ -187,6 +201,138 @@ fn evidence_for(
             CarveConfidence::Medium,
         ),
     }
+}
+
+/// Writer for one rebuilt/cut MP4 variant (same payload, different
+/// `moov`): creates `partial/`, refuses to overwrite, streams the payload
+/// out of the dump. Returns the path.
+fn write_mp4_variant(
+    dump_path: &str,
+    payload_start: u64,
+    payload_len: u64,
+    moov: &[u8],
+    out_dir: &Path,
+    name: &str,
+) -> io::Result<PathBuf> {
+    let partial = out_dir.join("partial");
+    std::fs::create_dir_all(&partial)?;
+    let path = partial.join(name);
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to overwrite '{}'; use a fresh --carve-out",
+                path.display()
+            ),
+        ));
+    }
+    let mut source = File::open(dump_path)?;
+    let mut out = BufWriter::new(File::create(&path)?);
+    out.write_all(&rebuilt_header(payload_len))?;
+    stream_region(&mut source, payload_start, payload_len, |chunk| {
+        out.write_all(chunk)
+    })?;
+    out.write_all(moov)?;
+    out.flush()?;
+    Ok(path)
+}
+
+/// Result of the own-validator post-check on a just-written MP4 variant.
+enum CarvedCheck {
+    /// The file parses as a valid MP4; it may be handed out.
+    Ok,
+    /// The validator rejected it; the file has been deleted and the caller
+    /// records a rejection with this reason.
+    Rejected(String),
+}
+
+/// End-to-end post-check: the written file must pass our own MP4
+/// validator before we hand it out. On rejection the file is removed.
+fn check_carved_mp4(path: &Path) -> io::Result<CarvedCheck> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut check = Source::new(&mut file, 0, len);
+    Ok(match carve_mp4(&mut check)? {
+        Verdict::Valid => CarvedCheck::Ok,
+        Verdict::Truncated(reason) | Verdict::Invalid(reason) => {
+            std::fs::remove_file(path).ok();
+            CarvedCheck::Rejected(reason)
+        }
+    })
+}
+
+/// One record for a rebuilt/cut MP4 pair (ROADMAP 8.11.5): evidence,
+/// confidence, dedupe and the size/file-count limits. Returns `false`
+/// when a limit was reached (the caller stops the salvage pass).
+#[allow(clippy::too_many_arguments)]
+fn push_carved_mp4(
+    report: &mut CarveReport,
+    by_hash: &mut HashMap<String, usize>,
+    payload_start: u64,
+    size: u64,
+    sha256: String,
+    entropy: f64,
+    notes: String,
+    path: Option<PathBuf>,
+    role: CarveRole,
+    trailer: (Option<u64>, Option<u64>, Option<String>, Option<String>),
+    tracks_intact: &[TrackIntact],
+    max_files: usize,
+    max_total: u64,
+) -> bool {
+    by_hash.insert(sha256.clone(), report.files.len());
+    report.bytes_written += size;
+    let (tier, mut evidence, mut confidence) = evidence_for(role, CarveKind::Mp4, false, "kind");
+    // Confidence reflects the NAL oracle when it could check a track:
+    // high only when every checked video track is intact and the head sits
+    // at byte 0; low when nothing survived.
+    if !tracks_intact.is_empty() {
+        evidence.push("nal_oracle");
+        let all_intact = tracks_intact
+            .iter()
+            .all(|track| track.intact == track.samples);
+        let any_intact = tracks_intact.iter().any(|track| track.intact > 0);
+        if payload_start == 0 && all_intact {
+            confidence = CarveConfidence::High;
+        } else if !any_intact {
+            confidence = CarveConfidence::Low;
+        }
+    }
+    let tracks_intact = (!tracks_intact.is_empty()).then(|| tracks_intact.to_vec());
+    report.files.push(CarvedFile {
+        offset: payload_start,
+        kind: CarveKind::Mp4,
+        size,
+        complete: false,
+        sha256,
+        entropy,
+        notes,
+        path,
+        duplicates: Vec::new(),
+        corrupted_offset: Some(payload_start),
+        entropy_spike_at: None,
+        partial_encryption: None,
+        trailer_offset: trailer.0,
+        trailer_len: trailer.1,
+        trailer_sha256: trailer.2,
+        trailer_preview: trailer.3,
+        tracks_intact,
+        ext: "mp4".to_string(),
+        ext_source: "kind".to_string(),
+        role,
+        tier,
+        evidence,
+        confidence,
+    });
+    if max_files != 0 && report.files.len() >= max_files {
+        report.truncated = true;
+        return false;
+    }
+    if max_total != 0 && report.bytes_written >= max_total {
+        report.truncated = true;
+        return false;
+    }
+    true
 }
 
 /// Builds the one canonical output name: `{offset:08x}-{kind}-{sha8}.{ext}.carved`.
@@ -236,6 +382,12 @@ pub fn carved_file_name_with_ext(
         CarveRole::Rebuilt => {
             format!(
                 "{offset:08x}-{kind_id}-{}.{ext}.rebuilt.carved",
+                short_hash(sha256)
+            )
+        }
+        CarveRole::Cut => {
+            format!(
+                "{offset:08x}-{kind_id}-{}.{ext}.cut.carved",
                 short_hash(sha256)
             )
         }
@@ -1331,82 +1483,58 @@ impl Carver {
                     }
                     let sha256 = rebuilt.sha256.clone();
                     let entropy = rebuilt.entropy;
+                    let trailer = (
+                        rebuilt.trailer_offset,
+                        rebuilt.trailer_len,
+                        rebuilt.trailer_sha256.clone(),
+                        rebuilt.trailer_preview.clone(),
+                    );
                     covered.push((rebuilt.payload_start, moov_end));
-                    if let Some(&index) = by_hash.get(&sha256) {
+                    let rebuilt_duplicate = by_hash.get(&sha256).copied();
+                    if let Some(&index) = rebuilt_duplicate.as_ref() {
                         report.duplicates += 1;
                         report.duplicate_bytes += size;
                         report.files[index].duplicates.push(rebuilt.payload_start);
-                        continue;
                     }
-                    let path = match out_dir {
-                        Some(dir) => {
-                            // A rebuilt MP4 is incomplete by definition, so it
-                            // always goes beside the other partial files.
-                            let partial = dir.join("partial");
-                            if let Err(error) = std::fs::create_dir_all(&partial) {
-                                failure = Some(error);
-                                return false;
-                            }
-                            let name = carved_file_name_with_ext(
-                                rebuilt.payload_start,
-                                CarveKind::Mp4,
-                                "mp4",
-                                CarveRole::Rebuilt,
-                                &sha256,
-                            );
-                            let path = partial.join(name);
-                            if path.exists() {
-                                failure = Some(io::Error::new(
-                                    io::ErrorKind::AlreadyExists,
-                                    format!(
-                                        "refusing to overwrite '{}'; use a fresh --carve-out",
-                                        path.display()
-                                    ),
-                                ));
-                                return false;
-                            }
-                            let result = (|| -> io::Result<()> {
-                                let mut out = BufWriter::new(File::create(&path)?);
-                                out.write_all(&rebuilt_header(rebuilt.payload_len))?;
-                                stream_region(
-                                    &mut source,
+                    let path = match rebuilt_duplicate {
+                        Some(_) => None,
+                        None => match out_dir {
+                            Some(dir) => {
+                                // A rebuilt MP4 is incomplete by definition,
+                                // so it always goes beside the other
+                                // partial files.
+                                let name = carved_file_name_with_ext(
+                                    rebuilt.payload_start,
+                                    CarveKind::Mp4,
+                                    "mp4",
+                                    CarveRole::Rebuilt,
+                                    &sha256,
+                                );
+                                match write_mp4_variant(
+                                    dump_path,
                                     rebuilt.payload_start,
                                     rebuilt.payload_len,
-                                    |chunk| out.write_all(chunk),
-                                )?;
-                                out.write_all(&rebuilt.moov)?;
-                                out.flush()
-                            })();
-                            if let Err(error) = result {
-                                failure = Some(error);
-                                return false;
-                            }
-                            // End-to-end: the rebuilt file must pass our own
-                            // MP4 validator before we hand it out.
-                            let check = std::fs::File::open(&path).and_then(|mut file| {
-                                let len = file.metadata()?.len();
-                                let mut check = Source::new(&mut file, 0, len);
-                                match carve_mp4(&mut check) {
-                                    Ok(verdict) => Ok(verdict),
-                                    Err(error) => Err(error),
-                                }
-                            });
-                            match check {
-                                Ok(Verdict::Valid) => Some(path),
-                                Ok(Verdict::Truncated(reason)) => {
-                                    std::fs::remove_file(&path).ok();
-                                    report.rejected += 1;
-                                    if report.rejected_details.len() < 16 {
-                                        report.rejected_details.push(format!(
-                                            "{:#x} mp4: rebuilt file truncated at own validator: {reason}",
-                                            rebuilt.payload_start
-                                        ));
+                                    &rebuilt.moov,
+                                    dir,
+                                    &name,
+                                ) {
+                                    Ok(path) => Some(path),
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        return false;
                                     }
-                                    covered.pop();
-                                    continue;
                                 }
-                                Ok(Verdict::Invalid(reason)) => {
-                                    std::fs::remove_file(&path).ok();
+                            }
+                            None => None,
+                        },
+                    };
+                    if rebuilt_duplicate.is_none() {
+                        // End-to-end: the written file must pass our own MP4
+                        // validator before we hand it out.
+                        if let Some(path) = &path {
+                            match check_carved_mp4(path) {
+                                Ok(CarvedCheck::Ok) => {}
+                                Ok(CarvedCheck::Rejected(reason)) => {
                                     report.rejected += 1;
                                     if report.rejected_details.len() < 16 {
                                         report.rejected_details.push(format!(
@@ -1418,78 +1546,108 @@ impl Carver {
                                     continue;
                                 }
                                 Err(error) => {
-                                    std::fs::remove_file(&path).ok();
                                     failure = Some(error);
                                     return false;
                                 }
                             }
                         }
-                        None => None,
-                    };
-                    by_hash.insert(sha256.clone(), report.files.len());
-                    report.bytes_written += size;
-                    let (tier, mut evidence, mut confidence) =
-                        evidence_for(CarveRole::Rebuilt, CarveKind::Mp4, false, "kind");
-                    // Confidence reflects the NAL oracle when it could check
-                    // a track: high only when every checked video track is
-                    // intact and the head sits at byte 0; low when no video
-                    // track survived at all.
-                    if !rebuilt.tracks_intact.is_empty() {
-                        evidence.push("nal_oracle");
-                        let all_intact = rebuilt
-                            .tracks_intact
-                            .iter()
-                            .all(|track| track.intact == track.samples);
-                        let any_intact = rebuilt.tracks_intact.iter().any(|track| track.intact > 0);
-                        if rebuilt.payload_start == 0 && all_intact {
-                            confidence = CarveConfidence::High;
-                        } else if !any_intact {
-                            confidence = CarveConfidence::Low;
+                        if !push_carved_mp4(
+                            report,
+                            &mut by_hash,
+                            rebuilt.payload_start,
+                            size,
+                            sha256,
+                            entropy,
+                            rebuilt.notes.clone(),
+                            path,
+                            CarveRole::Rebuilt,
+                            trailer.clone(),
+                            &rebuilt.tracks_intact,
+                            self.options.max_files,
+                            self.options.max_total,
+                        ) {
+                            stop = true;
+                            return false;
                         }
                     }
-                    let entropy_spike_at = None;
-                    let partial_encryption = None;
-                    let tracks_intact = if rebuilt.tracks_intact.is_empty() {
-                        None
-                    } else {
-                        Some(rebuilt.tracks_intact)
-                    };
-                    report.files.push(CarvedFile {
-                        offset: rebuilt.payload_start,
-                        kind: CarveKind::Mp4,
-                        size,
-                        complete: false,
-                        sha256,
-                        entropy,
-                        notes: rebuilt.notes,
-                        path,
-                        duplicates: Vec::new(),
-                        corrupted_offset: Some(rebuilt.payload_start),
-                        entropy_spike_at,
-                        partial_encryption,
-                        trailer_offset: rebuilt.trailer_offset,
-                        trailer_len: rebuilt.trailer_len,
-                        trailer_sha256: rebuilt.trailer_sha256,
-                        trailer_preview: rebuilt.trailer_preview,
-                        tracks_intact,
-                        ext: "mp4".to_string(),
-                        ext_source: "kind".to_string(),
-                        role: CarveRole::Rebuilt,
-                        tier,
-                        evidence,
-                        confidence,
-                    });
 
-                    if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
-                        report.truncated = true;
-                        stop = true;
-                        return false;
-                    }
-                    if self.options.max_total != 0 && report.bytes_written >= self.options.max_total
-                    {
-                        report.truncated = true;
-                        stop = true;
-                        return false;
+                    // ROADMAP 8.11.5: the cut sibling — never instead of the
+                    // full rebuild. Same payload and tables; each track
+                    // gains an edit list so playback starts at the first
+                    // intact sync sample.
+                    if let Some(cut) = &rebuilt.cut {
+                        if let Some(&index) = by_hash.get(&cut.sha256) {
+                            report.duplicates += 1;
+                            report.duplicate_bytes += cut.len;
+                            report.files[index].duplicates.push(rebuilt.payload_start);
+                            continue;
+                        }
+                        let path = match out_dir {
+                            Some(dir) => {
+                                let name = carved_file_name_with_ext(
+                                    rebuilt.payload_start,
+                                    CarveKind::Mp4,
+                                    "mp4",
+                                    CarveRole::Cut,
+                                    &cut.sha256,
+                                );
+                                match write_mp4_variant(
+                                    dump_path,
+                                    rebuilt.payload_start,
+                                    rebuilt.payload_len,
+                                    &cut.moov,
+                                    dir,
+                                    &name,
+                                ) {
+                                    Ok(path) => Some(path),
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        return false;
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+                        let mut cut_ok = true;
+                        if let Some(path) = &path {
+                            match check_carved_mp4(path) {
+                                Ok(CarvedCheck::Ok) => {}
+                                Ok(CarvedCheck::Rejected(reason)) => {
+                                    report.rejected += 1;
+                                    if report.rejected_details.len() < 16 {
+                                        report.rejected_details.push(format!(
+                                            "{:#x} mp4: cut file invalid at own validator: {reason}",
+                                            rebuilt.payload_start
+                                        ));
+                                    }
+                                    cut_ok = false;
+                                }
+                                Err(error) => {
+                                    failure = Some(error);
+                                    return false;
+                                }
+                            }
+                        }
+                        if cut_ok
+                            && !push_carved_mp4(
+                                report,
+                                &mut by_hash,
+                                rebuilt.payload_start,
+                                cut.len,
+                                cut.sha256.clone(),
+                                cut.entropy,
+                                cut.notes.clone(),
+                                path,
+                                CarveRole::Cut,
+                                trailer,
+                                &rebuilt.tracks_intact,
+                                self.options.max_files,
+                                self.options.max_total,
+                            )
+                        {
+                            stop = true;
+                            return false;
+                        }
                     }
                     continue;
                 }
@@ -3024,6 +3182,7 @@ const MDAT_LARGE_THRESHOLD: u64 = u32::MAX as u64 - 8;
 
 /// One box in the `moov` tree. `children` is non-empty only for the
 /// container types the patcher understands.
+#[derive(Clone)]
 struct MoovBox {
     typ: [u8; 4],
     /// Raw box contents (without the 8- or 16-byte box header).
@@ -3854,6 +4013,99 @@ fn nal_oracle_track(
     })
 }
 
+// --- Cut from the first intact sync sample (ROADMAP 8.11.5) ----------------
+
+/// `mdhd` v0/v1: the track's media timescale and duration.
+fn mdhd_time_and_duration(mdhd: &MoovBox) -> Option<(u32, Option<u64>)> {
+    let d = &mdhd.data;
+    if d.len() >= 20 && d[0] == 0 {
+        let timescale = u32::from_be_bytes(d[12..16].try_into().unwrap());
+        let duration = u64::from(u32::from_be_bytes(d[16..20].try_into().unwrap()));
+        Some((timescale, Some(duration)))
+    } else if d.len() >= 32 && d[0] == 1 {
+        let timescale = u32::from_be_bytes(d[20..24].try_into().unwrap());
+        let duration = u64::from_be_bytes(d[24..32].try_into().unwrap());
+        Some((timescale, Some(duration)))
+    } else {
+        None
+    }
+}
+
+/// Build the cut `moov` (ROADMAP 8.11.5): the rebuilt box with an
+/// `edts`→`elst` pair inserted into every `trak` so playback starts at
+/// `t_seconds`. Sample tables are untouched — the head garbage is simply
+/// never presented — and the full rebuilt file is always kept alongside.
+/// Returns the serialized moov and the number of tracks that gained an
+/// edit list; `Ok(None)` when nothing can be cut (no `trak` with a usable
+/// `mdhd`, `t_seconds` rounds to zero media time, …).
+fn build_cut_moov(
+    rebuilt_root: &MoovBox,
+    shift: u64,
+    t_seconds: f64,
+) -> Result<Option<(Vec<u8>, usize)>, String> {
+    if !t_seconds.is_finite() || t_seconds <= 0.0 {
+        return Ok(None);
+    }
+    let mut tree = rebuilt_root.clone();
+    let mut patched = 0usize;
+    for child in &mut tree.children {
+        if &child.typ != b"trak" {
+            continue;
+        }
+        let Some((timescale, duration)) =
+            find_box_tree(child, b"mdhd").and_then(mdhd_time_and_duration)
+        else {
+            continue; // no usable mdhd: leave the track untouched
+        };
+        if timescale == 0 || timescale > 10_000_000 {
+            continue;
+        }
+        let media_time = (t_seconds * f64::from(timescale)).round();
+        // 0 = nothing to skip for this track; elst v0 `media_time` is a
+        // signed 32-bit field, so larger values stay out.
+        if !media_time.is_finite() || media_time < 1.0 || media_time > 2_147_483_647.0 {
+            continue;
+        }
+        let media_time = media_time as u64;
+        if let Some(limit) = duration {
+            if media_time > limit {
+                continue; // starts past the end of the track
+            }
+        }
+        let mut elst_body = Vec::with_capacity(20);
+        elst_body.extend_from_slice(&0u32.to_be_bytes()); // version/flags
+        elst_body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        elst_body.extend_from_slice(&u32::MAX.to_be_bytes()); // segment_duration: rest of the track
+        elst_body.extend_from_slice(&(media_time as u32).to_be_bytes()); // media_time
+        elst_body.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
+        let elst = MoovBox {
+            typ: *b"elst",
+            data: elst_body,
+            children: Vec::new(),
+            promote_to_co64: false,
+        };
+        let edts = MoovBox {
+            typ: *b"edts",
+            data: Vec::new(),
+            children: vec![elst],
+            promote_to_co64: false,
+        };
+        // Spec order inside `trak`: `tkhd`, `edts`?, `mdia`.
+        let at = child
+            .children
+            .iter()
+            .position(|node| &node.typ == b"tkhd")
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        child.children.insert(at, edts);
+        patched += 1;
+    }
+    if patched == 0 {
+        return Ok(None);
+    }
+    Ok(Some((serialize_moov(&tree, shift)?, patched)))
+}
+
 /// Mark `stco` tables whose entries overflow 32 bits once `shift` is added;
 /// those become `co64` on serialize. Returns how many tables were promoted.
 fn promote_overflowing_stco(node: &mut MoovBox, shift: u64) -> usize {
@@ -3970,6 +4222,25 @@ struct RebuiltMp4 {
     /// NAL oracle verdicts for the track(s) with an AVC/HEVC video codec
     /// (8.11.4); empty when nothing could be checked.
     tracks_intact: Vec<TrackIntact>,
+    /// ROADMAP 8.11.5: a sibling `moov` whose edit lists start playback at
+    /// the first intact sync sample; always written alongside the full
+    /// rebuild. `None` when there is nothing to skip.
+    cut: Option<CutMp4>,
+}
+
+/// The edit-list-cut sibling of a rebuilt MP4 (ROADMAP 8.11.5): same
+/// payload and sample tables, but every patched `trak` carries an
+/// `edts`→`elst` that starts presentation at the first intact sync
+/// sample, so the encrypted head is never presented.
+struct CutMp4 {
+    /// Serialized `moov` for the cut file.
+    moov: Vec<u8>,
+    /// Total size of the cut file.
+    len: u64,
+    sha256: String,
+    entropy: f64,
+    /// The rebuilt notes plus the cut suffix.
+    notes: String,
 }
 
 /// The regenerated `ftyp` + `mdat` header bytes. `payload_len` picks the
@@ -4112,26 +4383,78 @@ fn mp4_rebuild(
         Err(reason) => return Ok(Err(reason)),
     }
 
-    // Second pass over the dump: hash and entropy of the rebuilt bytes.
-    let header = rebuilt_header(payload_len);
-    let mut sha = Sha256::new();
-    let mut counts = [0u64; 256];
-    let mut total = 0u64;
-    let mut account = |bytes: &[u8]| {
-        sha.update(bytes);
-        for &byte in bytes {
-            counts[byte as usize] += 1;
+    // NAL oracle (8.11.4): which frames survived? Runs before the hash
+    // pass because the cut variant (8.11.5) is decided from its verdicts.
+    let (tracks_intact, oracle_notes) = nal_oracle(file, payload_start, file_len, &moov_bytes);
+
+    // ROADMAP 8.11.5: a cut `moov` beside the full rebuild. Playback
+    // starts at the earliest first-intact sync sample across checked
+    // video tracks; every track just gains an edit list. The full
+    // rebuilt file is always kept alongside.
+    let mut cut_reject_reason: Option<String> = None;
+    let cut_start = tracks_intact
+        .iter()
+        .filter_map(|track| track.first_intact_sync_time)
+        .fold(f64::INFINITY, f64::min);
+    let cut_moov = match build_cut_moov(&root, shift, cut_start) {
+        Ok(Some((bytes, patched))) => match analyze_moov(&bytes) {
+            Ok((e_cut, _)) if e_cut == shift + payload_len => Some((bytes, patched)),
+            Ok((e_cut, _)) => {
+                cut_reject_reason = Some(format!(
+                    "end offset {e_cut} != shift + payload after edit lists"
+                ));
+                None
+            }
+            Err(reason) => {
+                cut_reject_reason = Some(reason);
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(reason) => {
+            cut_reject_reason = Some(reason);
+            None
         }
-        total += bytes.len() as u64;
     };
-    account(&header);
-    stream_region(file, payload_start, payload_len, |chunk| {
-        account(chunk);
-        Ok(())
-    })?;
-    account(&moov_new);
+
+    // Second pass over the dump: hash and entropy of the rebuilt bytes.
+    // One pass feeds both the full rebuild and (when there is one) the cut.
+    let header = rebuilt_header(payload_len);
+    let want_cut = cut_moov.is_some();
+    let mut sha = Sha256::new();
+    let mut sha_cut = Sha256::new();
+    let mut counts = [0u64; 256];
+    let mut counts_cut = [0u64; 256];
+    let mut total = 0u64;
+    let mut total_cut = 0u64;
+    {
+        let mut account = |bytes: &[u8]| {
+            sha.update(bytes);
+            for &byte in bytes {
+                counts[byte as usize] += 1;
+            }
+            total += bytes.len() as u64;
+            if want_cut {
+                sha_cut.update(bytes);
+                for &byte in bytes {
+                    counts_cut[byte as usize] += 1;
+                }
+                total_cut += bytes.len() as u64;
+            }
+        };
+        account(&header);
+        stream_region(file, payload_start, payload_len, |chunk| {
+            account(chunk);
+            Ok(())
+        })?;
+    }
+    sha.update(&moov_new);
+    for &byte in &moov_new {
+        counts[byte as usize] += 1;
+    }
+    total += moov_new.len() as u64;
     let rebuilt_len = total;
-    let entropy = entropy(&counts, total);
+    let entropy_full = entropy(&counts, total);
 
     // Trailer after moov: whatever the ransomware appended. Recorded in the
     // index, cut out of the rebuilt file.
@@ -4188,8 +4511,11 @@ fn mp4_rebuild(
         ));
     }
 
-    // NAL oracle (8.11.4): which frames survived?
-    let (tracks_intact, oracle_notes) = nal_oracle(file, payload_start, file_len, &moov_bytes);
+    // The verdicts were computed before the hash pass (above).
+    if let Some(reason) = &cut_reject_reason {
+        notes.push_str("; cut rejected: ");
+        notes.push_str(reason);
+    }
     for note in oracle_notes {
         notes.push_str("; ");
         notes.push_str(&note);
@@ -4223,6 +4549,33 @@ fn mp4_rebuild(
         notes.push_str(&summary);
     }
 
+    // Assemble the cut record now that `notes` is final; drop it when it
+    // would push the pair past the size cap.
+    let cut = cut_moov.map(|(bytes, patched)| {
+        sha_cut.update(&bytes);
+        for &byte in &bytes {
+            counts_cut[byte as usize] += 1;
+        }
+        total_cut += bytes.len() as u64;
+        let cut_notes = format!(
+            "{notes}; cut: {patched} edit list(s), playback starts at the first intact sync sample (t~{cut_start:.2}s); full rebuilt file kept alongside"
+        );
+        CutMp4 {
+            moov: bytes,
+            len: total_cut,
+            sha256: hex(&sha_cut.finalize()),
+            entropy: entropy(&counts_cut, total_cut),
+            notes: cut_notes,
+        }
+    });
+    let cut = match cut {
+        Some(cut) if cut.len > max_size => {
+            notes.push_str("; cut dropped: exceeds --carve-max-size");
+            None
+        }
+        other => other,
+    };
+
     Ok(Ok(RebuiltMp4 {
         payload_start,
         payload_len,
@@ -4230,13 +4583,14 @@ fn mp4_rebuild(
         moov: moov_new,
         rebuilt_len,
         sha256: hex(&sha.finalize()),
-        entropy,
+        entropy: entropy_full,
         trailer_offset,
         trailer_len: trailer_len_out,
         trailer_sha256: trailer_sha,
         trailer_preview,
         notes,
         tracks_intact,
+        cut,
     }))
 }
 
@@ -8414,7 +8768,15 @@ mod tests {
         .concat();
         let stbl = bx(b"stbl", stbl_body);
         let minf = bx(b"minf", stbl);
-        let mdia = bx(b"mdia", minf);
+        // mdhd: v0, timescale 1000 (needed by the cut builder's elst).
+        let mut mdhd = Vec::new();
+        mdhd.extend_from_slice(&u32be(0)); // version/flags
+        mdhd.extend_from_slice(&u32be(0)); // creation
+        mdhd.extend_from_slice(&u32be(0)); // modification
+        mdhd.extend_from_slice(&u32be(1000)); // timescale
+        mdhd.extend_from_slice(&u32be(10_000)); // duration (10 s)
+        mdhd.extend_from_slice(&u32be(0)); // language + quality
+        let mdia = bx(b"mdia", [bx(b"mdhd", mdhd), minf].concat());
         let trak = bx(b"trak", mdia);
         // mvhd: timescale 1000.
         let mut mvhd = Vec::new();
@@ -8528,8 +8890,14 @@ mod tests {
             .unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
 
-        assert_eq!(report.files.len(), 1, "{report:?}");
-        let file = &report.files[0];
+        // The damaged first sample yields a first intact sync sample (3),
+        // so a cut sibling is emitted alongside the full rebuild.
+        assert_eq!(report.files.len(), 2, "{report:?}");
+        let file = report
+            .files
+            .iter()
+            .find(|file| file.role == CarveRole::Rebuilt)
+            .expect("rebuilt file present");
         let tracks = file.tracks_intact.as_ref().expect("oracle ran");
         assert_eq!(tracks.len(), 1);
         let track = &tracks[0];
@@ -8590,8 +8958,13 @@ mod tests {
             .unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
 
-        assert_eq!(report.files.len(), 1, "{report:?}");
-        let track = &report.files[0].tracks_intact.as_ref().unwrap()[0];
+        assert_eq!(report.files.len(), 2, "{report:?}");
+        let file = report
+            .files
+            .iter()
+            .find(|file| file.role == CarveRole::Rebuilt)
+            .expect("rebuilt file present");
+        let track = &file.tracks_intact.as_ref().unwrap()[0];
         assert_eq!(track.broken_prefix, 1);
         assert_eq!(track.first_intact_sync_sample, Some(2));
         assert_eq!(track.first_intact_sync_time, Some(1.0)); // one delta before it
@@ -8619,6 +8992,115 @@ mod tests {
         assert!(!file.evidence.contains(&"nal_oracle"));
         assert!(file.notes.contains("no oracle"), "{}", file.notes);
         assert_eq!(file.confidence, CarveConfidence::Medium);
+    }
+
+    #[test]
+    fn a_cut_mp4_is_written_alongside_the_rebuilt_one() {
+        // Sample 1 (the IDR) is damaged; the first intact sync sample is 3
+        // at t = 2.0 s. The cut variant must start playback there via an
+        // edit list; the full rebuild is kept alongside.
+        let mut frames = sample_frames();
+        frames[0][0] ^= 0xFF;
+        let dump = mp4_nal_fixture(b"avc1", &frames, Some(&[1, 3]));
+        let path = write_dump("mp4-cut", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let out_dir = root.join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+
+        let rebuilt = report
+            .files
+            .iter()
+            .find(|file| file.role == CarveRole::Rebuilt)
+            .expect("rebuilt file present");
+        let cut = report
+            .files
+            .iter()
+            .find(|file| file.role == CarveRole::Cut)
+            .expect("cut file present");
+        assert_eq!(report.files.len(), 2, "{report:?}");
+        assert_eq!(cut.offset, rebuilt.offset);
+        assert_ne!(cut.sha256, rebuilt.sha256);
+        assert_eq!(cut.tier, 2);
+        assert_eq!(cut.confidence, CarveConfidence::Medium);
+        assert!(cut.evidence.contains(&"nal_oracle"), "{cut:?}");
+        assert!(cut.evidence.contains(&"elst_cut"), "{cut:?}");
+        assert!(cut.evidence.contains(&"moov_ok"), "{cut:?}");
+        assert!(cut.notes.contains("cut:"), "{}", cut.notes);
+        assert_eq!(
+            cut.tracks_intact.as_ref().unwrap()[0].first_intact_sync_sample,
+            Some(3)
+        );
+        let cut_path = cut.path.clone().expect("cut file was written");
+        let rebuilt_path = rebuilt.path.clone().expect("rebuilt file was written");
+        assert!(rebuilt_path.is_file());
+        assert!(cut_path.is_file());
+        assert!(cut_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".mp4.cut.carved"));
+        assert_eq!(
+            cut_path.parent().unwrap(),
+            out_dir.join("partial").as_path()
+        );
+        assert_eq!(std::fs::metadata(&cut_path).unwrap().len(), cut.size);
+
+        // elst layout: [size 4]['elst' 4][v/f 4][count 4][seg 4][time 4][rate 4]
+        let bytes = std::fs::read(&cut_path).unwrap();
+        let edts = bytes
+            .windows(4)
+            .position(|window| window == b"edts")
+            .expect("edts box present");
+        let elst = bytes
+            .windows(4)
+            .position(|window| window == b"elst")
+            .expect("elst box present");
+        assert_eq!(elst, edts + 8, "elst box follows the edts header");
+        // [size]['elst'][v/f 4][count 4][seg 4][media_time 4][rate 4]
+        let segment_duration = u32::from_be_bytes(bytes[elst + 12..elst + 16].try_into().unwrap());
+        assert_eq!(segment_duration, u32::MAX, "rest of the track");
+        let media_time = u32::from_be_bytes(bytes[elst + 16..elst + 20].try_into().unwrap());
+        assert_eq!(media_time, 2000, "t = 2.0 s at a 1000 Hz mdhd");
+        let rate = u32::from_be_bytes(bytes[elst + 20..elst + 24].try_into().unwrap());
+        assert_eq!(rate, 0x0001_0000, "rate 1.0");
+
+        // The cut file must pass our own MP4 validator end to end.
+        let mut file = std::fs::File::open(&cut_path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let mut source = Source::new(&mut file, 0, len);
+        assert!(matches!(carve_mp4(&mut source).unwrap(), Verdict::Valid));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_fully_intact_mp4_gets_no_cut_sibling() {
+        // Everything intact and the first sync sample is sample 1 (t = 0):
+        // there is nothing to skip, so no cut is emitted.
+        let dump = mp4_nal_fixture(b"avc1", &sample_frames(), Some(&[1, 3]));
+        let path = write_dump("mp4-cut-skip", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let out_dir = root.join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Mp4],
+            min_size: 0,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(report.files.len(), 1, "{report:?}");
+        assert_eq!(report.files[0].role, CarveRole::Rebuilt);
     }
 
     #[test]

@@ -831,7 +831,11 @@ OPTIONS:
                           chunk offsets shifted (stco promoted to co64 when
                           entries would overflow 32 bits), giving
                           .mp4.rebuilt.carved in partial/ - the head is
-                          garbage, the rest can play. The trailer after moov
+                          garbage, the rest can play. When the NAL oracle
+                          finds a surviving sync sample, an edit-list cut
+                          is written alongside it as .mp4.cut.carved
+                          (presentation starts at that sample; the full
+                          rebuilt file is always kept). The trailer after moov
                           (e.g. a ransomware victim ID) is cut out and kept
                           in the index (trailer_offset/len/sha256/preview).
                           Tails are labelled salvage:tail, cut back to the
@@ -850,7 +854,8 @@ OPTIONS:
                           Output names are {offset:08x}-{kind}-{sha8}.{ext}.carved
                           (plaintext is .txt.carved, a salvaged tail without its
                           header is .{ext}.tail.carved, a rebuilt MP4 is
-                          .mp4.rebuilt.carved). .carved is always the
+                          .mp4.rebuilt.carved, its edit-list cut is
+                          .mp4.cut.carved). .carved is always the
                           last extension so a double-click cannot open or run
                           the file; to use one, strip the trailing .carved in
                           an isolated environment. Scripts should read `path`

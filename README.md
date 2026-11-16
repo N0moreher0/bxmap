@@ -460,7 +460,14 @@ Recover structured files directly from a raw dump. The carver:
   all samples) and `first_intact_sync_time` (mvhd timescale + stts deltas),
   plus `evidence: nal_oracle`; confidence is `high` only when every checked
   video track is 100% intact at dump offset 0, `low` when nothing survived.
-  Audio tracks are not checked (no oracle) and the notes say so.
+  Audio tracks are not checked (no oracle) and the notes say so. When at
+  least one video track has a surviving sync sample, an **edit-list cut**
+  is written alongside the full rebuild as `.mp4.cut.carved`: the same
+  payload and sample tables, but every `trak` gains an `edts`→`elst` so
+  playback starts at the first intact sync sample and the encrypted head
+  is never presented (`evidence: elst_cut`, index `role: "cut"`, tier 2).
+  Nothing is re-laid-out and no flag is needed — the cut always
+  accompanies the full rebuild, never replaces it.
   `.carved` is always the last extension so nothing auto-executes or auto-opens.
   `ext` is a static string, never taken from the file.
 - Refines the extension from content (bounded sniff: ZIP central directory, OLE

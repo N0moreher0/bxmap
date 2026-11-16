@@ -44,6 +44,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Audio tracks are not checked (no oracle) and the notes say so. Evidence
   gains `nal_oracle`; the entropy-coded video bytes are never used as a
   signal (video looks random either way).
+- **Edit-list cut alongside the full rebuild (ROADMAP 8.11.5, P2)**.
+  When the NAL oracle finds at least one surviving sync sample in a video
+  track, a sibling cut file is written next to the rebuilt one, named
+  `.mp4.cut.carved`. Same payload and sample tables (nothing is
+  re-laid-out, `stsz`/`stsc`/`stco`/`stts`/`stss` byte-identical, same
+  trailer cut rule); every `trak` gains an `edts`→`elst` pair (v0, one
+  entry: `segment_duration` `0xFFFFFFFF` = rest of the track,
+  `media_time` in each track's `mdhd` timescale set to the first intact
+  sync sample's time, rate 1.0). Playback starts where the video is
+  intact instead of at the damaged head. New `CarveRole::Cut` (index
+  `role: "cut"`), tier 2, confidence mirrors the rebuilt file (`high`
+  only when every checked video track is intact and the head sits at
+  dump offset 0), evidence gains `elst_cut`. Written automatically — no
+  new flag — and always paired with the full rebuilt file; skipped when
+  the oracle found nothing intact, when `t = 0` (nothing to skip), when
+  no `trak` has a usable `mdhd`, when the cut would exceed
+  `--carve-max-size`, or when the cut fails its own post-check (parse of
+  the new `moov` + own MP4 validator; then only the full rebuild ships).
+  Both files are hashed in a single pass; `tracks_intact`, trailer
+  fields and dedupe semantics match the rebuilt record.
 
 ### Fixed
 - **`carve_mp4` walked boxes 8 bytes short** (`skip(size - 8)` although
