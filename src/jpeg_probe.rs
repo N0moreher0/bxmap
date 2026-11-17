@@ -47,6 +47,8 @@
 
 use std::sync::OnceLock;
 
+use rayon::prelude::*;
+
 use crate::jpeg_donor::JpegDonor;
 use crate::jpeg_scan::{
     annex_k, walk_mcus, ComponentInfo, ComponentTables, ScanGeometry, WalkStats, MAX_MCUS,
@@ -386,21 +388,45 @@ fn probe_layout_with_tables(
     /// Minimum size of the frequent set before we trust it as a chain.
     const MIN_FREQ_POSITIONS: usize = 16;
     let window_bytes = unstuffed.len().min(PROBE_WINDOW_BYTES);
-    let mut anchors = 0usize;
-    let mut freq: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
-    for byte in 0..window_bytes {
-        for phase in 0..8usize {
-            let start_bit = byte * 8 + phase;
-            let stats = walk_mcus(unstuffed, &[], geometry, tables, start_bit, PROBE_MCUS);
-            if stats.err.is_some() || stats.mcus != PROBE_MCUS {
-                continue;
+    // Anchor sweeps are independent; sweep in parallel with per-worker
+    // frequency maps and merge (counts commute, so results are identical
+    // to the serial sweep, and `--threads`-style limits do not apply here).
+    let (anchors, freq) = (0..window_bytes)
+        .into_par_iter()
+        .map(|byte| {
+            let mut local_freq: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::with_capacity(256);
+            let mut local_anchors = 0usize;
+            for phase in 0..8usize {
+                let start_bit = byte * 8 + phase;
+                let stats = walk_mcus(
+                    unstuffed,
+                    &[],
+                    geometry,
+                    tables,
+                    start_bit,
+                    PROBE_MCUS,
+                    false,
+                );
+                if stats.err.is_some() || stats.mcus != PROBE_MCUS {
+                    continue;
+                }
+                local_anchors += 1;
+                for &pos in &stats.first_boundaries {
+                    *local_freq.entry(pos).or_default() += 1;
+                }
             }
-            anchors += 1;
-            for &pos in &stats.first_boundaries {
-                *freq.entry(pos).or_default() += 1;
-            }
-        }
-    }
+            (local_anchors, local_freq)
+        })
+        .reduce(
+            || (0usize, std::collections::HashMap::new()),
+            |(anchors_a, mut freq_a), (anchors_b, freq_b)| {
+                for (pos, count) in freq_b {
+                    *freq_a.entry(pos).or_default() += count;
+                }
+                (anchors_a + anchors_b, freq_a)
+            },
+        );
     if anchors < 2 {
         return (None, anchors > 0);
     }
@@ -415,27 +441,48 @@ fn probe_layout_with_tables(
     }
     let boundary = frequent[0];
     // Two independent chains must agree for ≥ 64 positions from the
-    // boundary (the spec's common-boundary evidence). Re-walk two
-    // anchors that contain the boundary — only needed for this layout.
-    let mut chain_a: Option<Vec<usize>> = None;
-    let mut chain_b: Option<Vec<usize>> = None;
-    'verify: for byte in 0..window_bytes {
-        for phase in 0..8usize {
-            let start_bit = byte * 8 + phase;
-            let stats = walk_mcus(unstuffed, &[], geometry, tables, start_bit, PROBE_MCUS);
-            if stats.err.is_some() || stats.mcus != PROBE_MCUS {
-                continue;
-            }
-            if stats.first_boundaries.binary_search(&boundary).is_ok() {
-                if chain_a.is_none() {
-                    chain_a = Some(stats.first_boundaries);
-                } else {
-                    chain_b = Some(stats.first_boundaries);
-                    break 'verify;
+    // boundary (the spec's common-boundary evidence). Sweep anchors in
+    // parallel (independent walks) and keep the first two chains that
+    // contain the boundary.
+    let chains: Vec<Vec<usize>> = (0..window_bytes)
+        .into_par_iter()
+        .map(|byte| {
+            let mut found: Vec<Vec<usize>> = Vec::new();
+            for phase in 0..8usize {
+                let start_bit = byte * 8 + phase;
+                let stats = walk_mcus(
+                    unstuffed,
+                    &[],
+                    geometry,
+                    tables,
+                    start_bit,
+                    PROBE_MCUS,
+                    false,
+                );
+                if stats.err.is_some() || stats.mcus != PROBE_MCUS {
+                    continue;
+                }
+                if stats.first_boundaries.binary_search(&boundary).is_ok() {
+                    found.push(stats.first_boundaries);
+                    if found.len() >= 2 {
+                        break;
+                    }
                 }
             }
-        }
-    }
+            found
+        })
+        .reduce(Vec::new, |mut merged, mut item| {
+            if merged.len() < 2 {
+                merged.append(&mut item);
+            }
+            merged
+        })
+        .into_iter()
+        .take(2)
+        .collect();
+    let mut chains = chains.into_iter();
+    let chain_a = chains.next();
+    let chain_b = chains.next();
     let (Some(chain_a), Some(chain_b)) = (chain_a, chain_b) else {
         return (None, true);
     };
@@ -690,7 +737,7 @@ fn estimate_candidate_with_context(
     // happened to have a marker shape; only markers at or past the kept
     // boundary belong to the real scan (a `DRI`-coded image, which is out
     // of scope for now: keep the plain Tail).
-    let walk = walk_mcus(unstuffed, &[], &geometry, &tables, boundary, MAX_MCUS);
+    let walk = walk_mcus(unstuffed, &[], &geometry, &tables, boundary, MAX_MCUS, true);
     let total_mcus = walk.mcus;
     if total_mcus < MIN_MCUS_FROM_BOUNDARY {
         return Err(EstimatedReject::TooFewMcus);
@@ -758,6 +805,7 @@ fn estimate_candidate_with_context(
         &tables,
         kept_start,
         rows.saturating_mul(cols),
+        false,
     );
     if kept_walk.err.is_some() || kept_walk.mcus != rows * cols {
         return Err(EstimatedReject::WalkerMismatch);
@@ -842,7 +890,7 @@ fn donor_direct_candidate(
     let geometry = donor.geometry();
     let tables = donor.tables();
     let cols = u64::from(donor.width) / mcu_width_px(layout_index);
-    let walk = walk_mcus(unstuffed, &[], &geometry, &tables, 0, MAX_MCUS);
+    let walk = walk_mcus(unstuffed, &[], &geometry, &tables, 0, MAX_MCUS, false);
     let total_mcus = walk.mcus;
     if total_mcus < MIN_MCUS_FROM_BOUNDARY {
         return None;
@@ -872,6 +920,7 @@ fn donor_direct_candidate(
         &tables,
         0,
         rows.saturating_mul(cols),
+        false,
     );
     if kept_walk.err.is_some() || kept_walk.mcus != rows * cols {
         return None;

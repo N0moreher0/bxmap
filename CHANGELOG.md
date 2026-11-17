@@ -6,6 +6,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **The 8.12.4 estimation probe is now parallel (ROADMAP 8.12.8a)**.
+  The bit-sync anchor sweep (16 KiB × 8 phases × 130k 64-MCU walks) and
+  the two-chain verification sweep run on rayon; the per-thread
+  frequency maps merge commutatively, so results are byte-identical to
+  the serial version (verified on the bench: 32/32 files identical,
+  SHA-256). `walk_mcus` gained a `collect_dc` switch — probe/kept walks
+  no longer record the luma DC series. Bench `--carve all` on the 412 MB
+  image: 72.55 s → 50.7 s (~30% faster); recovery 30/63 unchanged.
+  JPEG-only carve ~54 s; the entire remainder is the three ruined JPEGs
+  (~13–15 s each, within the 5–30 s target). 286 lib tests, 117 golden,
+  clippy `-D warnings`, fmt clean.
+
 - **Carved files are named with dots, not dashes (ROADMAP 8.10.14)**.
   `{offset:08x}-{kind}-{sha8}.{ext}.carved` is now
   `{offset:08x}.{kind}.{sha8}.{ext}.carved` (`00842000.pe.cb18a6c0.dll.carved`),

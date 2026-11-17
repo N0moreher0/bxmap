@@ -781,6 +781,7 @@ pub(crate) fn walk_mcus(
     tables: &[ComponentTables<'_>],
     start_bit: usize,
     limit_mcus: u64,
+    collect_dc: bool,
 ) -> WalkStats {
     let mut stat = WalkStats {
         mcus: 0,
@@ -788,7 +789,11 @@ pub(crate) fn walk_mcus(
         end_bit: start_bit.min(unstuffed.len() * 8),
         err: None,
         first_boundaries: Vec::with_capacity(limit_mcus.min(FIRST_BOUNDARIES_CAP as u64) as usize),
-        dc_luma: Vec::with_capacity(limit_mcus.min(DC_LUMA_CAP as u64) as usize),
+        dc_luma: if collect_dc {
+            Vec::with_capacity(limit_mcus.min(DC_LUMA_CAP as u64) as usize)
+        } else {
+            Vec::new()
+        },
         restarts_consumed: 0,
         geometry: geometry.clone(),
     };
@@ -862,7 +867,7 @@ pub(crate) fn walk_mcus(
                 };
                 dc_pred[index] = dc_pred[index].wrapping_add(diff);
                 // Component 0 is the luma plane in interleaved scans.
-                if index == 0 && stat.dc_luma.len() < DC_LUMA_CAP {
+                if index == 0 && collect_dc && stat.dc_luma.len() < DC_LUMA_CAP {
                     stat.dc_luma.push(dc_pred[index]);
                 }
                 stat.blocks += 1;
@@ -934,6 +939,7 @@ pub fn verify_scan(bytes: &[u8]) -> Result<WalkStats, WalkError> {
         &component_tables,
         0,
         total_mcus,
+        true,
     );
     if let Some(error) = stats.err {
         return Err(error);
@@ -1206,8 +1212,18 @@ mod tests {
             .collect();
         let annex = annex_k();
         let annex_refs = annex.for_components(&geometry);
-        let by_file = walk_mcus(&unstuffed, &restarts, &geometry, &file_refs, 0, MAX_MCUS);
-        let by_annex = walk_mcus(&unstuffed, &restarts, &geometry, &annex_refs, 0, MAX_MCUS);
+        let by_file = walk_mcus(
+            &unstuffed, &restarts, &geometry, &file_refs, 0, MAX_MCUS, true,
+        );
+        let by_annex = walk_mcus(
+            &unstuffed,
+            &restarts,
+            &geometry,
+            &annex_refs,
+            0,
+            MAX_MCUS,
+            true,
+        );
         assert_eq!(by_file.err, None);
         assert_eq!(by_annex.err, None);
         assert_eq!(by_file.mcus, by_annex.mcus);
@@ -1235,7 +1251,7 @@ mod tests {
                 ac: file_tables[4 + c.ta as usize].as_ref().unwrap(),
             })
             .collect();
-        let stats = walk_mcus(&unstuffed, &restarts, &geometry, &file_refs, 0, 10);
+        let stats = walk_mcus(&unstuffed, &restarts, &geometry, &file_refs, 0, 10, true);
         assert_eq!(stats.err, None);
         assert_eq!(stats.mcus, 10);
         assert_eq!(stats.first_boundaries.len(), 10);
@@ -1256,7 +1272,7 @@ mod tests {
             dc: &annex.dc_luma,
             ac: &annex.ac_luma,
         }]; // one component's worth for a 3-component scan
-        let stats = walk_mcus(&unstuffed, &restarts, &geometry, &refs, 0, MAX_MCUS);
+        let stats = walk_mcus(&unstuffed, &restarts, &geometry, &refs, 0, MAX_MCUS, false);
         assert!(stats.err.is_some());
     }
 
@@ -1277,7 +1293,7 @@ mod tests {
                 ac: file_tables[4 + c.ta as usize].as_ref().unwrap(),
             })
             .collect();
-        let stats = walk_mcus(&garbage, &[], &geometry, &refs, 0, MAX_MCUS);
+        let stats = walk_mcus(&garbage, &[], &geometry, &refs, 0, MAX_MCUS, false);
         assert!(stats.err.is_some() || stats.mcus > 0);
     }
 
