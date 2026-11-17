@@ -477,6 +477,12 @@ Nguyên tắc (giữ nguyên các ranh giới cũ):
 - [x] **Lab 6 (RAM dump)**: 18 sys (trước 15) — toàn bộ `sniff:pe/kernel-section`; 3 image kernel có INIT cũ bị gán `.dll` đã chuyển sang `.sys` đúng (`0x00bb8000`, `0x03a8c000`, `0x03b7e000`); 14 dll: 9 `sniff:pe/dll` + 5 `sniff:pe/user-delay`. Bench không đổi (không PE nào trong bench có INIT).
 - [x] Tests: **283 lib tests** (+4 qua fixture PE32+ dựng tay: `pe_layout` với sections/dirs tuỳ chọn — delay-load thắng NATIVE, INIT thắng DLL bit, exports loại nấc (3), BSS-style section vẫn ghi nhận tên); golden 117, clippy `-D warnings`, fmt clean.
 
+**8.10.14 Tên file carve đổi gạch nối thành dấu chấm (XONG 2026-11-17)**
+- [x] Chủ repo yêu cầu: tên cũ `{offset:08x}-{kind}-{sha8}.{ext}.carved` dùng `-` để ngăn cách phần offset/kind/hash; đổi mọi dấu `-` trong thân tên thành `.` (ví dụ `00842000-pe-cb18a6c0.dll.carved` → `00842000.pe.cb18a6c0.dll.carved`).
+- [x] Quy tắc mới (áp dụng **mọi** CarveKind, mọi vai trò): `{offset:08x}.{kind}.{sha8}.{ext}.carved`; `tail`: `…{ext}.tail.carved`; `rebuilt`: `…{ext}.rebuilt.carved`; `cut`: `…{ext}.cut.carved`; `reassembled` giữ token literal thay hash: `{offset:08x}.{kind}.reassembled.{ext}.carved`. `.carved` vẫn luôn là đuôi cuối cùng. Whitelist tên trong golden test siết còn `[a-z0-9.]` (bỏ `-`).
+- [x] Code: `carved_file_name_with_ext` (5 role) — không đụng chữ ký hàm; HELP `--carve-out`, doc comments; tests cập nhật theo tên mới. Index/NDJSON/bằng chứng/nhãn **không đổi**; `.scratch-enc` (bench artifacts) giữ nguyên tên cũ (phạm vi git-ignored, không rebuild).
+- [x] Docs: README gốc (2 chỗ), `cli/README.md` (ví dụ rebuilt/cut + mục naming), HELP. CHANGELOG thêm mục Changed; lịch sử 8.10.1/8.10.8/8.11.6 giữ nguyên (ghi đúng tại thời điểm quyết định). Bench chưa chạy lại — kỳ vọng không đổi vì harness chấm qua index/đường dẫn, không qua pattern gạch vs chấm.
+
 **8.11 Dựng lại container MP4/MOV khi đầu file bị mã hoá (`moov` còn sống) · P1 · M1–M6 XONG (code 2026-11-16)**
 
 Bối cảnh: ransomware mã hoá một phần ghi đè phần đầu video, làm mất `ftyp` và header `mdat`, nên carve header-first không thấy chữ ký. Nhưng `moov` (chỉ mục mẫu) của video quay từ điện thoại/camera thường nằm **cuối file** và còn nguyên; sau `moov` thường có một đoạn trailer (ID nạn nhân) do ransomware gắn. Đây là đúng chỗ 8.7.2 đã hoãn ("MP4 `moov` footer-first") vì thiếu quy tắc dừng theo cấu trúc; mục này cho quy tắc đó.
@@ -628,7 +634,7 @@ Nhiều ảnh máy ảnh/điện thoại đặt APP1 (EXIF + thumbnail, hàng ch
 - [ ] Ảnh có `RSTn` ít cần vì predictor reset mỗi interval. Tác động thực tế: ảnh thô có thể lệch sáng/màu rõ, nên mục này có thể được nâng ưu tiên nếu chủ repo muốn.
 
 **8.12.7 Đầu ra, đặt tên, CLI (khớp 8.10/8.11)**
-- [ ] `CarveRole::Rebuilt` dùng chung với 8.11 (mục nào làm trước thì thêm): `{offset:08x}-jpeg-{sha8}.jpg.rebuilt.carved`; `offset` là đầu chuỗi scan sống, không phải đầu file gốc. `Tail`: `.jpg.tail.carved`.
+- [ ] `CarveRole::Rebuilt` dùng chung với 8.11 (mục nào làm trước thì thêm): `{offset:08x}.jpeg.{sha8}.jpg.rebuilt.carved` (quy tắc tên 8.10.14); `offset` là đầu chuỗi scan sống, không phải đầu file gốc. `Tail`: `.jpg.tail.carved`.
 - [ ] Không thêm cờ kỹ thuật (nguyên tắc 8.7.6): chạy trong `--carve` / `--carve jpeg`; file lẻ cũng chạy.
 - [ ] `notes` mẫu: `rebuild: JPEG scan from stuffing-clean run [a..e); tables=annexk-assumed q90; 4:2:0; cols=250 (corr 0.87, seam 2.3x); rows kept 188; lost rows ~60 est; EXIF lost; colour cast possible`.
 

@@ -224,13 +224,13 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   `trailer_preview`, hex + ASCII). Fragmented MP4s (`mvex`) and compressed
   moovs (`cmov`) are rejected with a reason. Rebuilt files are labelled
   `role: "rebuilt"`, land in `partial/` (`complete: false`), tier 2,
-  `confidence: medium`, named `{offset:08x}-mp4-{sha8}.mp4.rebuilt.carved`.
+  `confidence: medium`, named `{offset:08x}.mp4.{sha8}.mp4.rebuilt.carved`.
   When the NAL oracle finds a surviving sync sample, an edit-list cut is
   written alongside it: `role: "cut"`, same payload and sample tables,
   but each `trak` gains an `edts`→`elst` pair with `media_time` at the
   first intact sync sample (`segment_duration` `0xFFFFFFFF`, rate 1.0) so
   playback starts where the video is intact. Named
-  `{offset:08x}-mp4-{sha8}.mp4.cut.carved`, evidence gains `elst_cut`;
+  `{offset:08x}.mp4.{sha8}.mp4.cut.carved`, evidence gains `elst_cut`;
   the full rebuilt file is always kept and no flag is needed.
   Tails are cut out and written to `partial/` with notes starting
   `salvage:tail`. A tail is walked back until the first high-entropy window
@@ -337,8 +337,8 @@ They may contain malicious code, exploits, or encrypted payloads. Treat every
 `.carved` file as untrusted: inspect in a sandbox/VM, never open on a host
 machine, and do not execute them.
 
-Carved files are named `{offset}-{kind}-{sha8}.{ext}.carved` (for example
-`0001a2b0-zip-9f3c1e2a.zip.carved`, `…exe.carved`); plaintext is `.txt.carved`, and a
+Carved files are named `{offset}.{kind}.{sha8}.{ext}.carved` (for example
+`0001a2b0.zip.9f3c1e2a.zip.carved`, `…exe.carved`); plaintext is `.txt.carved`, and a
 salvaged tail without its header is `.{ext}.tail.carved`. `.carved` is always the last
 extension so a double-click cannot open or run the file; to use one, remove the trailing
 `.carved` yourself, inside an isolated environment.

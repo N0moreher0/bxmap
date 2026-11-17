@@ -856,7 +856,7 @@ OPTIONS:
     --carve-out <dir>     Destination directory for carved files (default:
                           <input>.bxmap/carved). Existing files are never
                           overwritten.
-                          Output names are {offset:08x}-{kind}-{sha8}.{ext}.carved
+                          Output names are {offset:08x}.{kind}.{sha8}.{ext}.carved
                           (plaintext is .txt.carved, a salvaged tail without its
                           header is .{ext}.tail.carved, a rebuilt MP4 is
                           .mp4.rebuilt.carved, its edit-list cut is

@@ -379,13 +379,13 @@ fn push_carved_mp4(
     true
 }
 
-/// Builds the one canonical output name: `{offset:08x}-{kind}-{sha8}.{ext}.carved`.
+/// Builds the one canonical output name: `{offset:08x}.{kind}.{sha8}.{ext}.carved`.
 ///
 /// `.carved` is always the last extension so nothing auto-opens or runs the
 /// file; `ext` comes only from the static [`CarveKind::default_ext`] table,
 /// never from file contents, so the name cannot carry path separators or
 /// other surprises. A salvaged tail gets `.tail` (`...png.tail.carved`) and a
-/// reassembled file replaces the hash with `reassembled`.
+/// reassembled file carries the literal `reassembled` token in place of the hash.
 pub fn carved_file_name(offset: u64, kind: CarveKind, role: CarveRole, sha256: &str) -> String {
     carved_file_name_with_ext(offset, kind, kind.default_ext(), role, sha256)
 }
@@ -412,26 +412,26 @@ pub fn carved_file_name_with_ext(
     let kind_id = kind.as_str();
     match role {
         CarveRole::Whole => {
-            format!("{offset:08x}-{kind_id}-{}.{ext}.carved", short_hash(sha256))
+            format!("{offset:08x}.{kind_id}.{}.{ext}.carved", short_hash(sha256))
         }
         CarveRole::Tail => {
             format!(
-                "{offset:08x}-{kind_id}-{}.{ext}.tail.carved",
+                "{offset:08x}.{kind_id}.{}.{ext}.tail.carved",
                 short_hash(sha256)
             )
         }
         CarveRole::Reassembled => {
-            format!("{offset:08x}-{kind_id}-reassembled.{ext}.carved")
+            format!("{offset:08x}.{kind_id}.reassembled.{ext}.carved")
         }
         CarveRole::Rebuilt => {
             format!(
-                "{offset:08x}-{kind_id}-{}.{ext}.rebuilt.carved",
+                "{offset:08x}.{kind_id}.{}.{ext}.rebuilt.carved",
                 short_hash(sha256)
             )
         }
         CarveRole::Cut => {
             format!(
-                "{offset:08x}-{kind_id}-{}.{ext}.cut.carved",
+                "{offset:08x}.{kind_id}.{}.{ext}.cut.carved",
                 short_hash(sha256)
             )
         }
@@ -2769,7 +2769,7 @@ pub struct ReassemblyReport {
 /// Fragments are grouped by kind, sorted by VA (or file offset when no VA is
 /// known), and merged when their VA ranges are adjacent (within one 4 KiB
 /// page to tolerate small capture gaps). Each merged group is written as one
-/// `.carved` file named `{va:08x}-{kind}-reassembled.{ext}.carved`.
+/// `.carved` file named `{va:08x}.{kind}.reassembled.{ext}.carved`.
 pub fn reassemble_fragments(
     fragments: &[CarveFragment],
     dump_path: &str,
@@ -4669,7 +4669,7 @@ struct JpegRebuilt {
     /// up to and including the `FF D9`.
     bytes: Vec<u8>,
     /// Dump offset of the surviving `SOS` marker — the naming offset per
-    /// ROADMAP 8.12.7 (`...-jpeg-<hash>.jpg.rebuilt.carved`).
+    /// ROADMAP 8.12.7 (`...jpeg.<hash>.jpg.rebuilt.carved`).
     scan_start: u64,
     /// Absolute dump offset of the first surviving chain segment.
     chain_start: u64,
@@ -11203,7 +11203,7 @@ mod tests {
         std::fs::remove_dir_all(&out).ok();
     }
 
-    /// ROADMAP 8.10.8: with the new `{offset}-{kind}-{sha8}.{ext}.carved`
+    /// ROADMAP 8.10.8/8.10.14: with the `{offset}.{kind}.{sha8}.{ext}.carved`
     /// names, a file already sitting at the target name is refused and left
     /// exactly as it was; nothing else is written into that directory.
     #[test]
@@ -13219,7 +13219,7 @@ mod tests {
         let on_disk = file.path.as_ref().expect("written to disk");
         let name = on_disk.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.ends_with(".bin.carved"), "{name}");
-        assert!(name.starts_with("00004000-bin-"), "{name}");
+        assert!(name.starts_with("00004000.bin."), "{name}");
         assert_eq!(on_disk.parent().unwrap().file_name().unwrap(), "partial");
         assert_eq!(std::fs::read(on_disk).unwrap(), dump[0x4000..0x14000]);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
@@ -13356,7 +13356,7 @@ mod tests {
         let name = on_disk.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.ends_with(".bin.tail.carved"), "{name}");
         assert!(
-            name.starts_with(&format!("{:08x}-headloss-", file.offset)),
+            name.starts_with(&format!("{:08x}.headloss.", file.offset)),
             "{name}"
         );
         assert_eq!(on_disk.parent().unwrap().file_name().unwrap(), "partial");
@@ -14162,29 +14162,29 @@ mod naming_tests {
     #[test]
     fn whole_file_name_keeps_the_original_extension_before_carved() {
         let name = carved_file_name(0x1a2b0, CarveKind::Zip, CarveRole::Whole, SHA);
-        assert_eq!(name, "0001a2b0-zip-9f3c1e2a.zip.carved");
+        assert_eq!(name, "0001a2b0.zip.9f3c1e2a.zip.carved");
         let name = carved_file_name(0x4f0000, CarveKind::Pe, CarveRole::Whole, SHA);
-        assert_eq!(name, "004f0000-pe-9f3c1e2a.exe.carved");
+        assert_eq!(name, "004f0000.pe.9f3c1e2a.exe.carved");
         let name = carved_file_name(0, CarveKind::Jpeg, CarveRole::Whole, SHA);
-        assert_eq!(name, "00000000-jpeg-9f3c1e2a.jpg.carved");
+        assert_eq!(name, "00000000.jpeg.9f3c1e2a.jpg.carved");
     }
 
     #[test]
     fn plaintext_without_evidence_is_txt_carved() {
         let name = carved_file_name(0x2bc7c, CarveKind::Text, CarveRole::Whole, SHA);
-        assert_eq!(name, "0002bc7c-text-9f3c1e2a.txt.carved");
+        assert_eq!(name, "0002bc7c.text.9f3c1e2a.txt.carved");
     }
 
     #[test]
     fn a_salvaged_tail_says_so_in_its_name() {
         let name = carved_file_name(0x9000, CarveKind::Png, CarveRole::Tail, SHA);
-        assert_eq!(name, "00009000-png-9f3c1e2a.png.tail.carved");
+        assert_eq!(name, "00009000.png.9f3c1e2a.png.tail.carved");
     }
 
     #[test]
     fn reassembled_files_use_the_extension_and_no_hash() {
         let name = carved_file_name(0x1000, CarveKind::Pdf, CarveRole::Reassembled, "");
-        assert_eq!(name, "00001000-pdf-reassembled.pdf.carved");
+        assert_eq!(name, "00001000.pdf.reassembled.pdf.carved");
     }
 
     /// ROADMAP 8.10.9: the static table covers every one of the 41 kinds and
@@ -14268,12 +14268,12 @@ mod naming_tests {
             " ",
         ] {
             let name = carved_file_name_with_ext(1, CarveKind::Zip, ext, CarveRole::Whole, SHA);
-            assert_eq!(name, "00000001-zip-9f3c1e2a.zip.carved", "{ext:?}");
+            assert_eq!(name, "00000001.zip.9f3c1e2a.zip.carved", "{ext:?}");
         }
         let name = carved_file_name_with_ext(1, CarveKind::Zip, "docx", CarveRole::Whole, SHA);
-        assert_eq!(name, "00000001-zip-9f3c1e2a.docx.carved");
+        assert_eq!(name, "00000001.zip.9f3c1e2a.docx.carved");
         let name = carved_file_name_with_ext(1, CarveKind::Zip, "..", CarveRole::Tail, SHA);
-        assert_eq!(name, "00000001-zip-9f3c1e2a.zip.tail.carved");
+        assert_eq!(name, "00000001.zip.9f3c1e2a.zip.tail.carved");
     }
 
     /// Names start with a hex digit and only use `[a-z0-9.-]`, so they can
@@ -14296,9 +14296,8 @@ mod naming_tests {
                     assert!(name.len() <= 100, "{name}");
                     assert!(name.as_bytes()[0].is_ascii_hexdigit(), "{name}");
                     assert!(
-                        name.bytes().all(|b| {
-                            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'
-                        }),
+                        name.bytes()
+                            .all(|b| { b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' }),
                         "{name}"
                     );
                     assert!(!name.contains(".."), "{name}");
@@ -14318,9 +14317,9 @@ mod naming_tests {
     #[test]
     fn short_or_empty_hash_never_panics() {
         let name = carved_file_name(1, CarveKind::Gif, CarveRole::Whole, "ab");
-        assert_eq!(name, "00000001-gif-ab.gif.carved");
+        assert_eq!(name, "00000001.gif.ab.gif.carved");
         let name = carved_file_name(1, CarveKind::Gif, CarveRole::Whole, "");
-        assert_eq!(name, "00000001-gif-.gif.carved");
+        assert_eq!(name, "00000001.gif..gif.carved");
     }
 
     #[test]

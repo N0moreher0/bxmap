@@ -1699,8 +1699,8 @@ fn golden_carve_new_formats_gif_and_lnk() {
             .map(|entry| std::fs::read(entry.path()).unwrap())
             .unwrap()
     };
-    assert_eq!(read_kind("-gif-"), gif, "carved GIF must be byte-identical");
-    assert_eq!(read_kind("-lnk-"), lnk, "carved LNK must be byte-identical");
+    assert_eq!(read_kind(".gif."), gif, "carved GIF must be byte-identical");
+    assert_eq!(read_kind(".lnk."), lnk, "carved LNK must be byte-identical");
 
     // Tên file: đuôi gốc rồi mới tới `.carved` (ROADMAP 8.10).
     let names = std::fs::read_dir(&out_dir)
@@ -1711,13 +1711,13 @@ fn golden_carve_new_formats_gif_and_lnk() {
     assert!(
         names
             .iter()
-            .any(|n| n.contains("-gif-") && n.ends_with(".gif.carved")),
+            .any(|n| n.contains(".gif.") && n.ends_with(".gif.carved")),
         "{names:?}"
     );
     assert!(
         names
             .iter()
-            .any(|n| n.contains("-lnk-") && n.ends_with(".lnk.carved")),
+            .any(|n| n.contains(".lnk.") && n.ends_with(".lnk.carved")),
         "{names:?}"
     );
 }
@@ -1947,7 +1947,7 @@ fn zip_multi_fixture(members: &[(&str, &[u8])]) -> Vec<u8> {
 #[test]
 fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
     // ROADMAP 8.10.9: docx + exe + jpg + plaintext in one dump. Each file is
-    // named `{offset}-{kind}-{sha8}.{ext}.carved` with the extension the
+    // named `{offset}.{kind}.{sha8}.{ext}.carved` with the extension the
     // content proves, and docx/jpg are byte-identical (exe keeps its zero overlay).
     let dir = tempfile::tempdir().unwrap();
     let docx = docx_fixture();
@@ -2038,7 +2038,7 @@ fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
         ("jpg", jpeg_at, &jpeg),
     ] {
         let name = find(ext);
-        assert!(name.starts_with(&format!("{offset:08x}-")), "{name}");
+        assert!(name.starts_with(&format!("{offset:08x}.")), "{name}");
         let carved = std::fs::read(out_dir.join(&name)).unwrap();
         if ext == "exe" {
             assert!(
@@ -2061,11 +2061,11 @@ fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
         .collect::<Vec<_>>();
     assert_eq!(partial.len(), 1, "{partial:?}");
     assert!(
-        partial[0].contains("-text-") && partial[0].ends_with(".txt.carved"),
+        partial[0].contains(".text.") && partial[0].ends_with(".txt.carved"),
         "{partial:?}"
     );
 
-    // Every name only uses the whitelist (hex, `-`, lowercase, dots).
+    // Every name only uses the whitelist (hex, lowercase, dots).
     for name in names
         .iter()
         .filter(|n| n.as_str() != "partial")
@@ -2073,7 +2073,7 @@ fn golden_carve_mixed_dump_names_follow_the_real_type_and_bytes_match() {
     {
         assert!(
             name.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'),
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.'),
             "{name}"
         );
         assert!(name.ends_with(".carved") && name.len() < 64, "{name}");
@@ -2151,7 +2151,7 @@ fn golden_carve_writes_validated_files_and_index() {
     let written = std::fs::read_dir(&out_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
-        .find(|entry| entry.file_name().to_string_lossy().contains("-png-"))
+        .find(|entry| entry.file_name().to_string_lossy().contains(".png."))
         .map(|entry| std::fs::read(entry.path()).unwrap())
         .unwrap();
     assert_eq!(written, png, "carved PNG must be byte-identical");
@@ -2280,9 +2280,9 @@ fn golden_bare_carve_is_a_full_carve() {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(names.len(), 2, "{name}: {names:?}");
-        assert!(names.iter().any(|file| file.contains("-png-")), "{names:?}");
+        assert!(names.iter().any(|file| file.contains(".png.")), "{names:?}");
         assert!(
-            names.iter().any(|file| file.contains("-jpeg-")),
+            names.iter().any(|file| file.contains(".jpeg.")),
             "{names:?}"
         );
     }
@@ -2952,7 +2952,7 @@ fn golden_carve_bin_writes_unclassified_high_entropy_runs() {
         .collect::<Vec<_>>();
     assert_eq!(names.len(), 1, "{names:?}");
     assert!(names[0].ends_with(".bin.carved"), "{names:?}");
-    assert!(names[0].starts_with("00004000-bin-"), "{names:?}");
+    assert!(names[0].starts_with("00004000.bin."), "{names:?}");
     let written = std::fs::read(carved.join("partial").join(&names[0])).unwrap();
     assert_eq!(written, blob, "the carved file must be byte-identical");
 

@@ -447,8 +447,8 @@ Recover structured files directly from a raw dump. The carver:
   structural validation decides what is written.
 - Deduplicates by SHA-256; identical files found at multiple offsets are recorded
   once with `duplicates: [offsets]` in the index.
-- Writes files as `{offset:08x}-{kind}-{sha8}.{ext}.carved` (e.g.
-  `0001a2b0-zip-9f3c1e2a.docx.carved`): the extension is taken from a static
+- Writes files as `{offset:08x}.{kind}.{sha8}.{ext}.carved` (e.g.
+  `0001a2b0.zip.9f3c1e2a.docx.carved`): the extension is taken from a static
   table and refined from content only when the structure is proven (ZIP with
   Word parts -> `docx`, PE with the DLL flag -> `dll`, ...). Plaintext is
   `.txt.carved`; a salvaged tail without its header is `.{ext}.tail.carved`;
@@ -555,7 +555,7 @@ bxmap <dump>.raw --carve all --carve-out <dir> --carve-index <idx> [--max-string
 The carved files land in `<dump>.raw.bxmap/carved` by default; add
 `--carve-out <dir>` to choose a different directory.
 
-Carved file names are `{offset:08x}-{kind}-{sha256[:8]}.{ext}.carved` (see
+Carved file names are `{offset:08x}.{kind}.{sha256[:8]}.{ext}.carved` (see
 ROADMAP 8.10 B1/B2): `{offset}` is hex, `{ext}` is the kind's default or the
 content-refined extension (`refine_ext`, e.g. `dll`/`sys` for PE, `docx` for
 OOXML ZIPs), tails get `.tail.carved` and reassembled files keep their

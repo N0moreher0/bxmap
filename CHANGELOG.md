@@ -5,6 +5,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Carved files are named with dots, not dashes (ROADMAP 8.10.14)**.
+  `{offset:08x}-{kind}-{sha8}.{ext}.carved` is now
+  `{offset:08x}.{kind}.{sha8}.{ext}.carved` (`00842000.pe.cb18a6c0.dll.carved`),
+  for every `CarveKind` and every role suffix: `.tail`, `.rebuilt`, `.cut`
+  stay in place (`…mp4.9f3c1e2a.mp4.rebuilt.carved`); `reassembled` still
+  replaces the hash. `.carved` is always the last extension as before; the
+  index (`path`, `role`, `tier`, evidence) is unchanged, and the name
+  whitelist in the golden tests is tightened to `[a-z0-9.]`. HELP and the
+  READMEs updated. 283 lib tests, 117 golden, clippy `-D warnings`,
+  fmt clean.
+
 ### Added
 - **PE sniff gained a measured elimination ladder for ruined import
   tables (ROADMAP 8.10.13)**. RAM-dump PEs whose import descriptors
