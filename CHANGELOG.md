@@ -6,6 +6,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **PE sniff gained a measured elimination ladder for ruined import
+  tables (ROADMAP 8.10.13)**. RAM-dump PEs whose import descriptors
+  were zeroed (every one of the Lab 6 driver cases) now classify on
+  the surviving evidence, in order: (1) a delay-load directory
+  refines to `.dll`/`.exe` (`sniff:pe/user-delay`) — kernel drivers
+  never delay-load; (2) an `INIT` section refines to `.sys`
+  (`sniff:pe/kernel-section`) — present in 100% of Windows 11 drivers
+  (479/479), in 1.09% of `.dll` and 0.16% of `.exe`; (3)
+  `SUBSYSTEM_NATIVE` + DLL bit + no export directory refines to
+  `.sys` (`sniff:pe/kernel-noexports`), the symcryptk.dll profile.
+  The ladder outranks the DLL bit on purpose. Validated on 4,773
+  real PEs (Windows 11): the 47 remaining mismatches are all Windows
+  kernel-role images shipped as `.dll`/`.exe` (kernel debugger
+  transports, HAL extensions, microcode/secure-firmware components),
+  plus the unavoidable subsystem-16 boot apps; no `.sys` is demoted
+  anywhere on the corpus. On Lab 6 the three kernel-mode images
+  previously labelled `.dll` now get `.sys`; the five user-mode
+  images that happen to carry delay-load directories get their own
+  evidence (`sniff:pe/user-delay`). 283 lib tests, 117 golden,
+  clippy `-D warnings`, fmt clean.
 - **PE subtype sniff now uses the import table, not just the
   characteristics/subsystem (ROADMAP 8.10.12)**. `refine_ext` for
   `CarveKind::Pe` previously assigned `.sys` only to subsystem NATIVE

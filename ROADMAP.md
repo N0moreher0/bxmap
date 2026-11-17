@@ -464,6 +464,19 @@ Nguyên tắc (giữ nguyên các ranh giới cũ):
 - [x] Trần đọc: ≤ 64 descriptor, ≤ 256 B mỗi module name, RVA→offset theo section table (chỉ sect có raw data, `rva - va < rawSize`), clip theo vùng carve như mọi sniff khác; chạy sau validator, không thêm lượt quét dump, không phụ thuộc vị trí PE trong vùng. Bằng chứng ra index qua `ext_source=sniff:pe/kernel-import|user-import`.
 - [x] Tests: 4 test fixture PE32+ dựng tay trong `carve_ext::tests` (kernel import beats DLL flag, user import → exe, import ngoài vùng → fallback subsystem, KMDF + `ext-ms-win-ntos-*`); **279 lib tests** (275 + 4), golden 117, clippy `-D warnings`, fmt clean.
 
+**8.10.13 Thang loại trừ cho PE khi bảng import bị zero (XONG 2026-11-17)**
+- [x] Vấn đề: rule import-table của 8.10.12 không giúp được gì với dump RAM mà các driver .sys có **descriptor import toàn 0** (Lab 6 — 32/32 PE `complete=true`). Đã đo trực tiếp trên corpus Windows 11 thật (`C:\Windows\System32` + `drivers`, 4.773 PE: 479 `.sys` / 3.668 `.dll` / 626 `.exe`) để tìm tín hiệu loại trừ còn đọc được khi import vô hình:
+  - `subsystem NATIVE`: 100% `.sys`, 1.8% `.exe`, 7.1% `.dll` (yếu, giữ làm lưới cuối).
+  - `delay-load directory` (dir[13]): **0/479 `.sys`** — mọi user image có thể có nó; 48% dll, 35% exe.
+  - Section names: `INIT` có mặt trong **479/479 `.sys`**, 1.09% dll, 0.16% exe. `PAGE` 86.8% / `GFIDS` 81% (dư thừa bởi INIT), `PAGEDATA`/`PAGERO`/`NONPAGED` hiếm và dư thừa → **bỏ hết, giữ đúng `INIT`**. `.MRDATA`/`.DODATA` khớp user-mode (ntdll có `.MRDATA`) → loại.
+- [x] Thứ tự `sniff_pe` cuối cùng: `kernel-import` (8.10.12) → **thang loại trừ** → đuôi DLL bit → `user-import` → subsystem NATIVE yếu → mặc định. Thang loại trừ chạy khi import table **không** chứng minh được gì, gồm 3 nấc:
+  1. `delay-load` present → **`.exe`** (`.dll` nếu có DLL bit), `sniff:pe/user-delay`.
+  2. Section `INIT` → **`.sys`**, `sniff:pe/kernel-section` — thắng DLL bit (đúng thiết kế: kernel image nhãn `.dll` của Windows).
+  3. `SUBSYSTEM_NATIVE` + DLL bit + **không** export directory → **`.sys`**, `sniff:pe/kernel-noexports` (profile symcryptk.dll; trên corpus: 4/4 đều là kernel).
+- [x] Kiểm thật: 4.773 PE Windows 11 → còn **47 lệch**, **toàn kernel components Windows tự ship nhãn .dll/.exe** (`kd*.dll`, `kd_02_*.dll`, `HalExt*.dll`, `mcupdate_*.dll`, `plutonfw_*.dll`, `secfw_*.dll`, `ntoskrnl.exe`, `hvix64.exe`, `PSHED.DLL`, `ci.dll`, `cdd.dll`) + boot apps subsystem 16 (`tcblaunch.exe`, `winload.exe`, `dpnsvr.exe` — giữ `.dll`, chấp nhận). Không có `.sys` nào bị tụt hạng; 1 false flip / 3.668 dll (`KBDUS.DLL`, có section INIT) — ghi nhận trong ROADMAP.
+- [x] **Lab 6 (RAM dump)**: 18 sys (trước 15) — toàn bộ `sniff:pe/kernel-section`; 3 image kernel có INIT cũ bị gán `.dll` đã chuyển sang `.sys` đúng (`0x00bb8000`, `0x03a8c000`, `0x03b7e000`); 14 dll: 9 `sniff:pe/dll` + 5 `sniff:pe/user-delay`. Bench không đổi (không PE nào trong bench có INIT).
+- [x] Tests: **283 lib tests** (+4 qua fixture PE32+ dựng tay: `pe_layout` với sections/dirs tuỳ chọn — delay-load thắng NATIVE, INIT thắng DLL bit, exports loại nấc (3), BSS-style section vẫn ghi nhận tên); golden 117, clippy `-D warnings`, fmt clean.
+
 **8.11 Dựng lại container MP4/MOV khi đầu file bị mã hoá (`moov` còn sống) · P1 · M1–M6 XONG (code 2026-11-16)**
 
 Bối cảnh: ransomware mã hoá một phần ghi đè phần đầu video, làm mất `ftyp` và header `mdat`, nên carve header-first không thấy chữ ký. Nhưng `moov` (chỉ mục mẫu) của video quay từ điện thoại/camera thường nằm **cuối file** và còn nguyên; sau `moov` thường có một đoạn trailer (ID nạn nhân) do ransomware gắn. Đây là đúng chỗ 8.7.2 đã hoãn ("MP4 `moov` footer-first") vì thiếu quy tắc dừng theo cấu trúc; mục này cho quy tắc đó.

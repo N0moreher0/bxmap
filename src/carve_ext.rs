@@ -179,6 +179,16 @@ const PE_USER_MODULES: [&[u8]; 4] = [
     b"user32.dll",
     b"kernelbase.dll",
 ];
+/// Kernel-mode section name observed in Windows 11 kernel images (`.sys`
+/// and kernel-mode `.dll` alike). Measured on 4,773 real PEs: **every**
+/// `.sys` has an `INIT` section (479/479), only 1.09% of `.dll` and 0.16% of
+/// `.exe` do — the dlls that do are kernel images shipped with a .dll
+/// extension (symcryptk.dll profile). Names that matched on Windows (PAGE,
+/// GFIDS, PAGEDATA…) are redundant with INIT here and pull in false
+/// positives; `.mrdata`/`.dodata` matched user-mode images, so they were
+/// dropped outright. Memory dumps that scrub the import table keep the
+/// headers, so this is usually the strongest surviving evidence.
+const PE_KERNEL_SECTIONS: [&[u8]; 1] = [b"init"];
 
 /// What the import table can prove about the image's subsystem family.
 enum ImportScan {
@@ -195,6 +205,8 @@ struct PeSection {
     va: u32,
     raw_size: u32,
     raw_ptr: u32,
+    /// Section name, lowercased and trimmed of trailing NULs/spaces.
+    name: Vec<u8>,
 }
 
 fn pe_rva_to_file(sections: &[PeSection], rva: u32) -> Option<u64> {
@@ -229,9 +241,24 @@ fn sniff_pe<R: Read + Seek>(r: &mut R, base: u64, size: u64) -> io::Result<Sniff
     // kernel itself — and many of them also set IMAGE_FILE_DLL (ks.sys,
     // fltMgr.sys, …), so the DLL bit alone cannot tell a driver from a
     // user-mode library. A user-mode DLL never imports ntoskrnl.
-    let scan = pe_import_scan(r, base, size, &head, p, magic, optional_size);
+    let sections = pe_sections(&head, p, optional_size);
+    let scan = pe_import_scan(r, base, size, &head, p, magic, sections.as_deref());
     if matches!(scan, ImportScan::Kernel) {
         return Ok(Sniff::Refined("sys", "sniff:pe/kernel-import"));
+    }
+    // The import table proved nothing (typically RAM-dump PEs whose import
+    // descriptors were zeroed): run the elimination ladder on what survived.
+    // It outranks the DLL bit on purpose: the kernel images Windows ships
+    // with a .dll extension (symcryptk.dll, the 0x3a8c000 Lab 6 case) set
+    // IMAGE_FILE_DLL too.
+    if let Some(refined) = pe_elimination(
+        characteristics,
+        &head,
+        p,
+        magic,
+        sections.as_deref().unwrap_or(&[]),
+    ) {
+        return Ok(refined);
     }
     if characteristics & PE_FILE_DLL != 0 {
         return Ok(Sniff::Refined("dll", "sniff:pe/dll"));
@@ -248,9 +275,55 @@ fn sniff_pe<R: Read + Seek>(r: &mut R, base: u64, size: u64) -> io::Result<Sniff
     Ok(Sniff::Generic)
 }
 
+/// Elimination ladder for PEs whose import table was unreadable (RAM dumps
+/// that scrubbed the loader's descriptor pages). Runs only when
+/// [`pe_import_scan`] yields `Unknown`, in order:
+///
+/// 1. A delay-load directory ⇒ user-mode image (kernel drivers never
+///    delay-load): with the DLL bit ⇒ `.dll`, else `.exe`.
+/// 2. Kernel-mode section names (`PAGE`, `PAGEDATA`, `INIT`, `GFIDS`,
+///    `NONPAGED`, …) ⇒ kernel image ⇒ `.sys`. Measured on 4,773 real PEs
+///    (Windows 11): every `.sys` has at least one, ~2% of `.dll` do too
+///    (kernel-mode DLLs such as symcryptk.dll — also kernel images).
+/// 3. `SUBSYSTEM_NATIVE` + DLL bit + no export directory ⇒ kernel image
+///    with a `.dll` extension (symcryptk.dll profile) ⇒ `.sys`.
+/// 4. Otherwise no evidence — the caller keeps the weak subsystem rule.
+fn pe_elimination(
+    characteristics: u16,
+    head: &[u8],
+    p: usize,
+    magic: u16,
+    sections: &[PeSection],
+) -> Option<Sniff> {
+    let directories_at = p.saturating_add(24 + if magic == 0x10b { 96 } else { 112 });
+    let delay_rva = rd32(head, directories_at.saturating_add(13 * 8), false).unwrap_or(0);
+    if delay_rva != 0 {
+        return Some(if characteristics & PE_FILE_DLL != 0 {
+            Sniff::Refined("dll", "sniff:pe/user-delay")
+        } else {
+            Sniff::Refined("exe", "sniff:pe/user-delay")
+        });
+    }
+    if sections
+        .iter()
+        .any(|s| PE_KERNEL_SECTIONS.contains(&s.name.as_slice()))
+    {
+        return Some(Sniff::Refined("sys", "sniff:pe/kernel-section"));
+    }
+    let export_rva = rd32(head, directories_at, false).unwrap_or(0);
+    if characteristics & PE_FILE_DLL != 0
+        && export_rva == 0
+        && rd16(head, p.saturating_add(24 + 68), false) == Some(PE_SUBSYSTEM_NATIVE)
+    {
+        return Some(Sniff::Refined("sys", "sniff:pe/kernel-noexports"));
+    }
+    None
+}
+
 /// Walk the import descriptor array and decide whether the image links the
 /// kernel. Reads are bounded (≤ 64 descriptors, ≤ 256 B per name) and clipped
-/// to the region like everything else here.
+/// to the region like everything else here. `sections` is the already-parsed
+/// section table (`None` when it does not fit the head window).
 fn pe_import_scan<R: Read + Seek>(
     r: &mut R,
     base: u64,
@@ -258,7 +331,7 @@ fn pe_import_scan<R: Read + Seek>(
     head: &[u8],
     p: usize,
     magic: u16,
-    optional_size: u16,
+    sections: Option<&[PeSection]>,
 ) -> ImportScan {
     let directories_at = match magic {
         0x10b => p.saturating_add(24 + 96),  // PE32
@@ -273,10 +346,8 @@ fn pe_import_scan<R: Read + Seek>(
     if rd32(head, count_at, false) == Some(0) {
         return ImportScan::Unknown;
     }
-    // Section table: NumberOfSections (COFF +6), starts after the optional header.
-    let sections = match pe_sections(head, p, optional_size) {
-        Some(sections) => sections,
-        None => return ImportScan::Unknown,
+    let Some(sections) = sections else {
+        return ImportScan::Unknown;
     };
     // Data directory 1 is the import table (RVAs are relative to image base).
     let Some(import_rva) = rd32(head, directories_at.saturating_add(8), false) else {
@@ -285,7 +356,7 @@ fn pe_import_scan<R: Read + Seek>(
     if import_rva == 0 {
         return ImportScan::Unknown;
     }
-    let Some(import_off) = pe_rva_to_file(&sections, import_rva) else {
+    let Some(import_off) = pe_rva_to_file(sections, import_rva) else {
         return ImportScan::Unknown;
     };
     let mut saw_user = false;
@@ -305,7 +376,7 @@ fn pe_import_scan<R: Read + Seek>(
         if name_rva == 0 {
             continue;
         }
-        let Some(name_off) = pe_rva_to_file(&sections, name_rva) else {
+        let Some(name_off) = pe_rva_to_file(sections, name_rva) else {
             continue;
         };
         let Ok(raw) = read_at(r, base, size, name_off, PE_MODULE_NAME_MAX as u64) else {
@@ -350,13 +421,33 @@ fn pe_sections(head: &[u8], p: usize, optional_size: u16) -> Option<Vec<PeSectio
         let at = table + index * 40;
         let raw_size = rd32(head, at + 16, false)?;
         let raw_ptr = rd32(head, at + 20, false)?;
-        // Sections without raw data (BSS) never map RVAs.
+        // Sections without raw data (BSS) never map RVAs; they are skipped but
+        // kept for their names? No — a BSS section still may carry a kernel
+        // name (.mrdata/.dodata are usually zero-initialised), so keep it.
+        let mut name = head[at..at + 8].to_vec();
+        let end = name
+            .iter()
+            .rposition(|&b| b != 0 && b != b' ')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        name.truncate(end);
+        let name = lower(&name);
         if raw_size > 0 {
             let va = rd32(head, at + 12, false)?;
             out.push(PeSection {
                 va,
                 raw_size,
                 raw_ptr,
+                name,
+            });
+        } else if !name.is_empty() {
+            // No raw data: never maps an RVA, but the name still counts as
+            // evidence for the elimination ladder.
+            out.push(PeSection {
+                va: 0,
+                raw_size: 0,
+                raw_ptr: 0,
+                name,
             });
         }
     }
@@ -685,6 +776,11 @@ mod tests {
         b[p + 22..p + 24].copy_from_slice(&characteristics.to_le_bytes());
         b[p + 24..p + 26].copy_from_slice(&0x20bu16.to_le_bytes());
         b[p + 24 + 68..p + 24 + 70].copy_from_slice(&subsystem.to_le_bytes());
+        // ntdll-style: a native-subsystem user DLL exports functions.
+        let dirs = p + 24 + 112;
+        b[p + 24 + 108..p + 24 + 112].copy_from_slice(&16u32.to_le_bytes());
+        b[dirs..dirs + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[dirs + 4..dirs + 8].copy_from_slice(&0x100u32.to_le_bytes());
         b
     }
 
@@ -697,6 +793,182 @@ mod tests {
         assert_eq!(
             pick(CarveKind::Pe, &pe(0x0022, 1)),
             ("sys", "sniff:pe/native")
+        );
+    }
+
+    /// PE32+ image with named sections and optional export/delay-load
+    /// directories. The import directory stays absent (rva = 0): the fixture
+    /// models RAM-dump PEs whose import descriptors were zeroed. Direction of
+    /// the layout: header 0x00-0x200, sections raw at 0x200 + 0x200 * i.
+    fn pe_layout(
+        characteristics: u16,
+        subsystem: u16,
+        sections: &[&[u8]],
+        exports: bool,
+        delay: bool,
+    ) -> Vec<u8> {
+        let nsect = sections.len();
+        let mut b = vec![0u8; 0x200];
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        let p = 0x80usize;
+        b[p..p + 4].copy_from_slice(b"PE\0\0");
+        b[p + 6..p + 8].copy_from_slice(&(nsect as u16).to_le_bytes());
+        b[p + 20..p + 22].copy_from_slice(&0xF0u16.to_le_bytes());
+        b[p + 22..p + 24].copy_from_slice(&characteristics.to_le_bytes());
+        let o = p + 24usize; // optional header
+        b[o..o + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        b[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
+        let dirs = o + 112;
+        if exports {
+            b[dirs..dirs + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+            b[dirs + 4..dirs + 8].copy_from_slice(&0x40u32.to_le_bytes());
+        }
+        if delay {
+            let at = dirs + 13 * 8;
+            b[at..at + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+            b[at + 4..at + 8].copy_from_slice(&0x60u32.to_le_bytes());
+        }
+        b[o + 68..o + 70].copy_from_slice(&subsystem.to_le_bytes());
+        for (i, name) in sections.iter().enumerate() {
+            let at = o + 0xF0 + i * 40;
+            let va = 0x1000u32 + i as u32 * 0x1000;
+            let raw = 0x200usize + i * 0x200;
+            let mut raw_size = 0x200u32;
+            if name.starts_with(b"BSS") {
+                raw_size = 0;
+            }
+            let mut slot = [0u8; 8];
+            let copy_len = name.len().min(8);
+            slot[..copy_len].copy_from_slice(&name[..copy_len]);
+            b[at..at + 8].copy_from_slice(&slot);
+            b[at + 8..at + 12].copy_from_slice(&0x100u32.to_le_bytes());
+            b[at + 12..at + 16].copy_from_slice(&va.to_le_bytes());
+            b[at + 16..at + 20].copy_from_slice(&raw_size.to_le_bytes());
+            b[at + 20..at + 24].copy_from_slice(&(raw as u32).to_le_bytes());
+            if b.len() < raw + raw_size as usize {
+                b.resize(raw + raw_size as usize, 0);
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn pe_delay_load_marks_the_image_user_mode() {
+        // Delay-load directory ⇒ user image; the DLL bit maps the extension.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x2022, 1, &[b".text", b".rsrc"], false, true)
+            ),
+            ("dll", "sniff:pe/user-delay")
+        );
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x0022, 1, &[b".text"], false, true)
+            ),
+            ("exe", "sniff:pe/user-delay")
+        );
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x0022, 3, &[b".text"], false, true)
+            ),
+            ("exe", "sniff:pe/user-delay")
+        );
+    }
+
+    #[test]
+    fn pe_kernel_sections_mark_the_image_kernel() {
+        // INIT: the anchor (100% of .sys on Windows 11, 1% of .dll).
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x2022, 1, &[b".text", b"INIT"], false, false)
+            ),
+            ("sys", "sniff:pe/kernel-section")
+        );
+        // Kernel evidence beats the DLL bit (symcryptk.dll style).
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x0022, 3, &[b".text", b"INIT"], false, false)
+            ),
+            ("sys", "sniff:pe/kernel-section")
+        );
+        // Mixed case section names are lowered for matching.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x0022, 1, &[b"Init"], false, false)
+            ),
+            ("sys", "sniff:pe/kernel-section")
+        );
+        // Other names are not evidence: they keep the weak/default rules.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x0022, 1, &[b".text", b"PAGEDATA"], false, false)
+            ),
+            ("sys", "sniff:pe/native")
+        );
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x0022, 3, &[b".text", b"PAGEDATA"], false, false)
+            ),
+            ("exe", "kind")
+        );
+    }
+
+    #[test]
+    fn pe_native_dll_without_exports_is_kernel() {
+        // The symcryptk.dll profile: DLL bit + SUBSYSTEM_NATIVE + no export
+        // directory (kernel-mode image with a .dll extension).
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x2022, 1, &[b".text", b".rdata"], false, false)
+            ),
+            ("sys", "sniff:pe/kernel-noexports")
+        );
+        // Exports present: that evidence is gone, the DLL bit (or a weaker
+        // rung) decides.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x2022, 1, &[b".text"], true, false)
+            ),
+            ("dll", "sniff:pe/dll")
+        );
+    }
+
+    #[test]
+    fn pe_no_elimination_evidence_keeps_the_old_rules() {
+        // No delay, no kernel sections, exports present or not: left to the
+        // weak subsystem rule / default, exactly as 8.10.12 behaved.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x0022, 1, &[b".text"], false, false)
+            ),
+            ("sys", "sniff:pe/native")
+        );
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x0022, 3, &[b".text"], false, false)
+            ),
+            ("exe", "kind")
+        );
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_layout(0x2022, 3, &[b".text"], false, false)
+            ),
+            ("dll", "sniff:pe/dll")
         );
     }
 
