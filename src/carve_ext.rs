@@ -158,6 +158,56 @@ fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
 const PE_FILE_DLL: u16 = 0x2000;
 /// `IMAGE_SUBSYSTEM_NATIVE` (drivers).
 const PE_SUBSYSTEM_NATIVE: u16 = 1;
+/// Most import descriptors we follow before giving up (the linker emits a few).
+const PE_IMPORT_DESCRIPTOR_CAP: usize = 64;
+/// Largest module name we read from the import table.
+const PE_MODULE_NAME_MAX: usize = 256;
+/// Kernel-mode images link the kernel itself (or the KMDF loader) — every
+/// driver on Windows 10/11 does, so this is a much sharper discriminator
+/// than the subsystem flag: it splits genuine drivers from native EXEs
+/// (`smss.exe`, `csrss.exe`, …), which also use `SUBSYSTEM_NATIVE`.
+const PE_KERNEL_MODULES: [&[u8]; 3] = [b"ntoskrnl.exe", b"wdf01000.sys", b"wdfldr.sys"];
+/// Kernel API-set family (e.g. `ext-ms-win-ntos-clipsp-l1-1-0.dll`); only the
+/// `ntos-` namespace is treated as kernel evidence (`ext-ms-win-fs-clfs` and
+/// friends are left ambiguous and need one of the other kernel signals).
+const PE_KERNEL_PREFIX: &[u8] = b"ext-ms-win-ntos-";
+/// Win32 API-set family; every user-mode image imports these (or ntdll).
+const PE_USER_PREFIX: &[u8] = b"api-ms-win-";
+const PE_USER_MODULES: [&[u8]; 4] = [
+    b"ntdll.dll",
+    b"kernel32.dll",
+    b"user32.dll",
+    b"kernelbase.dll",
+];
+
+/// What the import table can prove about the image's subsystem family.
+enum ImportScan {
+    /// Kernel image (`.sys`): imports the kernel or KMDF, or a `ntos-` API set.
+    Kernel,
+    /// User-mode image (`.exe`): imports ntdll/kernel32 or `api-ms-win-*`.
+    User,
+    /// Nothing readable (no import directory, RVAs outside the sections,
+    /// truncated region): fall back to the subsystem flag.
+    Unknown,
+}
+
+struct PeSection {
+    va: u32,
+    raw_size: u32,
+    raw_ptr: u32,
+}
+
+fn pe_rva_to_file(sections: &[PeSection], rva: u32) -> Option<u64> {
+    for s in sections {
+        if rva >= s.va {
+            let delta = u64::from(rva - s.va);
+            if delta < u64::from(s.raw_size) {
+                return Some(u64::from(s.raw_ptr) + delta);
+            }
+        }
+    }
+    None
+}
 
 fn sniff_pe<R: Read + Seek>(r: &mut R, base: u64, size: u64) -> io::Result<Sniff> {
     let head = read_at(r, base, size, 0, HEAD_WINDOW)?;
@@ -173,10 +223,22 @@ fn sniff_pe<R: Read + Seek>(r: &mut R, base: u64, size: u64) -> io::Result<Sniff
     let Some(characteristics) = rd16(&head, p.saturating_add(22), false) else {
         return Ok(Sniff::Unsure);
     };
+    let optional_size = rd16(&head, p.saturating_add(20), false).unwrap_or(0);
+    let magic = rd16(&head, p.saturating_add(24), false).unwrap_or(0);
+    // The import table decides first: Windows 10/11 kernel drivers link the
+    // kernel itself — and many of them also set IMAGE_FILE_DLL (ks.sys,
+    // fltMgr.sys, …), so the DLL bit alone cannot tell a driver from a
+    // user-mode library. A user-mode DLL never imports ntoskrnl.
+    let scan = pe_import_scan(r, base, size, &head, p, magic, optional_size);
+    if matches!(scan, ImportScan::Kernel) {
+        return Ok(Sniff::Refined("sys", "sniff:pe/kernel-import"));
+    }
     if characteristics & PE_FILE_DLL != 0 {
         return Ok(Sniff::Refined("dll", "sniff:pe/dll"));
     }
-    let optional_size = rd16(&head, p.saturating_add(20), false).unwrap_or(0);
+    if matches!(scan, ImportScan::User) {
+        return Ok(Sniff::Refined("exe", "sniff:pe/user-import"));
+    }
     // Subsystem sits at offset 68 of the optional header for PE32 and PE32+.
     if optional_size >= 70
         && rd16(&head, p.saturating_add(24 + 68), false) == Some(PE_SUBSYSTEM_NATIVE)
@@ -184,6 +246,135 @@ fn sniff_pe<R: Read + Seek>(r: &mut R, base: u64, size: u64) -> io::Result<Sniff
         return Ok(Sniff::Refined("sys", "sniff:pe/native"));
     }
     Ok(Sniff::Generic)
+}
+
+/// Walk the import descriptor array and decide whether the image links the
+/// kernel. Reads are bounded (≤ 64 descriptors, ≤ 256 B per name) and clipped
+/// to the region like everything else here.
+fn pe_import_scan<R: Read + Seek>(
+    r: &mut R,
+    base: u64,
+    size: u64,
+    head: &[u8],
+    p: usize,
+    magic: u16,
+    optional_size: u16,
+) -> ImportScan {
+    let directories_at = match magic {
+        0x10b => p.saturating_add(24 + 96),  // PE32
+        0x20b => p.saturating_add(24 + 112), // PE32+
+        _ => return ImportScan::Unknown,
+    };
+    // Optional header holds at least one data directory.
+    let count_at = match magic {
+        0x10b => p.saturating_add(24 + 92),
+        _ => p.saturating_add(24 + 108),
+    };
+    if rd32(head, count_at, false) == Some(0) {
+        return ImportScan::Unknown;
+    }
+    // Section table: NumberOfSections (COFF +6), starts after the optional header.
+    let sections = match pe_sections(head, p, optional_size) {
+        Some(sections) => sections,
+        None => return ImportScan::Unknown,
+    };
+    // Data directory 1 is the import table (RVAs are relative to image base).
+    let Some(import_rva) = rd32(head, directories_at.saturating_add(8), false) else {
+        return ImportScan::Unknown;
+    };
+    if import_rva == 0 {
+        return ImportScan::Unknown;
+    }
+    let Some(import_off) = pe_rva_to_file(&sections, import_rva) else {
+        return ImportScan::Unknown;
+    };
+    let mut saw_user = false;
+    for index in 0..PE_IMPORT_DESCRIPTOR_CAP {
+        let at = import_off.saturating_add(index as u64 * 20);
+        let Ok(desc) = read_at(r, base, size, at, 20) else {
+            return ImportScan::Unknown;
+        };
+        if desc.len() < 20 {
+            return ImportScan::Unknown;
+        }
+        let name_rva = rd32(&desc, 12, false).unwrap_or(0);
+        // An all-zero descriptor terminates the array.
+        if name_rva == 0 && rd32(&desc, 0, false) == Some(0) && rd32(&desc, 16, false) == Some(0) {
+            return done(saw_user);
+        }
+        if name_rva == 0 {
+            continue;
+        }
+        let Some(name_off) = pe_rva_to_file(&sections, name_rva) else {
+            continue;
+        };
+        let Ok(raw) = read_at(r, base, size, name_off, PE_MODULE_NAME_MAX as u64) else {
+            continue;
+        };
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        if end == 0 {
+            continue;
+        }
+        let name = &raw[..end];
+        if is_kernel_module(name) {
+            return ImportScan::Kernel;
+        }
+        if is_user_module(name) {
+            saw_user = true;
+        }
+    }
+    done(saw_user)
+}
+
+fn done(saw_user: bool) -> ImportScan {
+    if saw_user {
+        ImportScan::User
+    } else {
+        ImportScan::Unknown
+    }
+}
+
+/// Parse the section table out of the (already bounded) head window.
+fn pe_sections(head: &[u8], p: usize, optional_size: u16) -> Option<Vec<PeSection>> {
+    let nsect = rd16(head, p + 6, false)? as usize;
+    if nsect == 0 || nsect > 96 {
+        return None;
+    }
+    let table = p.saturating_add(24).saturating_add(optional_size as usize);
+    let table_end = table.saturating_add(nsect.saturating_mul(40));
+    if head.len() < table_end {
+        return None;
+    }
+    let mut out = Vec::with_capacity(nsect);
+    for index in 0..nsect {
+        let at = table + index * 40;
+        let raw_size = rd32(head, at + 16, false)?;
+        let raw_ptr = rd32(head, at + 20, false)?;
+        // Sections without raw data (BSS) never map RVAs.
+        if raw_size > 0 {
+            let va = rd32(head, at + 12, false)?;
+            out.push(PeSection {
+                va,
+                raw_size,
+                raw_ptr,
+            });
+        }
+    }
+    Some(out)
+}
+
+fn lower(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().map(|b| b.to_ascii_lowercase()).collect()
+}
+
+fn is_kernel_module(name: &[u8]) -> bool {
+    let name = lower(name);
+    PE_KERNEL_MODULES.contains(&name.as_slice()) || name.starts_with(PE_KERNEL_PREFIX)
+}
+
+fn is_user_module(name: &[u8]) -> bool {
+    let name = lower(name);
+    PE_USER_MODULES.contains(&name.as_slice()) || name.starts_with(PE_USER_PREFIX)
 }
 
 // --- MP4 -----------------------------------------------------------------------
@@ -506,6 +697,183 @@ mod tests {
         assert_eq!(
             pick(CarveKind::Pe, &pe(0x0022, 1)),
             ("sys", "sniff:pe/native")
+        );
+    }
+
+    /// Build a PE32+ image with two sections and an import table naming
+    /// `modules`. Layout: MZ stub 0x00-0x80, PE signature at 0x80, COFF at
+    /// 0x84, optional header at 0x98 (size 0xF0), section table at 0x188,
+    /// `.text` raw at 0x200, `.idata` raw at 0x400.
+    fn pe_with_imports(characteristics: u16, subsystem: u16, modules: &[&[u8]]) -> Vec<u8> {
+        const LAYOUT: usize = 0x600;
+        let mut b = vec![0u8; LAYOUT];
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        let p = 0x80usize;
+        b[p..p + 4].copy_from_slice(b"PE\0\0");
+        b[p + 6..p + 8].copy_from_slice(&2u16.to_le_bytes()); // NumberOfSections
+        b[p + 20..p + 22].copy_from_slice(&0xF0u16.to_le_bytes()); // optSize
+        b[p + 22..p + 24].copy_from_slice(&characteristics.to_le_bytes());
+        let o = p + 24usize; // optional header (PE32+)
+        b[o..o + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        b[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
+                                                                   // Idata section: va 0x2000, raw 0x400. Import directory = dir[1].
+        b[o + 112 + 8..o + 112 + 12].copy_from_slice(&0x2000u32.to_le_bytes());
+        b[o + 112 + 12..o + 112 + 16].copy_from_slice(&0x60u32.to_le_bytes());
+        let t = o + 0xF0; // section table
+        let put_section =
+            |slot: &mut [u8], name: &[u8; 8], va: u32, raw_size: u32, raw_ptr: u32| {
+                slot[..8].copy_from_slice(name);
+                slot[8..12].copy_from_slice(&0x100u32.to_le_bytes()); // vsize
+                slot[12..16].copy_from_slice(&va.to_le_bytes());
+                slot[16..20].copy_from_slice(&raw_size.to_le_bytes());
+                slot[20..24].copy_from_slice(&raw_ptr.to_le_bytes());
+            };
+        put_section(&mut b[t..t + 40], b".text\0\0\0", 0x1000, 0x200, 0x200);
+        put_section(&mut b[t + 40..t + 80], b".idata\0\0", 0x2000, 0x200, 0x400);
+        let n = modules.len();
+        let desc_bytes = (n + 1) as u32 * 20;
+        let mut name_rva = 0x2000u32 + desc_bytes;
+        let mut at = 0x400usize; // file offset of the descriptor array
+        for module in modules {
+            b[at + 12..at + 16].copy_from_slice(&name_rva.to_le_bytes());
+            let file_at = 0x400usize + (name_rva - 0x2000) as usize;
+            b[file_at..file_at + module.len()].copy_from_slice(module);
+            name_rva += module.len() as u32 + 1; // NUL-terminated
+            at += 20;
+        }
+        let _ = subsystem; // subsystem lives at o+68; set it here too
+        b[o + 68..o + 70].copy_from_slice(&subsystem.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn pe_kernel_imports_are_drivers() {
+        // Windows 10/11 kernel images link the kernel itself even when they
+        // export nothing (disk.sys ships no export table at all).
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(0x0022, 1, &[b"ntoskrnl.exe"])
+            ),
+            ("sys", "sniff:pe/kernel-import")
+        );
+        // KMDF drivers import the framework loader.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(0x0022, 1, &[b"wdf01000.sys"])
+            ),
+            ("sys", "sniff:pe/kernel-import")
+        );
+        // Kernel API-set namespace is kernel evidence.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(0x0022, 1, &[b"ext-ms-win-ntos-clipsp-l1-1-0.dll"])
+            ),
+            ("sys", "sniff:pe/kernel-import")
+        );
+        // A driver whose GUI-looking subsystem would defeat the old rule.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(0x0022, 3, &[b"ntoskrnl.exe", b"hal.dll"])
+            ),
+            ("sys", "sniff:pe/kernel-import")
+        );
+        // Case-insensitive module names (the loader accepts both).
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(0x0022, 1, &[b"NTOSKRNL.EXE"])
+            ),
+            ("sys", "sniff:pe/kernel-import")
+        );
+    }
+
+    #[test]
+    fn pe_user_imports_are_not_drivers() {
+        // smss.exe / csrss.exe style: SUBSYSTEM_NATIVE but pure user imports.
+        assert_eq!(
+            pick(CarveKind::Pe, &pe_with_imports(0x0022, 1, &[b"ntdll.dll"])),
+            ("exe", "sniff:pe/user-import")
+        );
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(0x0022, 1, &[b"ntdll.dll", b"csrsrv.dll"])
+            ),
+            ("exe", "sniff:pe/user-import")
+        );
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(0x0022, 1, &[b"api-ms-win-core-processthreads-l1-1-1.dll"])
+            ),
+            ("exe", "sniff:pe/user-import")
+        );
+        // A user-mode image with mixed evidence: any user import claims it.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(
+                    0x0022,
+                    3,
+                    &[b"kernel32.dll", b"kernelbase.dll", b"ntdll.dll"]
+                )
+            ),
+            ("exe", "sniff:pe/user-import")
+        );
+    }
+
+    #[test]
+    fn pe_imports_beyond_the_region_fall_back_to_the_subsystem_flag() {
+        // Import directory lands outside every section: nothing readable,
+        // weak subsystem evidence applies (the old rule).
+        let mut b = pe_with_imports(0x0022, 1, &[b"ntoskrnl.exe"]);
+        let o = 0x80 + 24usize;
+        b[o + 112 + 8..o + 112 + 12].copy_from_slice(&0x3000u32.to_le_bytes());
+        assert_eq!(pick(CarveKind::Pe, &b), ("sys", "sniff:pe/native"));
+        // Same, but with a GUI subsystem: the generic default stays.
+        let mut b = pe_with_imports(0x0022, 3, &[b"ntoskrnl.exe"]);
+        let o = 0x80 + 24usize;
+        b[o + 112 + 8..o + 112 + 12].copy_from_slice(&0x3000u32.to_le_bytes());
+        assert_eq!(pick(CarveKind::Pe, &b), ("exe", "kind"));
+        // Region ends mid-descriptor-array: equally unreadable.
+        let b = pe_with_imports(0x0022, 1, &[b"ntoskrnl.exe"])[..0x410].to_vec();
+        assert_eq!(pick(CarveKind::Pe, &b), ("sys", "sniff:pe/native"));
+        // No descriptors at all (empty array): fall back too.
+        assert_eq!(
+            pick(CarveKind::Pe, &pe_with_imports(0x0022, 1, &[])),
+            ("sys", "sniff:pe/native")
+        );
+        // Kernel evidence beats subsystem — even a "user" subsystem.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(0x0022, 2, &[b"ntoskrnl.exe"])
+            ),
+            ("sys", "sniff:pe/kernel-import")
+        );
+    }
+
+    #[test]
+    fn pe_kernel_import_beats_the_dll_flag_and_dll_beats_user_imports() {
+        // Windows drivers ship with IMAGE_FILE_DLL (ks.sys: 0x2022) — the
+        // import table outranks the bit.
+        assert_eq!(
+            pick(
+                CarveKind::Pe,
+                &pe_with_imports(0x2022, 1, &[b"ntoskrnl.exe"])
+            ),
+            ("sys", "sniff:pe/kernel-import")
+        );
+        // A user-mode DLL imports user modules and keeps the DLL bit.
+        assert_eq!(
+            pick(CarveKind::Pe, &pe_with_imports(0x2022, 3, &[b"ntdll.dll"])),
+            ("dll", "sniff:pe/dll")
         );
     }
 

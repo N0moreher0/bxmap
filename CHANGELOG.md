@@ -6,6 +6,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **PE subtype sniff now uses the import table, not just the
+  characteristics/subsystem (ROADMAP 8.10.12)**. `refine_ext` for
+  `CarveKind::Pe` previously assigned `.sys` only to subsystem NATIVE
+  images; on Windows 10/11 many real kernel drivers set
+  `IMAGE_FILE_DLL` and so were named `.dll`, while native user-mode
+  EXEs (`smss.exe`, `csrss.exe`) also use subsystem NATIVE and were
+  named `.sys`. The new order: (1) a readable import table naming
+  `ntoskrnl.exe` / `wdf01000.sys` / `wdfldr.sys` or an
+  `ext-ms-win-ntos-*` API set refines to `.sys`
+  (`sniff:pe/kernel-import`) — every Windows 11 kernel driver imports
+  the kernel, even ones with an empty export table; (2) otherwise the
+  `IMAGE_FILE_DLL` bit refines to `.dll` as before; (3) a readable
+  import table with only user-mode modules refines to `.exe`
+  (`sniff:pe/user-import`); (4) an unreadable import table falls back
+  to the old subsystem rule. Validated against 4,773 real PE files on
+  Windows 11 (System32 + drivers): only 7 files land outside the
+  expected family (kernel images shipped with `.dll`/`.exe` extensions
+  or boot apps). 279 lib tests, 117 golden, clippy `-D warnings`,
+  fmt clean.
 - **JPEG whose table chain is destroyed is rebuilt with the ITU-T T.81
   Annex K tables by estimation (ROADMAP 8.12.4, P1)**. When the ruin
   destroys the `DQT`/`SOF`/`DHT` segments but not the entropy-coded
