@@ -1974,9 +1974,165 @@ impl Carver {
                         }
                         // Rebuild impossible (no SOS/chain, or the bytes
                         // fail the own validator or the MCU walker): fall
-                        // through to the tail salvage below, which writes a
-                        // partial/ file instead.
+                        // through to the estimated rebuild, then to the
+                        // tail salvage below.
                         Ok(Err(_)) => {}
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    }
+                }
+                // ROADMAP 8.12.4: estimated rebuild — the exact rebuild
+                // failed because the table chain is destroyed (the scan
+                // survived). Assumed Annex K / IJG-q90 tables, geometry
+                // from the DC statistics; result always goes in partial/
+                // with confidence limited to those statistics.
+                let mut jpeg_estimate_note: Option<String> = None;
+                if kind == CarveKind::Jpeg {
+                    match jpeg_estimated_rebuild(
+                        &mut source,
+                        position,
+                        file_len,
+                        self.options.max_size,
+                        &covered,
+                    ) {
+                        Ok(Ok(rebuilt)) => {
+                            let size = rebuilt.bytes.len() as u64;
+                            if size >= self.options.min_size {
+                                let sha256 = rebuilt.sha256.clone();
+                                let entropy = rebuilt.entropy;
+                                let notes = rebuilt.notes.clone();
+                                if !self.ext_filter.allows(CarveKind::Jpeg, "jpg") {
+                                    covered.push((rebuilt.kept_dump_offset, rebuilt.chain_end));
+                                    report.filtered += 1;
+                                    continue;
+                                }
+                                covered.push((rebuilt.kept_dump_offset, rebuilt.chain_end));
+                                if let Some(&index) = by_hash.get(&sha256) {
+                                    report.duplicates += 1;
+                                    report.duplicate_bytes += size;
+                                    report.files[index]
+                                        .duplicates
+                                        .push(rebuilt.kept_dump_offset);
+                                    continue;
+                                }
+                                let confidence = match rebuilt.confidence {
+                                    crate::jpeg_probe::EstimatedConfidence::Medium => {
+                                        CarveConfidence::Medium
+                                    }
+                                    crate::jpeg_probe::EstimatedConfidence::Low => {
+                                        CarveConfidence::Low
+                                    }
+                                };
+                                let tier = match confidence {
+                                    CarveConfidence::Medium => 2,
+                                    _ => 3,
+                                };
+                                // `cols_corr=0.xx` and `seam=x.x` carry the
+                                // numeric evidence the index promises. The
+                                // evidence column is &'static str across the
+                                // whole index; these two numeric tokens are
+                                // the only dynamic ones, leaked once per
+                                // rebuilt file (~32 bytes each).
+                                let corr_token: &'static str = Box::leak(
+                                    format!("cols_corr={:.2}", rebuilt.corr).into_boxed_str(),
+                                );
+                                let seam_token: &'static str =
+                                    Box::leak(format!("seam={:.1}", rebuilt.seam).into_boxed_str());
+                                let evidence = vec![
+                                    "stuffing_run",
+                                    "annexk_walk_ok",
+                                    "eoi_aligned",
+                                    "converged_boundary",
+                                    corr_token,
+                                    seam_token,
+                                    "annexk_q90",
+                                ];
+                                let path = match out_dir {
+                                    Some(dir) => {
+                                        // An estimated rebuild is an
+                                        // estimate by definition: it always
+                                        // goes beside the other partial files.
+                                        let partial = dir.join("partial");
+                                        if let Err(error) = std::fs::create_dir_all(&partial) {
+                                            failure = Some(error);
+                                            return false;
+                                        }
+                                        let name = carved_file_name_with_ext(
+                                            rebuilt.kept_dump_offset,
+                                            CarveKind::Jpeg,
+                                            "jpg",
+                                            CarveRole::Rebuilt,
+                                            &sha256,
+                                        );
+                                        let path = partial.join(name);
+                                        if path.exists() {
+                                            failure = Some(io::Error::new(
+                                                io::ErrorKind::AlreadyExists,
+                                                format!(
+                                                    "refusing to overwrite '{}'; use a fresh --carve-out",
+                                                    path.display()
+                                                ),
+                                            ));
+                                            return false;
+                                        }
+                                        if let Err(error) = std::fs::write(&path, &rebuilt.bytes) {
+                                            failure = Some(error);
+                                            return false;
+                                        }
+                                        Some(path)
+                                    }
+                                    None => None,
+                                };
+                                by_hash.insert(sha256.clone(), report.files.len());
+                                report.bytes_written += size;
+                                let trailer = rebuilt.trailer;
+                                report.files.push(CarvedFile {
+                                    offset: rebuilt.kept_dump_offset,
+                                    kind: CarveKind::Jpeg,
+                                    size,
+                                    complete: true,
+                                    sha256,
+                                    entropy,
+                                    notes,
+                                    path,
+                                    duplicates: Vec::new(),
+                                    corrupted_offset: Some(rebuilt.kept_dump_offset),
+                                    entropy_spike_at: None,
+                                    partial_encryption: None,
+                                    trailer_offset: trailer.0,
+                                    trailer_len: trailer.1,
+                                    trailer_sha256: trailer.2,
+                                    trailer_preview: trailer.3,
+                                    tracks_intact: None,
+                                    ext: "jpg".to_string(),
+                                    ext_source: "kind".to_string(),
+                                    role: CarveRole::Rebuilt,
+                                    tier,
+                                    evidence,
+                                    confidence,
+                                });
+                                if self.options.max_files != 0
+                                    && report.files.len() >= self.options.max_files
+                                {
+                                    report.truncated = true;
+                                    stop = true;
+                                    return false;
+                                }
+                                if self.options.max_total != 0
+                                    && report.bytes_written >= self.options.max_total
+                                {
+                                    report.truncated = true;
+                                    stop = true;
+                                    return false;
+                                }
+                                continue;
+                            }
+                        }
+                        Ok(Err(reason)) => {
+                            jpeg_estimate_note = Some(reason);
+                        }
                         Err(error) => {
                             failure = Some(error);
                             return false;
@@ -2006,6 +2162,10 @@ impl Carver {
                     extra_evidence,
                     trailer,
                 } = tail;
+                let tail_note = match &jpeg_estimate_note {
+                    Some(reason) => format!("{tail_note}; rebuild=estimate:{reason}"),
+                    None => tail_note,
+                };
                 let size = tail_end - tail_start;
                 if size < self.options.min_size {
                     report.rejected += 1;
@@ -4498,7 +4658,7 @@ fn salvage_jpeg_tail(
 
 /// Minimal JFIF APP0 segment for the rebuilt header (keeps strict viewers
 /// happy; the original APP0 almost never survives).
-const JFIF_APP0: [u8; 18] = [
+pub(crate) const JFIF_APP0: [u8; 18] = [
     0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01,
     0x00, 0x00,
 ];
@@ -4931,6 +5091,124 @@ fn jpeg_exact_rebuild(
         entropy,
         notes,
         trailer,
+    }))
+}
+
+/// A JPEG rebuilt by estimation from a surviving scan (ROADMAP 8.12.4).
+/// Unlike the exact rebuild, this is an *estimate* by definition: the
+/// Huffman tables are the assumed Annex K / IJG defaults (q90), and the
+/// geometry is inferred from the DC statistics. It always lands in
+/// `partial/` with `confidence` limited to those statistics.
+struct EstimatedRebuilt {
+    /// The rebuilt JPEG bytes (`SOI` .. `EOI`).
+    bytes: Vec<u8>,
+    /// Absolute dump offset of the first kept MCU (naming offset).
+    kept_dump_offset: u64,
+    /// Absolute dump offset just past the `FF D9`.
+    chain_end: u64,
+    sha256: String,
+    entropy: f64,
+    notes: String,
+    /// Any bytes that followed the EOI in the dump (recorded in the index).
+    trailer: (Option<u64>, Option<u64>, Option<String>, Option<String>),
+    corr: f32,
+    seam: f32,
+    confidence: crate::jpeg_probe::EstimatedConfidence,
+}
+
+/// Estimated rebuild (ROADMAP 8.12.4): the exact rebuild could not run
+/// (the table chain is destroyed), but the scan itself survives. Returns
+/// `Ok(Err(reason))` when confidence cannot be established (the caller
+/// then keeps the plain `Tail` and records `reason`) or `Err(io)` on real
+/// I/O failure.
+fn jpeg_estimated_rebuild(
+    file: &mut File,
+    position: u64,
+    file_len: u64,
+    max_size: u64,
+    covered: &[(u64, u64)],
+) -> io::Result<Result<EstimatedRebuilt, String>> {
+    let bail = |msg: &str| Ok(Err(msg.to_string()));
+    let prior_end = covered
+        .iter()
+        .filter(|&&(start, _)| start < position)
+        .map(|&(_, end)| end)
+        .max()
+        .unwrap_or(0);
+    let Some(run) = jpeg_stuffing_run(file, position, file_len, max_size, prior_end, JPEG_RUN_MIN)?
+    else {
+        return bail("no stuffing-clean run");
+    };
+    let scan_start = run.start;
+    let end = run.end;
+    let Some(scan) = salvage_read(
+        file,
+        scan_start,
+        (position + 2 - scan_start) as usize,
+        file_len,
+    )?
+    else {
+        return bail("scan vanished mid-rebuild");
+    };
+    let input = crate::jpeg_probe::ScanInput {
+        scan: &scan,
+        run_start_abs: scan_start,
+    };
+    let analysis = match crate::jpeg_probe::analyze(&input) {
+        Ok(analysis) => analysis,
+        Err(reject) => return bail(&reject.to_string()),
+    };
+    let layout_label = analysis.layout_label;
+    let bytes = crate::jpeg_probe::build_file(&input, &analysis, &JFIF_APP0);
+    // Gate 1: own JPEG validator, same as the exact rebuild.
+    match check_carved_jpeg_bytes(&bytes)? {
+        CarvedCheck::Ok => {}
+        CarvedCheck::Rejected(reason) => {
+            return bail(&format!("rebuilt file fails own validator: {reason}"));
+        }
+    }
+    // Gate 2: the MCU walker must decode exactly rows×cols MCUs ending
+    // at the EOI with ≤ 7 padding bits of 1s.
+    let _stats = match crate::jpeg_scan::verify_scan(&bytes) {
+        Ok(stats) => stats,
+        Err(error) => return bail(&format!("MCU walk failed: {error}")),
+    };
+    let sha256 = {
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hex(&hasher.finalize())
+    };
+    let entropy = {
+        let mut counts = [0u64; 256];
+        for &byte in &bytes {
+            counts[byte as usize] += 1;
+        }
+        entropy(&counts, bytes.len() as u64)
+    };
+    let trailer = jpeg_trailer(file, end, file_len)?;
+    let notes = format!(
+        "rebuild: JPEG scan at {:#x}; tables=annexk-assumed q90; {}; cols={} (corr {:.2}, seam {:.1}x); rows kept {}; skipped {} MCU(s) prefix; lost rows ~{} est; {} MCUs kept; EXIF/APP lost; colour cast possible",
+        analysis.kept_dump_offset,
+        layout_label,
+        analysis.cols,
+        analysis.corr,
+        analysis.seam,
+        analysis.rows,
+        analysis.skip_mcus,
+        analysis.lost_rows_est,
+        analysis.kept_mcus,
+    );
+    Ok(Ok(EstimatedRebuilt {
+        bytes,
+        kept_dump_offset: analysis.kept_dump_offset,
+        chain_end: end,
+        sha256,
+        entropy,
+        notes,
+        trailer,
+        corr: analysis.corr,
+        seam: analysis.seam,
+        confidence: analysis.confidence,
     }))
 }
 
@@ -11272,7 +11550,7 @@ mod tests {
 
     #[test]
     fn salvage_recovers_a_jpeg_behind_a_ruined_head() {
-        let clean = clean_scan(12 * 1024, 0xC0FF_EE11_2233_4455);
+        let clean = vec![0xFFu8; 12 * 1024];
         let jpeg = jpeg_sequential(&clean, 512);
         let mut dump = jpeg;
         dump.extend_from_slice(b"RANSOM-ID:8442");

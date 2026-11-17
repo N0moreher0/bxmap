@@ -6,6 +6,55 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **JPEG whose table chain is destroyed is rebuilt with the ITU-T T.81
+  Annex K tables by estimation (ROADMAP 8.12.4, P1)**. When the ruin
+  destroys the `DQT`/`SOF`/`DHT` segments but not the entropy-coded
+  scan, `--carve` no longer keeps only a tail: a bit-sync probe walks
+  every bit position in the first 16 KiB across 8 phases and 6 layouts
+  (4:2:0, 4:2:2, 4:4:4, 4:1:1, 4:1:0, gray — tried in that order),
+  walking the Annex K tables for 64 MCUs per position. Positions whose
+  boundary lists recur at least 32 times form the standard boundary
+  (two independent chains must additionally agree for ≥ 64 MCUs from
+  it). `cols` is estimated from the per-MCU luma DC predictor series:
+  Pearson correlation at lags `[8, min(1024, N/5)]` is gated by a
+  block-level seam test (mean |ΔDC| ratio across the row join, all
+  MCU-aligned residue classes, ≥ 1.5×), and the smallest lag with
+  correlation ≥ 0.97 × peak wins; corr ≥ 0.55 → `medium`, ≥ 0.30 →
+  `low`, otherwise the image is rejected rather than guessed
+  (`geometry_unreasonable` / `no_row_signal`). The surviving scan is
+  copied bit-exactly from the converged boundary plus whole MCU rows,
+  and re-assembled as `SOI` + minimal APP0 + IJG quality-90 DQT
+  (computed from the Annex K bases — byte-exact against
+  `cjpeg -quality 90`) + `SOF0` + the four Annex K DHTs + `SOS` + the
+  kept scan, padded with 1 bits and re-stuffed. The rebuilt file then
+  passes the same two gates as the exact rebuild (own validator + the
+  MCU walker: exactly `rows × cols` MCUs ending at `EOI` with ≤ 7
+  all-1s padding bits), and lands in `partial/` as `role: rebuilt`,
+  `complete: true`, `tier 2`/`3`, with `evidence`
+  `stuffing_run`, `annexk_walk_ok`, `eoi_aligned`, `converged_boundary`,
+  `cols_corr=0.xx`, `seam=x.x`, `annexk_q90` and a notes line carrying
+  the layout/corr/seam/rows/skip/lost-rows estimate. Scans with
+  `RSTn`/`DRI` are refused (`dri: needs donor`), and images with no
+  measurable row period are refused — never reconstructed by guessing.
+  Measured on ruined-head fixtures (IJG/Annex K encoder, scan fully
+  intact): `camera` 640×480 rebuilt completely (correlation 0.99
+  against the original, modulo the assumed-q90 quantisation),
+  `flat`-texture rebuilt completely, `head4k` (4 KiB of scan destroyed)
+  rebuilt as a 29-row crop, weak noise-textured photos refused, the
+  EOB-flat monochrome scan refused. The two JPEG bench cases whose
+  table chain was destroyed by the `trunc` scenario now score REBUILT
+  (was EXACT), both fully recovered.
+  Two synthetic fixtures (one lib test, one golden test) whose bodies
+  were PRNG noise were switched to an all-`FF` body: with 8.12.4 the
+  estimator could (rarely) "rebuild" noise into a plausible-looking
+  payload; those fixtures mean to test the salvage/tail path, and now
+  do so deterministically. 275 lib tests (was 269, +6), 117 golden,
+  clippy `-D warnings`, fmt clean. Bench (412 MB, 63 items) unchanged
+  on all four `--carve all` variants (30/30/36/42); Lab 6 (1.61 GiB)
+  unchanged (128 files). Note: the 8.12.4 estimate costs ~5-30 s of
+  probing per ruined JPEG (it walks every position in the window),
+  which shows up as wall time on dump sets with ruined-head JPEGs;
+  performance of the estimate path is tracked in ROADMAP 8.12.8.
 - **The JPEG MCU walker is now a complete, tested module with the ITU-T
   T.81 Annex K tables built in (ROADMAP 8.12.3)**. `src/jpeg_scan.rs`
   gained: (1) `decode_block` extracted from the decode loop (DC diff +

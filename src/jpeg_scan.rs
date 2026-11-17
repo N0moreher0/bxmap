@@ -189,32 +189,24 @@ impl HuffmanTable {
 
 // --- ITU-T T.81 Annex K (K.3.1/K.3.2/K.3.3/K.3.4) -------------------------
 // Byte-exact against every libjpeg-encoded fixture and camera_sample.jpg
-// checked into this repo (see tests below). The tables are surfaced for
-// the test suite and for ROADMAP 8.12.4; the lib target does not call them
-// yet, so the whole surface carries `#[allow(dead_code)]`.
+// checked into this repo (see tests below).
 
-#[allow(dead_code)]
-const ANNEX_K_DC_LUMA_NR: [u8; 16] = [
+pub(crate) const ANNEX_K_DC_LUMA_NR: [u8; 16] = [
     0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
-#[allow(dead_code)]
-const ANNEX_K_DC_LUMA_VAL: [u8; 12] = [
+pub(crate) const ANNEX_K_DC_LUMA_VAL: [u8; 12] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
 ];
-#[allow(dead_code)]
-const ANNEX_K_DC_CHROMA_NR: [u8; 16] = [
+pub(crate) const ANNEX_K_DC_CHROMA_NR: [u8; 16] = [
     0x00, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
-#[allow(dead_code)]
-const ANNEX_K_DC_CHROMA_VAL: [u8; 12] = [
+pub(crate) const ANNEX_K_DC_CHROMA_VAL: [u8; 12] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
 ];
-#[allow(dead_code)]
-const ANNEX_K_AC_LUMA_NR: [u8; 16] = [
+pub(crate) const ANNEX_K_AC_LUMA_NR: [u8; 16] = [
     0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D,
 ];
-#[allow(dead_code)]
-const ANNEX_K_AC_LUMA_VAL: [u8; 162] = [
+pub(crate) const ANNEX_K_AC_LUMA_VAL: [u8; 162] = [
     0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
     0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
     0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
@@ -227,12 +219,10 @@ const ANNEX_K_AC_LUMA_VAL: [u8; 162] = [
     0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
     0xF9, 0xFA,
 ];
-#[allow(dead_code)]
-const ANNEX_K_AC_CHROMA_NR: [u8; 16] = [
+pub(crate) const ANNEX_K_AC_CHROMA_NR: [u8; 16] = [
     0x00, 0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04, 0x07, 0x05, 0x04, 0x04, 0x00, 0x01, 0x02, 0x77,
 ];
-#[allow(dead_code)]
-const ANNEX_K_AC_CHROMA_VAL: [u8; 162] = [
+pub(crate) const ANNEX_K_AC_CHROMA_VAL: [u8; 162] = [
     0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
     0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33, 0x52, 0xF0,
     0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34, 0xE1, 0x25, 0xF1, 0x17, 0x18, 0x19, 0x1A, 0x26,
@@ -247,7 +237,6 @@ const ANNEX_K_AC_CHROMA_VAL: [u8; 162] = [
 ];
 
 /// The four Annex K tables, built into 16-bit lookups once.
-#[allow(dead_code)]
 pub(crate) struct AnnexK {
     pub dc_luma: HuffmanTable,
     pub dc_chroma: HuffmanTable,
@@ -255,12 +244,10 @@ pub(crate) struct AnnexK {
     pub ac_chroma: HuffmanTable,
 }
 
-#[allow(dead_code)]
 static ANNEX_K: OnceLock<AnnexK> = OnceLock::new();
 
 /// The shared Annex K tables. The LUTs cost ~0.5 MiB (4 tables × 65 536 ×
 /// 2 bytes) and are built once, on first use.
-#[allow(dead_code)]
 pub(crate) fn annex_k() -> &'static AnnexK {
     ANNEX_K.get_or_init(|| AnnexK {
         dc_luma: HuffmanTable::build(&ANNEX_K_DC_LUMA_NR, &ANNEX_K_DC_LUMA_VAL)
@@ -274,7 +261,6 @@ pub(crate) fn annex_k() -> &'static AnnexK {
     })
 }
 
-#[allow(dead_code)]
 impl AnnexK {
     /// Map a scan's components onto the Annex K luma/chroma tables
     /// (component index 0 is treated as luma, the rest as chroma).
@@ -627,7 +613,7 @@ fn parse_huff_tables(bytes: &[u8], upto: usize) -> Result<[Option<HuffmanTable>;
 
 /// Remove `FF 00` byte stuffing and note the restart markers. Returns the
 /// entropy bytes plus the restart positions (byte offsets in the output).
-fn unstuff(data: &[u8]) -> (Vec<u8>, Vec<usize>) {
+pub(crate) fn unstuff(data: &[u8]) -> (Vec<u8>, Vec<usize>) {
     let mut out = Vec::with_capacity(data.len());
     let mut rests = Vec::new();
     let mut i = 0usize;
@@ -664,6 +650,61 @@ fn unstuff(data: &[u8]) -> (Vec<u8>, Vec<usize>) {
     (out, rests)
 }
 
+/// Lenient cousin of [`unstuff`] for ROADMAP 8.12.4's *ruined-head* input,
+/// where the slice may start inside random junk — any `FF xx` pair that
+/// looks like a marker is then random bytes, not a boundary, and stopping
+/// there would truncate the stream to the junk (nothing else finds the
+/// surviving entropy). The caller already bounded the slice to the EOI
+/// position, so no legal marker exists here either; but instead of
+/// stopping we *emit both bytes verbatim*. That keeps the entropy data
+/// byte-for-byte reconstructable, never loses an entropy byte, and lets
+/// the probe's sync attempt fail fast on junk. Rationale on the details:
+///
+/// - `FF 00` is stuffing: emit one `FF`;
+/// - `FF FF` is a fill byte: carries no entropy bits, skip it;
+/// - `FF D0..D7` are restart markers: their *position* is recorded (a real
+///   `DRI` scan must then bail out) but they carry no entropy bytes;
+/// - anything else: the two bytes are junk that happens to look like a
+///   marker: emit both so the dump→unstuffed mapping stays injective.
+pub(crate) fn unstuff_lenient(data: &[u8]) -> (Vec<u8>, Vec<usize>) {
+    let mut out = Vec::with_capacity(data.len());
+    let mut rests = Vec::new();
+    let mut i = 0usize;
+    while i < data.len() {
+        let b = data[i];
+        if b != 0xFF {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let next = data.get(i + 1).copied().unwrap_or(0);
+        match next {
+            0x00 => {
+                out.push(0xFF);
+                i += 2;
+            }
+            0xFF => {
+                // Fill bytes before a marker: the pair carries no entropy
+                // bits; skip both.
+                i += 2;
+            }
+            0xD0..=0xD7 => {
+                rests.push(out.len());
+                i += 2;
+            }
+            _ => {
+                // Junk that happens to look like a marker: keep both bytes.
+                out.push(0xFF);
+                if i + 1 < data.len() {
+                    out.push(next);
+                }
+                i += 2;
+            }
+        }
+    }
+    (out, rests)
+}
+
 /// Borrowed per-component table set, aligned with `ScanGeometry::components`
 /// (ROADMAP 8.12.3: callers need several table sources — the file's own
 /// `DHT` segments, or the shared Annex K tables for probes without tables).
@@ -679,6 +720,10 @@ fn decode_block(
     reader: &mut BitReader<'_>,
     tables: &ComponentTables<'_>,
 ) -> Result<i32, WalkError> {
+    // Reading past the end of the data is an error, never a decode.
+    if reader.remaining() == 0 {
+        return Err(WalkError::Truncated);
+    }
     // DC coefficient: category, then the extra bits.
     let dc_code = tables.dc.lut[reader.peek16() as usize];
     if dc_code.0 == 0 {
@@ -1240,5 +1285,36 @@ mod tests {
         assert_eq!(stats.dc_luma.len(), stats.mcus as usize * 4); // 4:2:0
         assert!(stats.first_boundaries.len() <= FIRST_BOUNDARIES_CAP);
         assert!(stats.dc_luma.len() <= DC_LUMA_CAP);
+    }
+
+    #[test]
+    fn unstuff_lenient_emits_junk_verbatim() {
+        // `FF 09` is junk (not a legal marker): both bytes are emitted so
+        // the dump→unstuffed mapping stays injective.
+        let (out, rests) = unstuff_lenient(&[0xFF, 0x09, 0x01, 0xFF, 0x00, 0x02]);
+        assert_eq!(out, vec![0xFF, 0x09, 0x01, 0xFF, 0x02]);
+        assert!(rests.is_empty());
+        // Fill bytes FF FF carry no entropy bits.
+        let (out, _) = unstuff_lenient(&[0xAB, 0xFF, 0xFF, 0xCD]);
+        assert_eq!(out, vec![0xAB, 0xCD]);
+        // Restart markers are located but carry no entropy bytes.
+        let (out, rests) = unstuff_lenient(&[0x11, 0xFF, 0xD0, 0x22]);
+        assert_eq!(out, vec![0x11, 0x22]);
+        assert_eq!(rests, vec![1]);
+        // A truncated trailing FF is kept, not dropped.
+        let (out, _) = unstuff_lenient(&[0x00, 0xFF]);
+        assert_eq!(out, vec![0x00, 0xFF]);
+    }
+
+    #[test]
+    fn unstuff_lenient_roundtrip_with_unstuff_on_clean_scans() {
+        let eoi = RGB
+            .windows(2)
+            .rposition(|w| w == [0xFF, 0xD9])
+            .expect("fixture ends with EOI");
+        let (scan_start, _) = parse_geometry(RGB).unwrap();
+        let (strict, _) = unstuff(&RGB[scan_start..eoi]);
+        let (lenient, _) = unstuff_lenient(&RGB[scan_start..eoi]);
+        assert_eq!(strict, lenient);
     }
 }

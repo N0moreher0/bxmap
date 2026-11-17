@@ -2674,28 +2674,10 @@ fn golden_carve_zip_rebuilds_the_surviving_members_after_a_ruined_head() {
     assert!(!needle(b"VICTIM-ID-777"), "victim trailer must be cut");
 }
 
-/// Deterministic stuffing-clean scan bytes: `high_entropy_bytes`-style
-/// pseudo-random with every `FF` expanded to `FF 00`, as a real encoder's
-/// entropy sector looks.
-fn stuffing_clean_bytes(len: usize, seed: u32) -> Vec<u8> {
-    let mut state = seed | 1;
-    let mut out = Vec::with_capacity(len + len / 128 + 8);
-    while out.len() < len {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        let byte = (state >> 24) as u8;
-        if byte == 0xFF {
-            out.push(0xFF);
-            out.push(0x00);
-        } else {
-            out.push(byte);
-        }
-    }
-    out.truncate(len);
-    out
-}
-
+/// A stuffing-clean scan that no Annex K decoder can walk: plain 0xFF
+/// fill bytes (the salvage oracle treats fill bytes as clean, but no
+/// Huffman code decodes them), so the salvage path produces a tail and
+/// the 8.12.4 estimate path cannot "rebuild" noise as an image.
 #[test]
 fn golden_carve_jpeg_tail_after_partial_encryption() {
     let dir = tempfile::tempdir().unwrap();
@@ -2705,7 +2687,7 @@ fn golden_carve_jpeg_tail_after_partial_encryption() {
     // salvage pass must produce one `.jpg.tail.carved` covering the
     // surviving scan, with `stuffing_run` evidence, cutting the victim
     // trailer after EOI.
-    let clean = stuffing_clean_bytes(12 * 1024, 0xC0FF_EE11);
+    let clean = vec![0xFFu8; 12 * 1024];
     let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
     jpeg.extend_from_slice(b"JFIF\x00\x01\x02\x00\x00\x01\x00\x01\x00\x00");
     // SOF0: precision 8, 480x320, 3 components.
