@@ -56,6 +56,7 @@ pub mod carve;
 mod carve_ext;
 pub mod chunk;
 pub mod classifier;
+pub(crate) mod jpeg_donor;
 pub(crate) mod jpeg_probe;
 pub(crate) mod jpeg_scan;
 pub use classifier::{

@@ -355,7 +355,7 @@ fn extend(size: u32, bits: u32) -> i32 {
 
 /// Parse the scan-relevant geometry from a fully built JPEG byte string.
 /// Returns the scan start offset (absolute, inside `bytes`) and the geometry.
-fn parse_geometry(bytes: &[u8]) -> Result<(usize, ScanGeometry), WalkError> {
+pub(crate) fn parse_geometry(bytes: &[u8]) -> Result<(usize, ScanGeometry), WalkError> {
     if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
         return Err(WalkError::InvalidSegment("missing SOI marker".to_string()));
     }
@@ -551,7 +551,10 @@ fn parse_geometry(bytes: &[u8]) -> Result<(usize, ScanGeometry), WalkError> {
 }
 
 /// Collect the Huffman tables (up to 4 DC + 4 AC) from the `DHT` segments.
-fn parse_huff_tables(bytes: &[u8], upto: usize) -> Result<[Option<HuffmanTable>; 8], WalkError> {
+pub(crate) fn parse_huff_tables(
+    bytes: &[u8],
+    upto: usize,
+) -> Result<[Option<HuffmanTable>; 8], WalkError> {
     let mut tables: [Option<HuffmanTable>; 8] = std::array::from_fn(|_| None);
     let mut offset = 2usize;
     while offset + 2 <= upto {

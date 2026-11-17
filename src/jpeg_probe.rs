@@ -47,7 +47,10 @@
 
 use std::sync::OnceLock;
 
-use crate::jpeg_scan::{annex_k, walk_mcus, ComponentInfo, ScanGeometry, WalkStats, MAX_MCUS};
+use crate::jpeg_donor::JpegDonor;
+use crate::jpeg_scan::{
+    annex_k, walk_mcus, ComponentInfo, ComponentTables, ScanGeometry, WalkStats, MAX_MCUS,
+};
 
 /// Largest scan window probed (bytes of entropy data, bit phases aside).
 pub const PROBE_WINDOW_BYTES: usize = 16 * 1024;
@@ -112,11 +115,26 @@ impl std::fmt::Display for EstimatedReject {
 
 impl std::error::Error for EstimatedReject {}
 
-/// Estimated-rebuild confidence; only ever reflects the DC statistics.
+/// Estimated-rebuild confidence; only ever reflects the DC statistics
+/// (or the exact-tables donor match).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EstimatedConfidence {
+    /// Donor-table rebuild: the walker decodes the kept scan to exactly
+    /// `rows × cols` MCUs ending at the `EOI` — as strong as the exact
+    /// rebuild, with no DC statistics involved.
+    High,
     Medium,
     Low,
+}
+
+/// The donor rebuild's provenance, carried into the file build and the notes:
+/// structural segments (`SOI`‥`SOS`, `APPn`/`COM` stripped) and the donor tag.
+#[derive(Debug)]
+pub(crate) struct DonorBuild {
+    /// Structural segments after the `SOI` (`DQT`, `SOF`, `DHT`, `SOS`).
+    pub header: Vec<u8>,
+    /// First 4 bytes of the donor's structural-header SHA-256, hex.
+    pub tag: String,
 }
 
 /// The output of a successful estimate: everything the carver needs to
@@ -143,12 +161,15 @@ pub(crate) struct Analysis {
     pub corr: f32,
     /// Block-level seam ratio at the selected lag.
     pub seam: f32,
-    /// `medium` (corr ≥ 0.55) or `low` (0.30..0.55).
+    /// `medium` (corr ≥ 0.55) or `low` (0.30..0.55); donor rebuilds report
+    /// `high` (the walker decodes to exactly `rows × cols` MCUs at `EOI`).
     pub confidence: EstimatedConfidence,
     /// Estimated rows lost to the destroyed head (label estimate).
     pub lost_rows_est: u32,
     /// Absolute dump offset of the kept scan start (as in `{offset:08x}`).
     pub kept_dump_offset: u64,
+    /// Set when the analysis ran on a donor's tables (ROADMAP 8.12.5).
+    pub donor: Option<DonorBuild>,
 }
 
 /// The six common baseline layouts (photo content lives almost entirely
@@ -342,22 +363,35 @@ struct Converged {
 /// [`analyze`] in [3, 2, 1, 4, 5, 0] order (most likely first), so a
 /// passing candidate never pays for the remaining layouts. Returns the
 /// candidate (if any) and whether any 64-MCU anchor was found.
+/// Probe one layout's anchors with the Annex K tables (the estimation path).
 fn probe_layout(unstuffed: &[u8], layout_index: usize) -> (Option<Converged>, bool) {
+    let annex = annex_k();
+    let geometry = probe_geometry(layout_index);
+    let tables = annex.for_components(&geometry);
+    probe_layout_with_tables(unstuffed, layout_index, &geometry, &tables)
+}
+
+/// Probe one layout's anchors with arbitrary tables and geometry. Donor
+/// rebuilds probe with the donor's tables and its own dimensions (the
+/// anchor data alone decides the boundary; the tables just let junk decode).
+fn probe_layout_with_tables(
+    unstuffed: &[u8],
+    layout_index: usize,
+    geometry: &ScanGeometry,
+    tables: &[ComponentTables<'_>],
+) -> (Option<Converged>, bool) {
     /// A boundary position shared by at least this many 64-MCU walks is a
     /// shared resync point of independent chains — a true MCU boundary.
     const FREQ_MIN: u32 = 32;
     /// Minimum size of the frequent set before we trust it as a chain.
     const MIN_FREQ_POSITIONS: usize = 16;
     let window_bytes = unstuffed.len().min(PROBE_WINDOW_BYTES);
-    let annex = annex_k();
-    let geometry = probe_geometry(layout_index);
-    let tables = annex.for_components(&geometry);
     let mut anchors = 0usize;
     let mut freq: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
     for byte in 0..window_bytes {
         for phase in 0..8usize {
             let start_bit = byte * 8 + phase;
-            let stats = walk_mcus(unstuffed, &[], &geometry, &tables, start_bit, PROBE_MCUS);
+            let stats = walk_mcus(unstuffed, &[], geometry, tables, start_bit, PROBE_MCUS);
             if stats.err.is_some() || stats.mcus != PROBE_MCUS {
                 continue;
             }
@@ -388,7 +422,7 @@ fn probe_layout(unstuffed: &[u8], layout_index: usize) -> (Option<Converged>, bo
     'verify: for byte in 0..window_bytes {
         for phase in 0..8usize {
             let start_bit = byte * 8 + phase;
-            let stats = walk_mcus(unstuffed, &[], &geometry, &tables, start_bit, PROBE_MCUS);
+            let stats = walk_mcus(unstuffed, &[], geometry, tables, start_bit, PROBE_MCUS);
             if stats.err.is_some() || stats.mcus != PROBE_MCUS {
                 continue;
             }
@@ -619,10 +653,24 @@ fn kept_start_bit(walk: &WalkStats, skip_mcus: u64) -> Option<usize> {
     boundary_after(&walk.first_boundaries, skip_mcus)
 }
 
-/// Estimate the image with one converged (layout, boundary) candidate.
-/// Returns the analysis or a reject reason; the caller tries the
-/// candidates in order until one passes every gate.
-fn estimate_candidate(
+/// The table source and geometry for one candidate. The estimation path
+/// probes with the Annex K tables at a synthetic 2048×2048 geometry; the
+/// donor path (ROADMAP 8.12.5) probes with the donor's tables at the
+/// donor's own dimensions (the width doubles as the exact `cols`).
+struct CandidateContext<'a> {
+    geometry: ScanGeometry,
+    tables: Vec<ComponentTables<'a>>,
+    /// Donor rebuild: MCUs per row are exact (`width / MCU width`).
+    fixed_cols: Option<u64>,
+    /// Donor rebuild: provenance carried into the result and the file build.
+    donor: Option<DonorBuild>,
+}
+
+/// Evaluate one converged (layout, boundary) candidate through the full
+/// pipeline: walk, row alignment, geometry gates, the definitive walker
+/// gate and the output description. Donor candidates pass the same gates
+/// with exact width/tables instead of the DC estimate.
+fn estimate_candidate_with_context(
     input: &ScanInput<'_>,
     unstuffed: &[u8],
     restarts: &[usize],
@@ -630,22 +678,44 @@ fn estimate_candidate(
         layout_index,
         boundary,
     }: Converged,
+    context: CandidateContext<'_>,
 ) -> Result<Analysis, EstimatedReject> {
+    let CandidateContext {
+        geometry,
+        tables,
+        fixed_cols,
+        donor,
+    } = context;
     // Restart markers we find anywhere before the kept MCU are junk that
     // happened to have a marker shape; only markers at or past the kept
-    // boundary belong to the real scan (a `DRI`-coded image, which P1
-    // refuses: keep the plain Tail).
-    let geometry = probe_geometry(layout_index);
-    let annex = annex_k();
-    let tables = annex.for_components(&geometry);
+    // boundary belong to the real scan (a `DRI`-coded image, which is out
+    // of scope for now: keep the plain Tail).
     let walk = walk_mcus(unstuffed, &[], &geometry, &tables, boundary, MAX_MCUS);
     let total_mcus = walk.mcus;
     if total_mcus < MIN_MCUS_FROM_BOUNDARY {
         return Err(EstimatedReject::TooFewMcus);
     }
     let fpm = luma_blocks_per_mcu(layout_index);
-    let estimate = estimate_cols(&walk.dc_luma, fpm)?;
-    let cols = estimate.cols as u64;
+    let (cols, corr, seam, confidence) = match fixed_cols {
+        // Donor: the width is known exactly; no DC statistics are needed
+        // (and the kept scan's DC predictors still start at zero, so a
+        // colour cast is still possible — the notes keep saying so).
+        Some(cols) => (cols, 1.0, 1.0, EstimatedConfidence::High),
+        None => {
+            let estimate = estimate_cols(&walk.dc_luma, fpm)?;
+            let confidence = if estimate.corr >= MEDIUM_CORR {
+                EstimatedConfidence::Medium
+            } else {
+                EstimatedConfidence::Low
+            };
+            (
+                estimate.cols as u64,
+                estimate.corr,
+                estimate.seam,
+                confidence,
+            )
+        }
+    };
     let skip_mcus = total_mcus % cols;
     let kept_mcus = total_mcus - skip_mcus;
     let rows = kept_mcus / cols;
@@ -678,15 +748,14 @@ fn estimate_candidate(
     let kept_geometry = ScanGeometry {
         width: u16::try_from(width).unwrap_or(u16::MAX),
         height: u16::try_from(height).unwrap_or(u16::MAX),
-        components: geometry.components,
-        dri: 0,
+        components: geometry.components.clone(),
+        dri: geometry.dri,
     };
-    let kept_tables = annex.for_components(&kept_geometry);
     let kept_walk = walk_mcus(
         unstuffed,
         &[],
         &kept_geometry,
-        &kept_tables,
+        &tables,
         kept_start,
         rows.saturating_mul(cols),
     );
@@ -707,11 +776,6 @@ fn estimate_candidate(
     let prefix_bytes = kept_start as f64 / 8.0;
     let prefix_mcus = prefix_bytes / bytes_per_mcu;
     let lost_rows_est = (prefix_mcus / cols as f64).round() as u32;
-    let confidence = if estimate.corr >= MEDIUM_CORR {
-        EstimatedConfidence::Medium
-    } else {
-        EstimatedConfidence::Low
-    };
     // End-of-data trailing bits are *not* gated here: the kept MCUs are
     // copied bit-exactly into the rebuilt scan (padded with 1s up to a
     // byte boundary), and the rebuilt file then passes the same gates as
@@ -722,31 +786,207 @@ fn estimate_candidate(
     Ok(Analysis {
         layout_index,
         layout_label: LAYOUTS[layout_index].label,
-        cols: estimate.cols as u32,
+        cols: cols as u32,
         rows: rows as u32,
         skip_mcus,
         kept_mcus,
         kept_start_bit: kept_start,
         kept_end_bit: kept_walk.end_bit,
-        corr: estimate.corr,
-        seam: estimate.seam,
+        corr,
+        seam,
         confidence,
         lost_rows_est,
         kept_dump_offset: input.run_start_abs
             + dump_offset_of_unstuffed_byte(input.scan, kept_start / 8),
+        donor,
     })
 }
 
+/// Estimate one candidate with the Annex K tables at the synthetic
+/// geometry (the 8.12.4 estimation path).
+fn estimate_candidate(
+    input: &ScanInput<'_>,
+    unstuffed: &[u8],
+    restarts: &[usize],
+    converged @ Converged { layout_index, .. }: Converged,
+) -> Result<Analysis, EstimatedReject> {
+    let geometry = probe_geometry(layout_index);
+    let annex = annex_k();
+    let tables = annex.for_components(&geometry);
+    estimate_candidate_with_context(
+        input,
+        unstuffed,
+        restarts,
+        converged,
+        CandidateContext {
+            geometry,
+            tables,
+            fixed_cols: None,
+            donor: None,
+        },
+    )
+}
+
+/// Fast path for a fully intact scan (the header-only ruin): the scan
+/// starts exactly at MCU 0 with exact donor tables, so the frequency-map
+/// probe is unnecessary. Returns `None` when the scan does not decode
+/// cleanly from bit 0 or the MCU count is off — the probe path handles
+/// those (e.g. a mid-scan boundary behind destroyed MCUs).
+fn donor_direct_candidate(
+    input: &ScanInput<'_>,
+    unstuffed: &[u8],
+    restarts: &[usize],
+    donor: &JpegDonor,
+) -> Option<Analysis> {
+    let layout_index = donor.layout_index;
+    let geometry = donor.geometry();
+    let tables = donor.tables();
+    let cols = u64::from(donor.width) / mcu_width_px(layout_index);
+    let walk = walk_mcus(unstuffed, &[], &geometry, &tables, 0, MAX_MCUS);
+    let total_mcus = walk.mcus;
+    if total_mcus < MIN_MCUS_FROM_BOUNDARY {
+        return None;
+    }
+    if total_mcus % cols != 0 {
+        // The boundary sits mid-MCU (some leading MCUs were destroyed);
+        // leave the probe to find it.
+        return None;
+    }
+    let rows = total_mcus / cols;
+    let width = cols * mcu_width_px(layout_index);
+    let height = rows * mcu_height_px(layout_index);
+    if width < MIN_SIDE_PX || height < MIN_SIDE_PX {
+        return None;
+    }
+    let aspect = width as f64 / height as f64;
+    if !(MIN_ASPECT..=MAX_ASPECT).contains(&aspect) {
+        return None;
+    }
+    if rows < MIN_ROWS {
+        return None;
+    }
+    let kept_walk = walk_mcus(
+        unstuffed,
+        &[],
+        &geometry,
+        &tables,
+        0,
+        rows.saturating_mul(cols),
+    );
+    if kept_walk.err.is_some() || kept_walk.mcus != rows * cols {
+        return None;
+    }
+    // Restart markers inside the kept scan mean the file is DRI-coded;
+    // a DRI-0 donor cannot be its sibling (the estimation path rejects
+    // these with `dri: needs donor`).
+    if restarts
+        .iter()
+        .any(|&restart| restart.saturating_mul(8) < kept_walk.end_bit)
+    {
+        return None;
+    }
+    Some(Analysis {
+        layout_index,
+        layout_label: LAYOUTS[layout_index].label,
+        cols: cols as u32,
+        rows: rows as u32,
+        skip_mcus: 0,
+        kept_mcus: total_mcus,
+        kept_start_bit: 0,
+        kept_end_bit: kept_walk.end_bit,
+        corr: 1.0,
+        seam: 1.0,
+        confidence: EstimatedConfidence::High,
+        lost_rows_est: 0,
+        kept_dump_offset: input.run_start_abs,
+        donor: Some(DonorBuild {
+            header: donor.header_segments().to_vec(),
+            tag: donor.tag.clone(),
+        }),
+    })
+}
+
+/// Evaluate one converged candidate against a donor (ROADMAP 8.12.5): the
+/// donor's tables and dimensions are exact, so `cols` is known without the
+/// DC correlation, and a passing candidate yields a `high` confidence
+/// rebuild.
+fn donor_candidate(
+    input: &ScanInput<'_>,
+    unstuffed: &[u8],
+    restarts: &[usize],
+    converged @ Converged { layout_index, .. }: Converged,
+    donor: &JpegDonor,
+) -> Result<Analysis, EstimatedReject> {
+    let geometry = donor.geometry();
+    let tables = donor.tables();
+    let cols = u64::from(donor.width) / mcu_width_px(layout_index);
+    estimate_candidate_with_context(
+        input,
+        unstuffed,
+        restarts,
+        converged,
+        CandidateContext {
+            geometry,
+            tables,
+            fixed_cols: Some(cols),
+            donor: Some(DonorBuild {
+                header: donor.header_segments().to_vec(),
+                tag: donor.tag.clone(),
+            }),
+        },
+    )
+}
+
 /// Analyze a survived scan and, on success, describe the rebuilt file.
-/// Layouts are probed one at a time in the order most likely to produce
-/// photo content (4:2:0 first); the first layout whose candidate passes
-/// every gate wins, so a passing candidate never pays for probing the
-/// rest. The final byte-level build happens in [`build_file`].
-pub(crate) fn analyze(input: &ScanInput<'_>) -> Result<Analysis, EstimatedReject> {
+/// Donors (ROADMAP 8.12.5) are tried first: their tables and dimensions are
+/// exact, so no DC statistics are needed. Then layouts are probed one at a
+/// time in the order most likely to produce photo content (4:2:0 first); the
+/// first layout whose candidate passes every gate wins. The final byte-level
+/// build happens in [`build_file`].
+pub(crate) fn analyze(
+    input: &ScanInput<'_>,
+    donors: &[JpegDonor],
+) -> Result<Analysis, EstimatedReject> {
     let (unstuffed, restarts) = crate::jpeg_scan::unstuff_lenient(input.scan);
     let layout_order = [3usize, 2, 1, 4, 5, 0];
     let mut found_any_anchor = false;
     let mut first_reject: Option<EstimatedReject> = None;
+    // Donor candidates first: exact tables beat the Annex K tables and the
+    // DC-correlation guess. A wrong donor is rejected by the walker and the
+    // estimation path still runs.
+    for donor in donors {
+        // Fast path: a fully intact scan (header-only ruin) decodes from
+        // MCU 0 with the donor tables; the probe is only needed when it
+        // does not.
+        if let Some(analysis) = donor_direct_candidate(input, &unstuffed, &restarts, donor) {
+            return Ok(analysis);
+        }
+        let geometry = donor.geometry();
+        let tables = donor.tables();
+        let (candidate, any_anchor) =
+            probe_layout_with_tables(&unstuffed, donor.layout_index, &geometry, &tables);
+        found_any_anchor |= any_anchor;
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        match donor_candidate(input, &unstuffed, &restarts, candidate, donor) {
+            Ok(analysis) => return Ok(analysis),
+            // Restart markers in the kept scan: this donor cannot be the
+            // sibling (or the file is `DRI`-coded); the estimation path
+            // reports `dri: needs donor` as usual.
+            Err(EstimatedReject::NeedsDonor) => {
+                // Restart markers in the kept scan: this donor cannot be the
+                // sibling (or the file is `DRI`-coded); the estimation path
+                // reports `dri: needs donor` as usual.
+                continue;
+            }
+            Err(reject) => {
+                if first_reject.is_none() {
+                    first_reject = Some(reject);
+                }
+            }
+        }
+    }
     for layout_index in layout_order {
         let (candidate, any_anchor) = probe_layout(&unstuffed, layout_index);
         found_any_anchor |= any_anchor;
@@ -897,12 +1137,15 @@ fn annex_k_dht_segments() -> Vec<u8> {
     out
 }
 
-/// Build the rebuilt JPEG: `SOI` + minimal APP0 + assumed `q90` DQTs +
-/// `SOF0` + Annex K DHTs + `SOS` + the bit-exact kept scan + `EOI`.
+/// Build the rebuilt JPEG. With a donor (ROADMAP 8.12.5): `SOI` + minimal
+/// `JFIF` + the donor's structural segments (`APPn`/`COM` stripped) + the
+/// bit-exact kept scan + `EOI` — the donor's own image dimensions are kept,
+/// so the file is a byte-consistent baseline JPEG whose only lost data is
+/// the overwritten head. Otherwise: `SOI` + minimal `JFIF` + assumed `q90`
+/// DQTs + `SOF0` + Annex K DHTs + `SOS` (the 8.12.4 estimation build).
 pub(crate) fn build_file(input: &ScanInput<'_>, analysis: &Analysis, jfif_app0: &[u8]) -> Vec<u8> {
     let layout_index = analysis.layout_index;
     let layout = &LAYOUTS[layout_index];
-    let q90 = q90_tables();
     let (unstuffed, _) = crate::jpeg_scan::unstuff_lenient(input.scan);
     let width = u64::from(analysis.cols) * mcu_width_px(layout_index);
     let height = u64::from(analysis.rows) * mcu_height_px(layout_index);
@@ -919,11 +1162,22 @@ pub(crate) fn build_file(input: &ScanInput<'_>, analysis: &Analysis, jfif_app0: 
     let mut bytes = Vec::with_capacity(input.scan.len() + 1024);
     bytes.extend_from_slice(&[0xFF, 0xD8]);
     bytes.extend_from_slice(jfif_app0);
-    bytes.extend_from_slice(&dqt_segment(0, &q90[0]));
-    bytes.extend_from_slice(&dqt_segment(1, &q90[1]));
-    bytes.extend_from_slice(&sof0_segment(width as u32, height as u32, &components));
-    bytes.extend_from_slice(&annex_k_dht_segments());
-    bytes.extend_from_slice(&sos_segment(&ids));
+    match &analysis.donor {
+        Some(donor) => {
+            // The donor's structural segments (DQT/SOF/DHT/SOS) — APPn/COM
+            // were stripped at harvest; nothing but the tables and geometry
+            // travels into the rebuilt file.
+            bytes.extend_from_slice(&donor.header);
+        }
+        None => {
+            let q90 = q90_tables();
+            bytes.extend_from_slice(&dqt_segment(0, &q90[0]));
+            bytes.extend_from_slice(&dqt_segment(1, &q90[1]));
+            bytes.extend_from_slice(&sof0_segment(width as u32, height as u32, &components));
+            bytes.extend_from_slice(&annex_k_dht_segments());
+            bytes.extend_from_slice(&sos_segment(&ids));
+        }
+    }
     // The kept scan: bit-exact copy, padded with 1s, re-stuffed.
     let kept_bits = extract_bits(&unstuffed, analysis.kept_start_bit, analysis.kept_end_bit);
     bytes.extend_from_slice(&restuff(&kept_bits));

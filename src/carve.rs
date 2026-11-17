@@ -1254,9 +1254,73 @@ impl Carver {
         result
     }
 
+    /// Harvest complete ('Whole') JPEGs from the dump for the donor rebuild
+    /// (ROADMAP 8.12.5): parse each candidate's header window, keep baseline
+    /// 8-bit donors with 1 or 3 components, deduplicate by structural header
+    /// fingerprint, cap at [`crate::jpeg_donor::MAX_DONORS`]. A dump with no
+    /// usable donors costs one matcher pass over the file.
+    fn collect_jpeg_donors(
+        source: &mut File,
+        dump_path: &str,
+        file_len: u64,
+    ) -> io::Result<Vec<crate::jpeg_donor::JpegDonor>> {
+        let mut donors = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut harvest_error: Option<io::Error> = None;
+        let overlap = max_signature_len().saturating_sub(1);
+        chunk::for_each_chunk(dump_path, chunk::CHUNK_SIZE, overlap, |window| {
+            for found in matcher().aho.find_overlapping_iter(window.data) {
+                if !window.spans_new_bytes(found.end()) {
+                    continue;
+                }
+                let kind = matcher().kinds[found.pattern().as_usize()];
+                if kind != CarveKind::Jpeg {
+                    continue;
+                }
+                let Some(offset) = candidate_offset(kind, window.offset_of(found.start())) else {
+                    continue;
+                };
+                let window_bytes =
+                    crate::jpeg_donor::MAX_DONOR_HEAD.min(file_len - offset) as usize;
+                // A JPEG header is never bigger than this window; a candidate
+                // that needs more simply yields no donor.
+                let head = match salvage_read(source, offset, window_bytes, file_len) {
+                    Ok(Some(head)) => head,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        harvest_error = Some(error);
+                        return false;
+                    }
+                };
+                if let Some(donor) = crate::jpeg_donor::JpegDonor::from_head(&head) {
+                    if seen.insert(donor.tag.clone()) {
+                        donors.push(donor);
+                        if donors.len() >= crate::jpeg_donor::MAX_DONORS {
+                            // Enough distinct donors; stop scanning.
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        })?;
+        if let Some(error) = harvest_error {
+            return Err(error);
+        }
+        Ok(donors)
+    }
+
     fn run(&self, dump_path: &str, out_dir: Option<&Path>) -> io::Result<CarveReport> {
         let file_len = std::fs::metadata(dump_path)?.len();
         let mut source = File::open(dump_path)?;
+        // ROADMAP 8.12.5: a donor pre-pass for JPEG rebuilds. Only when
+        // JPEG is in the carve set *and* the salvage pass can use them
+        // (the rebuild pipeline lives there); otherwise the scan is wasted.
+        let donors = if self.options.kinds.contains(&CarveKind::Jpeg) && self.salvage {
+            Self::collect_jpeg_donors(&mut source, dump_path, file_len)?
+        } else {
+            Vec::new()
+        };
         let mut report = CarveReport::default();
         let mut by_hash: HashMap<String, usize> = HashMap::new();
         let mut covered_end = 0u64;
@@ -1448,7 +1512,7 @@ impl Carver {
             return Err(error);
         }
         if self.salvage {
-            self.salvage_pass(dump_path, out_dir, file_len, &mut report)?;
+            self.salvage_pass(dump_path, out_dir, file_len, &mut report, &donors)?;
         }
         if self.options.kinds.contains(&CarveKind::Text) {
             self.text_pass(dump_path, out_dir, file_len, &mut report)?;
@@ -1472,6 +1536,7 @@ impl Carver {
         out_dir: Option<&Path>,
         file_len: u64,
         report: &mut CarveReport,
+        donors: &[crate::jpeg_donor::JpegDonor],
     ) -> io::Result<()> {
         // A header pass that already hit a cap must not be extended.
         if report.truncated || !self.options.kinds.iter().any(|kind| has_footer(*kind)) {
@@ -1996,6 +2061,7 @@ impl Carver {
                         file_len,
                         self.options.max_size,
                         &covered,
+                        donors,
                     ) {
                         Ok(Ok(rebuilt)) => {
                             let size = rebuilt.bytes.len() as u64;
@@ -2017,38 +2083,56 @@ impl Carver {
                                         .push(rebuilt.kept_dump_offset);
                                     continue;
                                 }
-                                let confidence = match rebuilt.confidence {
+                                let (confidence, tier) = match rebuilt.confidence {
+                                    crate::jpeg_probe::EstimatedConfidence::High => {
+                                        (CarveConfidence::High, 2)
+                                    }
                                     crate::jpeg_probe::EstimatedConfidence::Medium => {
-                                        CarveConfidence::Medium
+                                        (CarveConfidence::Medium, 2)
                                     }
                                     crate::jpeg_probe::EstimatedConfidence::Low => {
-                                        CarveConfidence::Low
+                                        (CarveConfidence::Low, 3)
                                     }
                                 };
-                                let tier = match confidence {
-                                    CarveConfidence::Medium => 2,
-                                    _ => 3,
-                                };
                                 // `cols_corr=0.xx` and `seam=x.x` carry the
-                                // numeric evidence the index promises. The
+                                // numeric evidence the index promises (or the
+                                // donor's tag for the 8.12.5 path). The
                                 // evidence column is &'static str across the
-                                // whole index; these two numeric tokens are
+                                // whole index; these numeric/tag tokens are
                                 // the only dynamic ones, leaked once per
                                 // rebuilt file (~32 bytes each).
-                                let corr_token: &'static str = Box::leak(
-                                    format!("cols_corr={:.2}", rebuilt.corr).into_boxed_str(),
-                                );
-                                let seam_token: &'static str =
-                                    Box::leak(format!("seam={:.1}", rebuilt.seam).into_boxed_str());
-                                let evidence = vec![
-                                    "stuffing_run",
-                                    "annexk_walk_ok",
-                                    "eoi_aligned",
-                                    "converged_boundary",
-                                    corr_token,
-                                    seam_token,
-                                    "annexk_q90",
-                                ];
+                                let evidence = match &rebuilt.donor_tag {
+                                    Some(tag) => {
+                                        let token: &'static str =
+                                            Box::leak(format!("donor={tag}").into_boxed_str());
+                                        vec![
+                                            "stuffing_run",
+                                            "donor_tables",
+                                            "mcu_walk_ok",
+                                            "eoi_aligned",
+                                            "converged_boundary",
+                                            token,
+                                        ]
+                                    }
+                                    None => {
+                                        let corr_token: &'static str = Box::leak(
+                                            format!("cols_corr={:.2}", rebuilt.corr)
+                                                .into_boxed_str(),
+                                        );
+                                        let seam_token: &'static str = Box::leak(
+                                            format!("seam={:.1}", rebuilt.seam).into_boxed_str(),
+                                        );
+                                        vec![
+                                            "stuffing_run",
+                                            "annexk_walk_ok",
+                                            "eoi_aligned",
+                                            "converged_boundary",
+                                            corr_token,
+                                            seam_token,
+                                            "annexk_q90",
+                                        ]
+                                    }
+                                };
                                 let path = match out_dir {
                                     Some(dir) => {
                                         // An estimated rebuild is an
@@ -5111,6 +5195,8 @@ struct EstimatedRebuilt {
     notes: String,
     /// Any bytes that followed the EOI in the dump (recorded in the index).
     trailer: (Option<u64>, Option<u64>, Option<String>, Option<String>),
+    /// Donor tables were used (ROADMAP 8.12.5): the donor's 8-char tag.
+    donor_tag: Option<String>,
     corr: f32,
     seam: f32,
     confidence: crate::jpeg_probe::EstimatedConfidence,
@@ -5120,13 +5206,15 @@ struct EstimatedRebuilt {
 /// (the table chain is destroyed), but the scan itself survives. Returns
 /// `Ok(Err(reason))` when confidence cannot be established (the caller
 /// then keeps the plain `Tail` and records `reason`) or `Err(io)` on real
-/// I/O failure.
+/// I/O failure. `donors` are the complete JPEGs harvested from the same
+/// dump for the 8.12.5 rebuild path.
 fn jpeg_estimated_rebuild(
     file: &mut File,
     position: u64,
     file_len: u64,
     max_size: u64,
     covered: &[(u64, u64)],
+    donors: &[crate::jpeg_donor::JpegDonor],
 ) -> io::Result<Result<EstimatedRebuilt, String>> {
     let bail = |msg: &str| Ok(Err(msg.to_string()));
     let prior_end = covered
@@ -5154,7 +5242,7 @@ fn jpeg_estimated_rebuild(
         scan: &scan,
         run_start_abs: scan_start,
     };
-    let analysis = match crate::jpeg_probe::analyze(&input) {
+    let analysis = match crate::jpeg_probe::analyze(&input, donors) {
         Ok(analysis) => analysis,
         Err(reject) => return bail(&reject.to_string()),
     };
@@ -5186,18 +5274,31 @@ fn jpeg_estimated_rebuild(
         entropy(&counts, bytes.len() as u64)
     };
     let trailer = jpeg_trailer(file, end, file_len)?;
-    let notes = format!(
-        "rebuild: JPEG scan at {:#x}; tables=annexk-assumed q90; {}; cols={} (corr {:.2}, seam {:.1}x); rows kept {}; skipped {} MCU(s) prefix; lost rows ~{} est; {} MCUs kept; EXIF/APP lost; colour cast possible",
-        analysis.kept_dump_offset,
-        layout_label,
-        analysis.cols,
-        analysis.corr,
-        analysis.seam,
-        analysis.rows,
-        analysis.skip_mcus,
-        analysis.lost_rows_est,
-        analysis.kept_mcus,
-    );
+    let notes = match &analysis.donor {
+        Some(donor) => format!(
+            "rebuild: JPEG scan at {:#x}; tables=donor:{}; {}; cols={} (donor); rows kept {}; skipped {} MCU(s) prefix; lost rows ~{} est; {} MCUs kept; EXIF/APP lost; colour cast possible",
+            analysis.kept_dump_offset,
+            donor.tag,
+            layout_label,
+            analysis.cols,
+            analysis.rows,
+            analysis.skip_mcus,
+            analysis.lost_rows_est,
+            analysis.kept_mcus,
+        ),
+        None => format!(
+            "rebuild: JPEG scan at {:#x}; tables=annexk-assumed q90; {}; cols={} (corr {:.2}, seam {:.1}x); rows kept {}; skipped {} MCU(s) prefix; lost rows ~{} est; {} MCUs kept; EXIF/APP lost; colour cast possible",
+            analysis.kept_dump_offset,
+            layout_label,
+            analysis.cols,
+            analysis.corr,
+            analysis.seam,
+            analysis.rows,
+            analysis.skip_mcus,
+            analysis.lost_rows_est,
+            analysis.kept_mcus,
+        ),
+    };
     Ok(Ok(EstimatedRebuilt {
         bytes,
         kept_dump_offset: analysis.kept_dump_offset,
@@ -5206,6 +5307,7 @@ fn jpeg_estimated_rebuild(
         entropy,
         notes,
         trailer,
+        donor_tag: analysis.donor.map(|donor| donor.tag),
         corr: analysis.corr,
         seam: analysis.seam,
         confidence: analysis.confidence,
@@ -11390,6 +11492,87 @@ mod tests {
         assert!(tail.notes.contains("3 chunk(s)"), "{}", tail.notes);
         assert_eq!(tail.offset, 32 + ruined as u64);
         assert_eq!(tail.size, (png.len() - ruined) as u64);
+    }
+
+    /// ROADMAP 8.12.5: a ruined JPEG (head destroyed, scan intact) is
+    /// rebuilt from a donor harvested from the same dump — the complete
+    /// copy later in the file. The donor lends its tables and its exact
+    /// dimensions; the rebuilt file passes the same walker/EOI gates as the
+    /// estimation path but with no DC statistics involved.
+    #[test]
+    fn donor_tables_rebuild_a_jpeg_with_a_destroyed_head() {
+        const RGB: &[u8] = include_bytes!("../tests/fixtures/baseline_288x216_smooth_q80.jpg");
+        // Destroy the header up to (and including) the SOS marker; the scan
+        // itself survives intact from its very first MCU.
+        let sos = RGB
+            .windows(2)
+            .position(|w| w == [0xFF, 0xDA])
+            .expect("fixture must carry SOS");
+        let scan_start = sos + 2 + u16::from_be_bytes([RGB[sos + 2], RGB[sos + 3]]) as usize + 2;
+        let mut ruined = RGB.to_vec();
+        let junk = pseudo_random(scan_start, 0x1EAF_0000_0000_000B);
+        ruined[..scan_start].copy_from_slice(&junk);
+        let mut dump = ruined;
+        dump.extend_from_slice(&[0u8; 64]);
+        dump.extend_from_slice(RGB);
+        let path = write_dump("jpeg-donor", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let out_dir = root.join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Jpeg],
+            min_size: 1,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .with_incomplete_dir(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        // The donor (the intact copy) is carved as Whole, byte-identical.
+        let whole = report
+            .files
+            .iter()
+            .find(|file| file.role == CarveRole::Whole)
+            .expect("the intact copy must be recovered");
+        let whole_bytes = std::fs::read(whole.path.as_ref().expect("written")).unwrap();
+        assert_eq!(whole_bytes, RGB);
+        // The ruined copy is rebuilt from the donor.
+        let rebuilt = report
+            .files
+            .iter()
+            .find(|file| file.role == CarveRole::Rebuilt)
+            .expect("the ruined copy must be rebuilt from the donor");
+        assert_eq!(rebuilt.confidence, CarveConfidence::High, "{rebuilt:?}");
+        assert!(rebuilt.complete);
+        assert_eq!(rebuilt.tier, 2);
+        assert_eq!(rebuilt.kind, CarveKind::Jpeg);
+        assert!(rebuilt.evidence.contains(&"donor_tables"), "{rebuilt:?}");
+        assert!(
+            rebuilt
+                .evidence
+                .iter()
+                .any(|token| token.starts_with("donor=")),
+            "{rebuilt:?}"
+        );
+        assert!(rebuilt.notes.contains("tables=donor:"), "{}", rebuilt.notes);
+        let rebuilt_path = rebuilt.path.as_ref().expect("written to partial/");
+        assert_eq!(
+            rebuilt_path.parent().unwrap(),
+            out_dir.join("partial"),
+            "{rebuilt_path:?}"
+        );
+        assert!(
+            rebuilt_path
+                .to_string_lossy()
+                .ends_with(".jpg.rebuilt.carved"),
+            "{rebuilt_path:?}"
+        );
+        let bytes = std::fs::read(rebuilt_path).unwrap();
+        assert!(bytes.starts_with(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        let stats =
+            crate::jpeg_scan::verify_scan(&bytes).expect("the rebuilt scan must decode exactly");
+        assert_eq!(stats.mcus, 18 * 14, "288x216 4:2:0 is 18x14 MCUs");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// 8.12.2: ruin only the head of a real baseline JPEG (SOI + APP0);

@@ -18,6 +18,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fmt clean.
 
 ### Added
+- **In-source donor rebuild for JPEGs whose table chain was destroyed
+  (ROADMAP 8.12.5)**. When the exact rebuild fails and a `Whole` baseline
+  JPEG exists elsewhere in the dump, bxmap now harvests its tables: one
+  matcher pre-pass keeps up to 64 distinct baseline 8-bit JPEGs (structural
+  segments only — DQT/SOF/DRI/DHT/SOS; APPn/COM are stripped at harvest),
+  then the ruined candidate is rebuilt with the donor's exact tables and
+  dimensions — no `cols` estimation, no Annex K assumption — through the
+  same gates (≥ 64 px per side, aspect 0.1–10, ≥ 5 rows, walker consuming
+  exactly `rows × cols` MCUs at the `EOI`, plus the own validator and
+  `verify_scan`). Confidence is `high`; the result always lands in
+  `partial/` (the head rows are lost for good), tier 2, `role: rebuilt`.
+  Provenance is carried in the index: evidence `donor_tables` +
+  `donor=<tag>`, notes `tables=donor:<tag>`. A direct fast path skips the
+  probe entirely when the scan is intact from MCU 0 (the header-only
+  ruin): one decode pass, milliseconds. `DRI`-coded donors are still
+  refused (restart phase unknown), RSTn ruins keep the plain `Tail`. The
+  estimation path (8.12.4) runs unchanged as the fallback whenever no
+  donor fits. 286 lib tests, 117 golden, clippy `-D warnings`,
+  fmt clean.
 - **PE sniff gained a measured elimination ladder for ruined import
   tables (ROADMAP 8.10.13)**. RAM-dump PEs whose import descriptors
   were zeroed (every one of the Lab 6 driver cases) now classify on
