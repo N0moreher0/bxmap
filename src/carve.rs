@@ -177,9 +177,13 @@ impl CarveConfidence {
 fn with_suspect(
     mut evidence: Vec<&'static str>,
     hint: Option<PartialEncryption>,
+    intermittent: bool,
 ) -> Vec<&'static str> {
     if hint.is_some() {
         evidence.push("suspected-partial-encryption");
+    }
+    if intermittent {
+        evidence.push("suspect:intermittent");
     }
     evidence
 }
@@ -321,6 +325,7 @@ fn push_carved_mp4(
     role: CarveRole,
     trailer: (Option<u64>, Option<u64>, Option<String>, Option<String>),
     tracks_intact: &[TrackIntact],
+    encrypted_ranges: Option<Vec<(u64, u64)>>,
     max_files: usize,
     max_total: u64,
 ) -> bool {
@@ -361,6 +366,7 @@ fn push_carved_mp4(
         trailer_sha256: trailer.2,
         trailer_preview: trailer.3,
         tracks_intact,
+        encrypted_ranges,
         ext: "mp4".to_string(),
         ext_source: "kind".to_string(),
         role,
@@ -953,14 +959,65 @@ fn detect_periodic_high(high: &[bool]) -> Option<(u64, f64)> {
 
 /// Scan `[offset, offset + size)` in [`SPIKE_WINDOW`]-byte windows and report
 /// a periodic high-entropy phase when one is found (ROADMAP 8.7.3).
+/// ROADMAP 8.14.3: derive the intermittent-encryption map from the window
+/// mask: merge high-entropy windows separated by at most one structured
+/// window, and report absolute `[start, end)` dump offsets. Capped at 64
+/// ranges (the longest first, then re-sorted by start).
+fn encrypted_ranges_from_mask(mask: &[bool], base_offset: u64) -> Vec<(u64, u64)> {
+    let window = SPIKE_WINDOW as u64;
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut index = 0usize;
+    while index < mask.len() {
+        if !mask[index] {
+            index += 1;
+            continue;
+        }
+        let mut last = index;
+        let mut probe = index + 1;
+        while probe < mask.len() {
+            if mask[probe] {
+                last = probe;
+                probe += 1;
+                continue;
+            }
+            // A single structured window may sit inside an encrypted run.
+            if probe + 1 < mask.len() && mask[probe + 1] {
+                last = probe + 1;
+                probe += 2;
+            } else {
+                break;
+            }
+        }
+        ranges.push((
+            base_offset + index as u64 * window,
+            base_offset + (last + 1) as u64 * window,
+        ));
+        index = last + 1;
+    }
+    if ranges.len() > 64 {
+        ranges.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
+        ranges.truncate(64);
+        ranges.sort_by_key(|&(start, _)| start);
+    }
+    ranges
+}
+
+/// ROADMAP 8.14.3: runs of high-entropy 4 KiB windows (absolute dump
+/// offsets, start inclusive / end exclusive) that look like an
+/// intermittently-encrypted region. A hint, not a verdict.
+pub type EncryptedRanges = Vec<(u64, u64)>;
+
 /// Files too small to hold 8 full periods of any cycle return `None`.
+/// Returns both the periodic-phase hint and the raw encrypted-window map
+/// (ROADMAP 8.14.3) — the map exists even when no *periodic* pattern
+/// emerges, because intermittent encryption is not always periodic.
 fn periodic_encryption_scan(
     file: &mut File,
     offset: u64,
     size: u64,
-) -> io::Result<Option<PartialEncryption>> {
+) -> io::Result<(Option<PartialEncryption>, EncryptedRanges)> {
     if size < (PARTIAL_ENC_MIN_WINDOWS * SPIKE_WINDOW) as u64 {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
     let mut counts = [0u64; 256];
     let mut filled = 0usize;
@@ -977,13 +1034,26 @@ fn periodic_encryption_scan(
         }
         Ok(())
     })?;
-    Ok(
+    // A uniformly-high file (compressed image/audio, fully encrypted, or
+    // packed) has no *intermittent* structure to map: the entropy map is
+    // noise there. Only report ranges when at least one structured
+    // window exists — same reasoning as `detect_periodic_high`'s duty >= 0.9
+    // rejection.
+    let high = mask.iter().filter(|&&flag| flag).count();
+    let uniform_high = !mask.is_empty() && high as f64 / mask.len() as f64 >= 0.9;
+    let ranges = if uniform_high {
+        Vec::new()
+    } else {
+        encrypted_ranges_from_mask(&mask, offset)
+    };
+    Ok((
         detect_periodic_high(&mask).map(|(period, duty)| PartialEncryption {
             period,
             duty,
             threshold: SPIKE_HIGH,
         }),
-    )
+        ranges,
+    ))
 }
 
 /// One recovered file.
@@ -1032,6 +1102,13 @@ pub struct CarvedFile {
     /// Per-track NAL oracle verdicts (ROADMAP 8.11.4); `None` outside
     /// rebuilt MP4s and for tracks with no AVC/HEVC video codec.
     pub tracks_intact: Option<Vec<TrackIntact>>,
+    /// ROADMAP 8.14.3: runs of high-entropy 4 KiB windows inside the
+    /// (validated) span — a *hint* that tools like LockBit/Conti/BlackCat
+    /// that encrypt a fraction of every file may be at play. Absolute dump
+    /// offsets, start inclusive / end exclusive. `None` when the scan ran
+    /// and found nothing suspicious, or the span was too small to scan.
+    /// Never a verdict: compressed data scores as high entropy too.
+    pub encrypted_ranges: Option<Vec<(u64, u64)>>,
     /// Extension carried before `.carved`: the kind's default, or a more
     /// specific one proven by the content sniff (ROADMAP 8.10.3).
     pub ext: String,
@@ -1452,6 +1529,25 @@ impl Carver {
                             "eocd_rebuilt",
                         ]
                     };
+                    let mut evidence = evidence;
+                    // ROADMAP 8.14.3: map the intermittently-encrypted
+                    // blocks of the ruined archive's span.
+                    let (zip_scan_hint, zip_ranges_vec) =
+                        match periodic_encryption_scan(&mut source, offset, size) {
+                            Ok(pair) => pair,
+                            Err(error) => {
+                                failure = Some(error);
+                                return false;
+                            }
+                        };
+                    let zip_ranges = if zip_ranges_vec.is_empty() {
+                        None
+                    } else {
+                        Some(zip_ranges_vec)
+                    };
+                    if zip_ranges.is_some() {
+                        evidence.push("suspect:intermittent");
+                    }
                     // ROADMAP 8.14.4: bytes after the original (destroyed)
                     // archive span in the dump — recorded, never separated.
                     let trailer = match universal_trailer(&mut source, offset + size, file_len) {
@@ -1527,12 +1623,13 @@ impl Carver {
                         duplicates: Vec::new(),
                         corrupted_offset: Some(offset),
                         entropy_spike_at: None,
-                        partial_encryption: None,
+                        partial_encryption: zip_scan_hint,
                         trailer_offset: trailer.0,
                         trailer_len: trailer.1,
                         trailer_sha256: trailer.2,
                         trailer_preview: trailer.3,
                         tracks_intact: None,
+                        encrypted_ranges: zip_ranges,
                         ext: choice.ext.to_string(),
                         ext_source: choice.source.to_string(),
                         role: CarveRole::Rebuilt,
@@ -1584,13 +1681,15 @@ impl Carver {
                 };
                 // Heuristic: periodic high-entropy phase (1 in N blocks kept
                 // encrypted). Cheap no-op for files too small to show one.
-                let partial_encryption = match periodic_encryption_scan(&mut source, offset, size) {
-                    Ok(hint) => hint,
-                    Err(error) => {
-                        failure = Some(error);
-                        return false;
-                    }
-                };
+                let (partial_encryption, ranges) =
+                    match periodic_encryption_scan(&mut source, offset, size) {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    };
+                let encrypted_ranges = (!ranges.is_empty()).then_some(ranges);
                 // Refine the extension from the bytes just validated (bounded
                 // reads inside this region, no extra pass over the dump).
                 let choice = crate::carve_ext::refine_ext(kind, &mut source, offset, size);
@@ -1665,7 +1764,8 @@ impl Carver {
                 report.bytes_written += size;
                 let (tier, evidence, confidence) =
                     evidence_for(CarveRole::Whole, kind, notes.is_empty(), choice.source);
-                let evidence = with_suspect(evidence, partial_encryption);
+                let evidence =
+                    with_suspect(evidence, partial_encryption, encrypted_ranges.is_some());
                 report.files.push(CarvedFile {
                     offset,
                     kind,
@@ -1684,6 +1784,7 @@ impl Carver {
                     trailer_sha256: trailer.2,
                     trailer_preview: trailer.3,
                     tracks_intact: None,
+                    encrypted_ranges,
                     ext: choice.ext.to_string(),
                     ext_source: choice.source.to_string(),
                     role: CarveRole::Whole,
@@ -1812,6 +1913,20 @@ impl Carver {
                         rebuilt.trailer_sha256.clone(),
                         rebuilt.trailer_preview.clone(),
                     );
+                    // ROADMAP 8.14.3: map the intermittently-encrypted
+                    // payload blocks of the ruined MP4 (LockBit-style
+                    // partial encryption shows up here).
+                    let mp4_ranges = match periodic_encryption_scan(
+                        &mut source,
+                        rebuilt.payload_start,
+                        rebuilt.payload_len,
+                    ) {
+                        Ok((_, ranges)) => (!ranges.is_empty()).then_some(ranges),
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    };
                     covered.push((rebuilt.payload_start, moov_end));
                     let rebuilt_duplicate = by_hash.get(&sha256).copied();
                     if let Some(&index) = rebuilt_duplicate.as_ref() {
@@ -1886,6 +2001,7 @@ impl Carver {
                             CarveRole::Rebuilt,
                             trailer.clone(),
                             &rebuilt.tracks_intact,
+                            mp4_ranges.clone(),
                             self.options.max_files,
                             self.options.max_total,
                         ) {
@@ -1964,6 +2080,7 @@ impl Carver {
                                 CarveRole::Cut,
                                 trailer,
                                 &rebuilt.tracks_intact,
+                                mp4_ranges,
                                 self.options.max_files,
                                 self.options.max_total,
                             )
@@ -2068,9 +2185,28 @@ impl Carver {
                                     }
                                     None => None,
                                 };
+                                // ROADMAP 8.14.3: map intermittently-
+                                // encrypted blocks of the source archive span.
+                                let (_, enc_ranges_vec) = match periodic_encryption_scan(
+                                    &mut source,
+                                    rebuilt.archive_start,
+                                    rebuilt.archive_end - rebuilt.archive_start,
+                                ) {
+                                    Ok(pair) => pair,
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        return false;
+                                    }
+                                };
+                                let encrypted_ranges =
+                                    (!enc_ranges_vec.is_empty()).then_some(enc_ranges_vec);
                                 by_hash.insert(sha256.clone(), report.files.len());
                                 report.bytes_written += size;
-                                let evidence = vec!["eocd_ok", "cd_ok", "local_headers_ok"];
+                                let mut evidence: Vec<&'static str> =
+                                    vec!["eocd_ok", "cd_ok", "local_headers_ok"];
+                                if encrypted_ranges.is_some() {
+                                    evidence.push("suspect:intermittent");
+                                }
                                 report.files.push(CarvedFile {
                                     offset: rebuilt.payload_start,
                                     kind: CarveKind::Zip,
@@ -2089,6 +2225,7 @@ impl Carver {
                                     trailer_sha256: None,
                                     trailer_preview: None,
                                     tracks_intact: None,
+                                    encrypted_ranges,
                                     ext: ext.to_string(),
                                     ext_source,
                                     role: CarveRole::Rebuilt,
@@ -2186,6 +2323,21 @@ impl Carver {
                                     }
                                     None => None,
                                 };
+                                // ROADMAP 8.14.3: map intermittently-
+                                // encrypted blocks of the surviving scan.
+                                let (jpeg_hint, jpeg_ranges_vec) = match periodic_encryption_scan(
+                                    &mut source,
+                                    rebuilt.chain_start,
+                                    rebuilt.chain_end - rebuilt.chain_start,
+                                ) {
+                                    Ok(pair) => pair,
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        return false;
+                                    }
+                                };
+                                let jpeg_ranges =
+                                    (!jpeg_ranges_vec.is_empty()).then_some(jpeg_ranges_vec);
                                 by_hash.insert(sha256.clone(), report.files.len());
                                 report.bytes_written += size;
                                 let trailer = rebuilt.trailer;
@@ -2201,12 +2353,13 @@ impl Carver {
                                     duplicates: Vec::new(),
                                     corrupted_offset: Some(rebuilt.chain_start),
                                     entropy_spike_at: None,
-                                    partial_encryption: None,
+                                    partial_encryption: jpeg_hint,
                                     trailer_offset: trailer.0,
                                     trailer_len: trailer.1,
                                     trailer_sha256: trailer.2,
                                     trailer_preview: trailer.3,
                                     tracks_intact: None,
+                                    encrypted_ranges: jpeg_ranges,
                                     ext: "jpg".to_string(),
                                     ext_source: "kind".to_string(),
                                     role: CarveRole::Rebuilt,
@@ -2436,6 +2589,21 @@ impl Carver {
                                         }
                                     }
                                 }
+                                // ROADMAP 8.14.3: map intermittently-
+                                // encrypted blocks of the kept scan.
+                                let (est_hint, est_ranges_vec) = match periodic_encryption_scan(
+                                    &mut source,
+                                    rebuilt.kept_dump_offset,
+                                    rebuilt.chain_end - rebuilt.kept_dump_offset,
+                                ) {
+                                    Ok(pair) => pair,
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        return false;
+                                    }
+                                };
+                                let est_ranges =
+                                    (!est_ranges_vec.is_empty()).then_some(est_ranges_vec);
                                 by_hash.insert(sha256.clone(), report.files.len());
                                 report.bytes_written += size;
                                 let trailer = rebuilt.trailer;
@@ -2451,12 +2619,13 @@ impl Carver {
                                     duplicates: Vec::new(),
                                     corrupted_offset: Some(rebuilt.kept_dump_offset),
                                     entropy_spike_at: None,
-                                    partial_encryption: None,
+                                    partial_encryption: est_hint,
                                     trailer_offset: trailer.0,
                                     trailer_len: trailer.1,
                                     trailer_sha256: trailer.2,
                                     trailer_preview: trailer.3,
                                     tracks_intact: None,
+                                    encrypted_ranges: est_ranges.clone(),
                                     ext: "jpg".to_string(),
                                     ext_source: "kind".to_string(),
                                     role: CarveRole::Rebuilt,
@@ -2502,12 +2671,13 @@ impl Carver {
                                         duplicates: Vec::new(),
                                         corrupted_offset: Some(rebuilt.kept_dump_offset),
                                         entropy_spike_at: None,
-                                        partial_encryption: None,
+                                        partial_encryption: est_hint,
                                         trailer_offset: trailer.0,
                                         trailer_len: trailer.1,
                                         trailer_sha256: trailer_2,
                                         trailer_preview: trailer_3,
                                         tracks_intact: None,
+                                        encrypted_ranges: est_ranges,
                                         ext: "jpg".to_string(),
                                         ext_source: "kind".to_string(),
                                         role: CarveRole::Rebuilt,
@@ -2589,14 +2759,15 @@ impl Carver {
                         return false;
                     }
                 };
-                let partial_encryption =
+                let (partial_encryption, tail_ranges_vec) =
                     match periodic_encryption_scan(&mut source, tail_start, size) {
-                        Ok(hint) => hint,
+                        Ok(pair) => pair,
                         Err(error) => {
                             failure = Some(error);
                             return false;
                         }
                     };
+                let tail_ranges = (!tail_ranges_vec.is_empty()).then_some(tail_ranges_vec);
                 covered.push((tail_start, tail_end));
                 if let Some(&index) = by_hash.get(&sha256) {
                     report.duplicates += 1;
@@ -2639,7 +2810,7 @@ impl Carver {
                     evidence_for(CarveRole::Tail, kind, false, "kind");
                 let mut evidence = evidence;
                 evidence.extend(extra_evidence);
-                let evidence = with_suspect(evidence, partial_encryption);
+                let evidence = with_suspect(evidence, partial_encryption, tail_ranges.is_some());
                 report.files.push(CarvedFile {
                     offset: tail_start,
                     kind,
@@ -2658,6 +2829,7 @@ impl Carver {
                     trailer_sha256: trailer.2,
                     trailer_preview: trailer.3,
                     tracks_intact: None,
+                    encrypted_ranges: tail_ranges,
                     ext: kind.default_ext().to_string(),
                     ext_source: "kind".to_string(),
                     role: CarveRole::Tail,
@@ -2762,7 +2934,7 @@ impl Carver {
                 report.filtered += 1;
                 continue;
             }
-            let evidence: Vec<&'static str> = if candidate.page1_tree_ok {
+            let mut evidence: Vec<&'static str> = if candidate.page1_tree_ok {
                 vec!["btree_pages_verified", "header_rebuilt", "page1_tree_ok"]
             } else {
                 vec!["btree_pages_verified", "header_rebuilt"]
@@ -2784,6 +2956,17 @@ impl Carver {
                 rebuilt_size,
                 page1_note,
             );
+            // ROADMAP 8.14.3: map intermittently-encrypted blocks of the
+            // destroyed database's pages.
+            let (sqlite_hint, sqlite_ranges_vec) = periodic_encryption_scan(
+                &mut source,
+                candidate.start,
+                candidate.end - candidate.start,
+            )?;
+            let sqlite_ranges = (!sqlite_ranges_vec.is_empty()).then_some(sqlite_ranges_vec);
+            if sqlite_ranges.is_some() {
+                evidence.push("suspect:intermittent");
+            }
             // ROADMAP 8.14.4: bytes after the rebuilt span in the dump.
             let trailer = universal_trailer(&mut source, candidate.end, file_len)?;
             let path = match out_dir {
@@ -2846,12 +3029,13 @@ impl Carver {
                 duplicates: Vec::new(),
                 corrupted_offset: Some(candidate.start),
                 entropy_spike_at: None,
-                partial_encryption: None,
+                partial_encryption: sqlite_hint,
                 trailer_offset: trailer.0,
                 trailer_len: trailer.1,
                 trailer_sha256: trailer.2,
                 trailer_preview: trailer.3,
                 tracks_intact: None,
+                encrypted_ranges: sqlite_ranges,
                 ext: "sqlite".to_string(),
                 ext_source: "kind".to_string(),
                 role: CarveRole::Rebuilt,
@@ -2957,10 +3141,21 @@ impl Carver {
             let notes = format!(
                 "text:region 0x{start:x}-0x{end:x}; boundary cut to newline; looks like {sniff}"
             );
+            // ROADMAP 8.14.3: map intermittently-encrypted blocks.
+            let (text_hint, text_ranges_vec) =
+                match periodic_encryption_scan(&mut source, start, size) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                };
+            let text_ranges = (!text_ranges_vec.is_empty()).then_some(text_ranges_vec);
             by_hash.insert(sha256.clone(), report.files.len());
             report.bytes_written += size;
             let (tier, evidence, confidence) =
                 evidence_for(CarveRole::Whole, CarveKind::Text, false, "kind");
+            let evidence = with_suspect(evidence, text_hint, text_ranges.is_some());
             report.files.push(CarvedFile {
                 offset: start,
                 kind: CarveKind::Text,
@@ -2973,12 +3168,13 @@ impl Carver {
                 duplicates: Vec::new(),
                 corrupted_offset: None,
                 entropy_spike_at: None,
-                partial_encryption: None,
+                partial_encryption: text_hint,
                 trailer_offset: None,
                 trailer_len: None,
                 trailer_sha256: None,
                 trailer_preview: None,
                 tracks_intact: None,
+                encrypted_ranges: text_ranges,
                 ext: CarveKind::Text.default_ext().to_string(),
                 ext_source: "kind".to_string(),
                 role: CarveRole::Whole,
@@ -3077,7 +3273,9 @@ impl Carver {
                     }
                     None => None,
                 };
-                let partial_encryption = periodic_encryption_scan(&mut source, at, size)?;
+                let (partial_encryption, bin_ranges_vec) =
+                    periodic_encryption_scan(&mut source, at, size)?;
+                let bin_ranges = (!bin_ranges_vec.is_empty()).then_some(bin_ranges_vec);
                 let notes = format!(
                     "bin:region 0x{at:x}-0x{end:x}; entropy {entropy:.2} bits/byte; unclassified (compressed, encrypted or packed)"
                 );
@@ -3085,7 +3283,7 @@ impl Carver {
                 report.bytes_written += size;
                 let (tier, evidence, confidence) =
                     evidence_for(CarveRole::Whole, CarveKind::Bin, false, "kind");
-                let evidence = with_suspect(evidence, partial_encryption);
+                let evidence = with_suspect(evidence, partial_encryption, bin_ranges.is_some());
                 report.files.push(CarvedFile {
                     offset: at,
                     kind: CarveKind::Bin,
@@ -3104,6 +3302,7 @@ impl Carver {
                     trailer_sha256: None,
                     trailer_preview: None,
                     tracks_intact: None,
+                    encrypted_ranges: bin_ranges,
                     ext: CarveKind::Bin.default_ext().to_string(),
                     ext_source: "kind".to_string(),
                     role: CarveRole::Whole,
@@ -3204,10 +3403,15 @@ impl Carver {
             let notes = format!(
                 "salvage:head4k: structured data 0x{at:x}-0x{end:x} follows a high-entropy run (entropy drop at 0x{at:x}); its head may be missing or overwritten, format unknown"
             );
+            // ROADMAP 8.14.3: map intermittently-encrypted blocks.
+            let (headloss_hint, headloss_ranges_vec) =
+                periodic_encryption_scan(&mut source, at, size)?;
+            let headloss_ranges = (!headloss_ranges_vec.is_empty()).then_some(headloss_ranges_vec);
             by_hash.insert(sha256.clone(), report.files.len());
             report.bytes_written += size;
             let (tier, evidence, confidence) =
                 evidence_for(CarveRole::Tail, CarveKind::HeadLoss, false, "kind");
+            let evidence = with_suspect(evidence, headloss_hint, headloss_ranges.is_some());
             report.files.push(CarvedFile {
                 offset: at,
                 kind: CarveKind::HeadLoss,
@@ -3220,12 +3424,13 @@ impl Carver {
                 duplicates: Vec::new(),
                 corrupted_offset: Some(at),
                 entropy_spike_at: None,
-                partial_encryption: None,
+                partial_encryption: headloss_hint,
                 trailer_offset: None,
                 trailer_len: None,
                 trailer_sha256: None,
                 trailer_preview: None,
                 tracks_intact: None,
+                encrypted_ranges: headloss_ranges,
                 ext: CarveKind::HeadLoss.default_ext().to_string(),
                 ext_source: "kind".to_string(),
                 role: CarveRole::Tail,
@@ -12194,6 +12399,63 @@ mod tests {
         meta
     }
 
+    // --- ROADMAP 8.14.3: encrypted_ranges ----------------------------------
+
+    #[test]
+    fn encrypted_ranges_merge_single_gap_windows_and_break_on_two() {
+        // base 0x1000: windows 0,1 high (gap 2 low), windows 3 high,
+        // windows 4,5 low (break), window 6 high.
+        let mask = [true, true, false, true, false, false, true];
+        let ranges = encrypted_ranges_from_mask(&mask, 0x1000);
+        assert_eq!(ranges, vec![(0x1000, 0x5000), (0x7000, 0x8000)]);
+    }
+
+    #[test]
+    fn encrypted_ranges_cap_at_64_keeping_first_sorted() {
+        // 100 isolated single-window high runs separated by two low
+        // windows each — merge does not join them, so 100 ranges enter
+        // the cap; the output must be 64, sorted by start.
+        let mut mask = Vec::with_capacity(300);
+        for _ in 0..100 {
+            mask.extend_from_slice(&[true, false, false]);
+        }
+        let ranges = encrypted_ranges_from_mask(&mask, 0x1000);
+        assert_eq!(ranges.len(), 64);
+        for window in ranges.windows(2) {
+            assert!(
+                window[0].0 < window[1].0,
+                "ranges must stay sorted by start"
+            );
+        }
+    }
+
+    #[test]
+    fn periodic_encryption_scan_reports_intermittent_runs() {
+        let mut dump = vec![0u8; 0];
+        for index in 0..80 {
+            if (10..30).contains(&index) || (40..70).contains(&index) {
+                dump.extend_from_slice(&pseudo_random(SPIKE_WINDOW, 0x5C4_0000 + index as u64));
+            } else {
+                dump.extend_from_slice(&vec![0u8; SPIKE_WINDOW]);
+            }
+        }
+        let path = write_dump("intermittent", &dump);
+        let mut file = File::open(&path).unwrap();
+        let dump_len = dump.len() as u64;
+        let (_, ranges) = periodic_encryption_scan(&mut file, 0, dump_len).unwrap();
+        drop(file);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(ranges.len(), 2, "{ranges:?}");
+        assert_eq!(
+            ranges[0],
+            (10 * SPIKE_WINDOW as u64, 30 * SPIKE_WINDOW as u64)
+        );
+        assert_eq!(
+            ranges[1],
+            (40 * SPIKE_WINDOW as u64, 70 * SPIKE_WINDOW as u64)
+        );
+    }
+
     #[test]
     fn universal_trailer_records_nothing_when_dump_ends_at_terminator() {
         let data = vec![0xABu8; 500];
@@ -15480,6 +15742,7 @@ mod evidence_tests {
             trailer_sha256: None,
             trailer_preview: None,
             tracks_intact: None,
+            encrypted_ranges: None,
             ext: ext.to_string(),
             ext_source: "kind".to_string(),
             role,
@@ -15540,9 +15803,30 @@ mod evidence_tests {
                 duty: 0.25,
                 threshold: 7.8,
             }),
+            false,
         );
         assert_eq!(evidence, ["magic", "suspected-partial-encryption"]);
-        assert_eq!(with_suspect(vec!["magic"], None), ["magic"]);
+        assert_eq!(with_suspect(vec!["magic"], None, false), ["magic"]);
+        assert_eq!(
+            with_suspect(vec!["magic"], None, true),
+            ["magic", "suspect:intermittent"]
+        );
+        assert_eq!(
+            with_suspect(
+                vec!["magic"],
+                Some(PartialEncryption {
+                    period: 16_384,
+                    duty: 0.25,
+                    threshold: 7.8,
+                }),
+                true,
+            ),
+            [
+                "magic",
+                "suspected-partial-encryption",
+                "suspect:intermittent",
+            ]
+        );
     }
 
     #[test]

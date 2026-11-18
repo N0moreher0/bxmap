@@ -6,6 +6,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Intermittent-encryption mapping in the index (ROADMAP 8.14.3)**.
+  `--carve` now emits `encrypted_ranges` — absolute dump offsets
+  `[start, end)` of high-entropy 4 KiB windows — into the carve index
+  (JSON/NDJSON, and a new RFC 4180 `--carve-index .csv` writer with a
+  fixed 23-column header). Windows separated by at most one structured
+  window are merged; at most 64 ranges are kept (longest first, then
+  sorted by start); files whose windows are ≥ 90 % high carry no ranges
+  (uniformly-high = packed/compressed, not intermittent). The mapping is
+  recorded for whole carves, salvaged tails, text/bin/head-loss regions
+  and every rebuilt path (ZIP CD rebuilt, ZIP member-salvage, JPEG
+  estimation/exact rebuilds including the DC-adjusted sibling, SQLite
+  header rebuilts, MP4 rebuilt/cut payload span). A record with ranges
+  gains the `suspect:intermittent` evidence token — a hint, not a
+  verdict. Bench files byte-identical (30/63); Lab 6 unchanged (152
+  files); JPEG/MP4 tails keep their 1 MiB caps.
+
 - **Universal ransomware-trailer extractor (ROADMAP 8.14.4)**.
   JPEG (`FF D9`), PNG (`IEND`), PDF (`%%EOF`), ZIP (EOCD) and SQLite
   (`page_size x page_count`) whole carves now record `trailer_*` (offset,
