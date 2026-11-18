@@ -51,7 +51,8 @@ use rayon::prelude::*;
 
 use crate::jpeg_donor::JpegDonor;
 use crate::jpeg_scan::{
-    annex_k, walk_mcus, ComponentInfo, ComponentTables, ScanGeometry, WalkStats, MAX_MCUS,
+    annex_k, walk_mcus, ComponentInfo, ComponentTables, ScanGeometry, WalkStats, MAX_COMPONENTS,
+    MAX_MCUS,
 };
 
 /// Largest scan window probed (bytes of entropy data, bit phases aside).
@@ -129,6 +130,16 @@ pub(crate) enum EstimatedConfidence {
     Low,
 }
 
+/// Everything the DC equalizer (ROADMAP 8.12.6) needs to rewrite the first
+/// DC difference of each component so the per-component DC average lands
+/// on mid-gray.
+#[derive(Debug)]
+pub(crate) struct DcFix {
+    /// Per component, the value to add to the *first* DC difference of the
+    /// kept scan (already clamped to ±2047).
+    pub shifts: [i32; MAX_COMPONENTS],
+}
+
 /// The donor rebuild's provenance, carried into the file build and the notes:
 /// structural segments (`SOI`‥`SOS`, `APPn`/`COM` stripped) and the donor tag.
 #[derive(Debug)]
@@ -172,6 +183,10 @@ pub(crate) struct Analysis {
     pub kept_dump_offset: u64,
     /// Set when the analysis ran on a donor's tables (ROADMAP 8.12.5).
     pub donor: Option<DonorBuild>,
+    /// The re-packed kept scan with the first DC differences rewritten
+    /// so every channel averages mid-gray (ROADMAP 8.12.6). `None` when
+    /// not applicable.
+    pub adjusted_kept: Option<Vec<u8>>,
 }
 
 /// The six common baseline layouts (photo content lives almost entirely
@@ -805,7 +820,7 @@ fn estimate_candidate_with_context(
         &tables,
         kept_start,
         rows.saturating_mul(cols),
-        false,
+        true,
     );
     if kept_walk.err.is_some() || kept_walk.mcus != rows * cols {
         return Err(EstimatedReject::WalkerMismatch);
@@ -824,13 +839,37 @@ fn estimate_candidate_with_context(
     let prefix_bytes = kept_start as f64 / 8.0;
     let prefix_mcus = prefix_bytes / bytes_per_mcu;
     let lost_rows_est = (prefix_mcus / cols as f64).round() as u32;
-    // End-of-data trailing bits are *not* gated here: the kept MCUs are
-    // copied bit-exactly into the rebuilt scan (padded with 1s up to a
-    // byte boundary), and the rebuilt file then passes the same gates as
-    // the exact rebuild — own validator + `verify_scan`, which requires
-    // exactly `rows × cols` MCUs ending with ≤ 7 all-1s padding bits.
-    // The bits after the kept scan belong to the dropped head region and
-    // are not part of the reconstruction.
+    // ROADMAP 8.12.6: the kept scan's DC predictors all start at zero, so
+    // every luma/chroma DC is shifted by a constant per component. Measure
+    // the per-component DC average (kept MCUs only) and, when it is not
+    // mid-gray, record the shift for the adjusted sibling.
+    let n_comp = geometry.components.len();
+    let mut shifts = [0i32; MAX_COMPONENTS];
+    let mut any = false;
+    for (i, shift) in shifts.iter_mut().enumerate().take(n_comp) {
+        let count = kept_walk.dc_blocks[i].max(1) as i64;
+        let avg = kept_walk.dc_sum[i] / count;
+        *shift = (-avg).clamp(-2047, 2047) as i32;
+        any |= *shift != 0;
+    }
+    let dc_fix = if any { Some(DcFix { shifts }) } else { None };
+    // Splice the first DC difference of each shifted component; if the
+    // splice fails we simply keep the raw rebuilt file (no adjusted sibling).
+    let adjusted_kept = match &dc_fix {
+        Some(fix) => {
+            let kept = extract_bits(unstuffed, kept_start, kept_walk.end_bit);
+            crate::jpeg_scan::splice_first_dc(
+                &kept,
+                kept_walk.end_bit - kept_start,
+                &kept_geometry,
+                &tables,
+                &fix.shifts,
+            )
+            .ok()
+        }
+        None => None,
+    };
+    let _ = dc_fix;
     Ok(Analysis {
         layout_index,
         layout_label: LAYOUTS[layout_index].label,
@@ -847,6 +886,7 @@ fn estimate_candidate_with_context(
         kept_dump_offset: input.run_start_abs
             + dump_offset_of_unstuffed_byte(input.scan, kept_start / 8),
         donor,
+        adjusted_kept,
     })
 }
 
@@ -920,7 +960,7 @@ fn donor_direct_candidate(
         &tables,
         0,
         rows.saturating_mul(cols),
-        false,
+        true,
     );
     if kept_walk.err.is_some() || kept_walk.mcus != rows * cols {
         return None;
@@ -934,6 +974,34 @@ fn donor_direct_candidate(
     {
         return None;
     }
+    // ROADMAP 8.12.6: the kept scan's DC predictors all start at zero, so
+    // every channel is shifted by a constant; record the per-component
+    // shifts for the adjusted sibling.
+    let n_comp = geometry.components.len();
+    let mut shifts = [0i32; MAX_COMPONENTS];
+    let mut any = false;
+    for (i, shift) in shifts.iter_mut().enumerate().take(n_comp) {
+        let count = kept_walk.dc_blocks[i].max(1) as i64;
+        let avg = kept_walk.dc_sum[i] / count;
+        *shift = (-avg).clamp(-2047, 2047) as i32;
+        any |= *shift != 0;
+    }
+    let dc_fix = if any { Some(DcFix { shifts }) } else { None };
+    let adjusted_kept = match &dc_fix {
+        Some(fix) => {
+            let kept = extract_bits(unstuffed, 0, kept_walk.end_bit);
+            crate::jpeg_scan::splice_first_dc(
+                &kept,
+                kept_walk.end_bit,
+                &geometry,
+                &tables,
+                &fix.shifts,
+            )
+            .ok()
+        }
+        None => None,
+    };
+    let _ = dc_fix;
     Some(Analysis {
         layout_index,
         layout_label: LAYOUTS[layout_index].label,
@@ -952,6 +1020,7 @@ fn donor_direct_candidate(
             header: donor.header_segments().to_vec(),
             tag: donor.tag.clone(),
         }),
+        adjusted_kept,
     })
 }
 
@@ -1186,16 +1255,12 @@ fn annex_k_dht_segments() -> Vec<u8> {
     out
 }
 
-/// Build the rebuilt JPEG. With a donor (ROADMAP 8.12.5): `SOI` + minimal
-/// `JFIF` + the donor's structural segments (`APPn`/`COM` stripped) + the
-/// bit-exact kept scan + `EOI` — the donor's own image dimensions are kept,
-/// so the file is a byte-consistent baseline JPEG whose only lost data is
-/// the overwritten head. Otherwise: `SOI` + minimal `JFIF` + assumed `q90`
-/// DQTs + `SOF0` + Annex K DHTs + `SOS` (the 8.12.4 estimation build).
-pub(crate) fn build_file(input: &ScanInput<'_>, analysis: &Analysis, jfif_app0: &[u8]) -> Vec<u8> {
+/// Assemble a rebuilt JPEG from the kept scan bytes: `SOI` + minimal
+/// `JFIF` + (donor segments or the assumed-q90 estimation header) + the
+/// bit-exact kept scan + `EOI`.
+fn assemble_file(analysis: &Analysis, jfif_app0: &[u8], kept_bits: &[u8]) -> Vec<u8> {
     let layout_index = analysis.layout_index;
     let layout = &LAYOUTS[layout_index];
-    let (unstuffed, _) = crate::jpeg_scan::unstuff_lenient(input.scan);
     let width = u64::from(analysis.cols) * mcu_width_px(layout_index);
     let height = u64::from(analysis.rows) * mcu_height_px(layout_index);
     let components: Vec<(u8, u8, u8)> = if layout.color {
@@ -1208,7 +1273,7 @@ pub(crate) fn build_file(input: &ScanInput<'_>, analysis: &Analysis, jfif_app0: 
         vec![(1, 0x11, 0)]
     };
     let ids: Vec<u8> = components.iter().map(|&(id, _, _)| id).collect();
-    let mut bytes = Vec::with_capacity(input.scan.len() + 1024);
+    let mut bytes = Vec::with_capacity(kept_bits.len() + 1024);
     bytes.extend_from_slice(&[0xFF, 0xD8]);
     bytes.extend_from_slice(jfif_app0);
     match &analysis.donor {
@@ -1227,11 +1292,33 @@ pub(crate) fn build_file(input: &ScanInput<'_>, analysis: &Analysis, jfif_app0: 
             bytes.extend_from_slice(&sos_segment(&ids));
         }
     }
-    // The kept scan: bit-exact copy, padded with 1s, re-stuffed.
-    let kept_bits = extract_bits(&unstuffed, analysis.kept_start_bit, analysis.kept_end_bit);
-    bytes.extend_from_slice(&restuff(&kept_bits));
+    bytes.extend_from_slice(&restuff(kept_bits));
     bytes.extend_from_slice(&[0xFF, 0xD9]);
     bytes
+}
+
+/// Build the rebuilt JPEG (ROADMAP 8.12.4/8.12.5). With a donor: `SOI` +
+/// minimal `JFIF` + the donor's structural segments + the bit-exact kept
+/// scan + `EOI` — the donor's own image dimensions are kept. Otherwise:
+/// the estimation build (`q90` DQTs + Annex K DHTs).
+///
+/// Returns `(raw, adjusted)`. `adjusted` carries the first DC difference
+/// of each shifted component rewritten so every channel averages mid-gray
+/// (ROADMAP 8.12.6); `None` when the average is already mid-gray or the
+/// splice fails — the caller keeps the raw file either way.
+pub(crate) fn build_file(
+    input: &ScanInput<'_>,
+    analysis: &Analysis,
+    jfif_app0: &[u8],
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    let (unstuffed, _) = crate::jpeg_scan::unstuff_lenient(input.scan);
+    let kept_bits = extract_bits(&unstuffed, analysis.kept_start_bit, analysis.kept_end_bit);
+    let raw = assemble_file(analysis, jfif_app0, &kept_bits);
+    let adjusted = analysis
+        .adjusted_kept
+        .as_deref()
+        .map(|kept| assemble_file(analysis, jfif_app0, kept));
+    (raw, adjusted)
 }
 
 // --- Tests ------------------------------------------------------------------

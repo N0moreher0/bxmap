@@ -5,6 +5,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **DC-equalized sibling for rebuilt JPEGs (ROADMAP 8.12.6)**.
+  A rebuilt baseline JPEG's scan starts at MCU 0 with the DC predictor
+  forced to zero, so every channel of a mostly-uniform image is shifted
+  by a constant. The rebuilt file now detects the per-component shift and,
+  when it is not mid-gray (or neutral chroma), emits an **additional**
+  `.jpg.adjusted.rebuilt.carved` next to the raw `.jpg.rebuilt.carved`:
+  the first DC difference of each shifted component is rewritten at bit
+  level (new category code from the build's DC table, new amplitude bits,
+  rest of the bitstream untouched). Both files pass the own validator and
+  the MCU walker; the adjusted one is validated before it is written, and
+  a failing splice keeps the raw file with no sibling. The raw rebuilt
+  record is unchanged (no `dc_adjusted` evidence/notes); the sibling
+  carries evidence `dc_adjusted`, notes `; dc-adjusted`, the same offset,
+  tier and confidence. New fixture `baseline_512x384_dark_q80.jpg` drives
+  the test. 287 lib tests, 117 golden, clippy `-D warnings`, fmt clean.
+
 ### Changed
 - **The 8.12.4 estimation probe is now parallel (ROADMAP 8.12.8a)**.
   The bit-sync anchor sweep (16 KiB × 8 phases × 130k 64-MCU walks) and

@@ -2067,7 +2067,7 @@ impl Carver {
                             let size = rebuilt.bytes.len() as u64;
                             if size >= self.options.min_size {
                                 let sha256 = rebuilt.sha256.clone();
-                                let entropy = rebuilt.entropy;
+                                let raw_entropy = rebuilt.entropy;
                                 let notes = rebuilt.notes.clone();
                                 if !self.ext_filter.allows(CarveKind::Jpeg, "jpg") {
                                     covered.push((rebuilt.kept_dump_offset, rebuilt.chain_end));
@@ -2169,6 +2169,66 @@ impl Carver {
                                     }
                                     None => None,
                                 };
+                                // ROADMAP 8.12.6: the DC-equalized sibling is
+                                // written beside the raw rebuilt file and
+                                // recorded in the same report.
+                                let mut sibling: Option<AdjustedSibling> = None;
+                                if let (Some(adjusted_bytes), Some(_)) = (&rebuilt.adjusted, &path)
+                                {
+                                    let partial = out_dir.unwrap().join("partial");
+                                    if let Err(error) = std::fs::create_dir_all(&partial) {
+                                        failure = Some(error);
+                                        return false;
+                                    }
+                                    let sha_adj = {
+                                        let mut hasher = Sha256::new();
+                                        hasher.update(adjusted_bytes);
+                                        hex(&hasher.finalize())
+                                    };
+                                    let entropy_adj = {
+                                        let mut counts = [0u64; 256];
+                                        for &byte in adjusted_bytes {
+                                            counts[byte as usize] += 1;
+                                        }
+                                        entropy(&counts, adjusted_bytes.len() as u64)
+                                    };
+                                    let mut adj_name = carved_file_name_with_ext(
+                                        rebuilt.kept_dump_offset,
+                                        CarveKind::Jpeg,
+                                        "jpg",
+                                        CarveRole::Rebuilt,
+                                        &sha_adj,
+                                    );
+                                    adj_name = adj_name.replace(
+                                        ".jpg.rebuilt.carved",
+                                        ".jpg.adjusted.rebuilt.carved",
+                                    );
+                                    let path = partial.join(adj_name);
+                                    if path.exists() {
+                                        failure = Some(io::Error::new(
+                                            io::ErrorKind::AlreadyExists,
+                                            format!(
+                                                "refusing to overwrite '{}'; use a fresh --carve-out",
+                                                path.display()
+                                            ),
+                                        ));
+                                        return false;
+                                    }
+                                    if let Err(error) = std::fs::write(&path, adjusted_bytes) {
+                                        failure = Some(error);
+                                        return false;
+                                    }
+                                    let mut evidence_adj = evidence.clone();
+                                    evidence_adj.push("dc_adjusted");
+                                    sibling = Some(AdjustedSibling {
+                                        sha256: sha_adj,
+                                        entropy: entropy_adj,
+                                        evidence: evidence_adj,
+                                        notes: format!("{notes}; dc-adjusted"),
+                                        trailer_sha256: rebuilt.trailer.2.clone(),
+                                        trailer_preview: rebuilt.trailer.3.clone(),
+                                    });
+                                }
                                 by_hash.insert(sha256.clone(), report.files.len());
                                 report.bytes_written += size;
                                 let trailer = rebuilt.trailer;
@@ -2178,7 +2238,7 @@ impl Carver {
                                     size,
                                     complete: true,
                                     sha256,
-                                    entropy,
+                                    entropy: raw_entropy,
                                     notes,
                                     path,
                                     duplicates: Vec::new(),
@@ -2197,6 +2257,58 @@ impl Carver {
                                     evidence,
                                     confidence,
                                 });
+                                if let Some(AdjustedSibling {
+                                    sha256: sha_adj,
+                                    entropy: entropy_adj,
+                                    evidence: evidence_adj,
+                                    notes: notes_adj,
+                                    trailer_sha256: trailer_2,
+                                    trailer_preview: trailer_3,
+                                }) = sibling.take()
+                                {
+                                    let partial = out_dir.unwrap().join("partial");
+                                    let adj_name = carved_file_name_with_ext(
+                                        rebuilt.kept_dump_offset,
+                                        CarveKind::Jpeg,
+                                        "jpg",
+                                        CarveRole::Rebuilt,
+                                        &sha_adj,
+                                    )
+                                    .replace(".jpg.rebuilt.carved", ".jpg.adjusted.rebuilt.carved");
+                                    let adj_path = partial.join(adj_name);
+                                    by_hash.insert(sha_adj.clone(), report.files.len());
+                                    let size_adj = rebuilt
+                                        .adjusted
+                                        .as_ref()
+                                        .map(|b| b.len() as u64)
+                                        .unwrap_or(0);
+                                    report.bytes_written += size_adj;
+                                    report.files.push(CarvedFile {
+                                        offset: rebuilt.kept_dump_offset,
+                                        kind: CarveKind::Jpeg,
+                                        size: size_adj,
+                                        complete: true,
+                                        sha256: sha_adj,
+                                        entropy: entropy_adj,
+                                        notes: notes_adj,
+                                        path: Some(adj_path),
+                                        duplicates: Vec::new(),
+                                        corrupted_offset: Some(rebuilt.kept_dump_offset),
+                                        entropy_spike_at: None,
+                                        partial_encryption: None,
+                                        trailer_offset: trailer.0,
+                                        trailer_len: trailer.1,
+                                        trailer_sha256: trailer_2,
+                                        trailer_preview: trailer_3,
+                                        tracks_intact: None,
+                                        ext: "jpg".to_string(),
+                                        ext_source: "kind".to_string(),
+                                        role: CarveRole::Rebuilt,
+                                        tier,
+                                        evidence: evidence_adj,
+                                        confidence,
+                                    });
+                                }
                                 if self.options.max_files != 0
                                     && report.files.len() >= self.options.max_files
                                 {
@@ -5178,6 +5290,19 @@ fn jpeg_exact_rebuild(
     }))
 }
 
+/// The DC-equalized sibling (ROADMAP 8.12.6): same pixel content with the
+/// first DC differences rewritten so every channel averages mid-gray, plus
+/// everything needed to record it in the report next to the raw rebuilt
+/// JPEG.
+struct AdjustedSibling {
+    sha256: String,
+    entropy: f64,
+    evidence: Vec<&'static str>,
+    notes: String,
+    trailer_sha256: Option<String>,
+    trailer_preview: Option<String>,
+}
+
 /// A JPEG rebuilt by estimation from a surviving scan (ROADMAP 8.12.4).
 /// Unlike the exact rebuild, this is an *estimate* by definition: the
 /// Huffman tables are the assumed Annex K / IJG defaults (q90), and the
@@ -5197,6 +5322,10 @@ struct EstimatedRebuilt {
     trailer: (Option<u64>, Option<u64>, Option<String>, Option<String>),
     /// Donor tables were used (ROADMAP 8.12.5): the donor's 8-char tag.
     donor_tag: Option<String>,
+    /// Same bytes with the first DC difference of each shifted component
+    /// rewritten so every channel averages mid-gray (ROADMAP 8.12.6).
+    /// `None` when not applicable.
+    adjusted: Option<Vec<u8>>,
     corr: f32,
     seam: f32,
     confidence: crate::jpeg_probe::EstimatedConfidence,
@@ -5247,20 +5376,40 @@ fn jpeg_estimated_rebuild(
         Err(reject) => return bail(&reject.to_string()),
     };
     let layout_label = analysis.layout_label;
-    let bytes = crate::jpeg_probe::build_file(&input, &analysis, &JFIF_APP0);
-    // Gate 1: own JPEG validator, same as the exact rebuild.
+    let (bytes, adjusted) = crate::jpeg_probe::build_file(&input, &analysis, &JFIF_APP0);
+    // Gate 1 (raw): own JPEG validator, same as the exact rebuild.
     match check_carved_jpeg_bytes(&bytes)? {
         CarvedCheck::Ok => {}
         CarvedCheck::Rejected(reason) => {
             return bail(&format!("rebuilt file fails own validator: {reason}"));
         }
     }
-    // Gate 2: the MCU walker must decode exactly rows×cols MCUs ending
+    // Gate 1 (adjusted, same structure): validate it too before offering it.
+    if let Some(adjusted_bytes) = &adjusted {
+        match check_carved_jpeg_bytes(adjusted_bytes)? {
+            CarvedCheck::Ok => {}
+            CarvedCheck::Rejected(reason) => {
+                return bail(&format!(
+                    "adjusted (dc-equalized) file fails own validator: {reason}"
+                ));
+            }
+        }
+    }
+    // Gate 2 (raw): the MCU walker must decode exactly rows×cols MCUs ending
     // at the EOI with ≤ 7 padding bits of 1s.
     let _stats = match crate::jpeg_scan::verify_scan(&bytes) {
         Ok(stats) => stats,
         Err(error) => return bail(&format!("MCU walk failed: {error}")),
     };
+    // Gate 2 (adjusted): rewrote only first-DCs — the walker must agree.
+    if let Some(adjusted_bytes) = &adjusted {
+        match crate::jpeg_scan::verify_scan(adjusted_bytes) {
+            Ok(_) => {}
+            Err(error) => {
+                return bail(&format!("adjusted (dc-equalized) MCU walk failed: {error}"))
+            }
+        }
+    }
     let sha256 = {
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
@@ -5308,6 +5457,7 @@ fn jpeg_estimated_rebuild(
         notes,
         trailer,
         donor_tag: analysis.donor.map(|donor| donor.tag),
+        adjusted,
         corr: analysis.corr,
         seam: analysis.seam,
         confidence: analysis.confidence,
@@ -11492,6 +11642,75 @@ mod tests {
         assert!(tail.notes.contains("3 chunk(s)"), "{}", tail.notes);
         assert_eq!(tail.offset, 32 + ruined as u64);
         assert_eq!(tail.size, (png.len() - ruined) as u64);
+    }
+
+    /// ROADMAP 8.12.6: a ruined JPEG whose scan DC average is far from
+    /// mid-gray gets an adjusted sibling (`-adjusted` name, `dc_adjusted`
+    /// evidence) with the first DC differences rewritten; both files must
+    /// decode cleanly.
+    #[test]
+    fn donor_rebuild_emits_a_dc_adjusted_sibling() {
+        const RGB: &[u8] = include_bytes!("../tests/fixtures/baseline_512x384_dark_q80.jpg");
+        let sos = RGB
+            .windows(2)
+            .position(|w| w == [0xFF, 0xDA])
+            .expect("fixture must carry SOS");
+        let scan_start = sos + 2 + u16::from_be_bytes([RGB[sos + 2], RGB[sos + 3]]) as usize + 2;
+        // Force the stuffing-run detector to stop exactly at the entropy
+        // boundary: a trailing FF 10 (an invalid marker, not a stuffed 00)
+        // in the junk guarantees the ruined copy's entropy run starts
+        // bit-exactly at `scan_start` (deterministic donor direct path).
+        let mut ruined = RGB.to_vec();
+        let junk = pseudo_random(scan_start, 0x1EAF_0000_0000_000C);
+        ruined[..scan_start].copy_from_slice(&junk);
+        ruined[scan_start - 2] = 0xFF;
+        ruined[scan_start - 1] = 0x10;
+        let mut dump = ruined;
+        // The intact copy later in the dump is the JPEG donor (8.12.5):
+        // it lends its tables and geometry to the rebuild.
+        dump.extend_from_slice(&[0u8; 64]);
+        dump.extend_from_slice(RGB);
+        let path = write_dump("jpeg-donor-dark", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let out_dir = root.join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Jpeg],
+            min_size: 1,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .with_incomplete_dir(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        let rebuilt = report
+            .files
+            .iter()
+            .find(|file| file.role == CarveRole::Rebuilt && !file.notes.contains("dc-adjusted"))
+            .expect("the ruined copy must be rebuilt");
+        let adjusted = report
+            .files
+            .iter()
+            .find(|file| file.notes.contains("dc-adjusted"))
+            .expect("the DC-adjusted sibling must be emitted");
+        assert_eq!(adjusted.role, CarveRole::Rebuilt);
+        assert_eq!(adjusted.kind, CarveKind::Jpeg);
+        assert!(adjusted.evidence.contains(&"dc_adjusted"), "{adjusted:?}");
+        assert_eq!(adjusted.offset, rebuilt.offset);
+        assert!(
+            adjusted
+                .path
+                .as_ref()
+                .expect("written")
+                .to_string_lossy()
+                .ends_with(".jpg.adjusted.rebuilt.carved"),
+            "{adjusted:?}"
+        );
+        let bytes = std::fs::read(adjusted.path.as_ref().expect("written")).unwrap();
+        let stats =
+            crate::jpeg_scan::verify_scan(&bytes).expect("the adjusted scan must decode exactly");
+        assert_eq!(stats.mcus, 32 * 24, "512x384 4:2:0 is 32x24 MCUs");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// ROADMAP 8.12.5: a ruined JPEG (head destroyed, scan intact) is

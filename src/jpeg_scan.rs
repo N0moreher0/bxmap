@@ -127,13 +127,24 @@ pub struct WalkStats {
     pub restarts_consumed: usize,
     /// Geometry the walk used.
     pub geometry: ScanGeometry,
+    /// Sum of the per-block DC predictors per component (only when
+    /// `collect_dc`; used by the DC equalizer, ROADMAP 8.12.6).
+    pub dc_sum: [i64; MAX_COMPONENTS],
+    /// Number of 8×8 blocks decoded per component (only when `collect_dc`).
+    pub dc_blocks: [u64; MAX_COMPONENTS],
 }
 
-/// One Huffman table as a 16-bit lookup.
+/// One Huffman table as a 16-bit lookup, plus the raw `DHT` payload so the
+/// encoder can map symbols back to codes (the DC-image fix encodes a new
+/// category, ROADMAP 8.12.6).
 pub(crate) struct HuffmanTable {
     /// `lut[next_16_bits]` → `(length_bits, symbol)`. A length of 0 means
     /// the code does not exist (invalid for this table).
     lut: Vec<(u8, u8)>,
+    /// Symbol-length counts, exactly as stored in the `DHT`.
+    counts: [u8; 16],
+    /// Symbol values in code order.
+    symbols: Vec<u8>,
 }
 
 impl HuffmanTable {
@@ -183,7 +194,30 @@ impl HuffmanTable {
             }
             code <<= 1;
         }
-        Ok(Self { lut })
+        Ok(Self {
+            lut,
+            counts: *counts,
+            symbols: symbols.to_vec(),
+        })
+    }
+
+    /// Encode `symbol` with this table: `(code, length)`. `None` when the
+    /// symbol has no code (should not happen for DC categories 0..=11).
+    pub(crate) fn encode(&self, symbol: u8) -> Option<(u32, u8)> {
+        let mut code: u32 = 0;
+        let mut index = 0usize;
+        for (length_index, &count) in self.counts.iter().enumerate() {
+            let length = (length_index + 1) as u32;
+            for _ in 0..count {
+                if self.symbols[index] == symbol {
+                    return Some((code, length as u8));
+                }
+                index += 1;
+                code += 1;
+            }
+            code <<= 1;
+        }
+        None
     }
 }
 
@@ -719,21 +753,39 @@ pub(crate) struct ComponentTables<'a> {
 /// Decode one 8×8 block: the DC difference plus the AC coefficients, in
 /// zig-zag order. No dequantization, no IDCT. Returns the DC predictor
 /// increment; the AC coefficients are validated but discarded.
+/// Where the DC coefficient of an 8×8 block lives inside the stream, for
+/// the DC equalizer (ROADMAP 8.12.6). Bit offsets are absolute in the
+/// entropy bytes the `BitReader` wraps.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DcSpan {
+    /// Bit position of the DC category code's first bit.
+    pub code_start: usize,
+    /// Bit position of the first extra (amplitude) bit.
+    pub value_start: usize,
+    /// Number of extra bits.
+    pub value_bits: u32,
+    /// The decoded DC difference (JPEG `extend` form).
+    pub diff: i32,
+}
+
 fn decode_block(
     reader: &mut BitReader<'_>,
     tables: &ComponentTables<'_>,
-) -> Result<i32, WalkError> {
+) -> Result<(i32, DcSpan), WalkError> {
     // Reading past the end of the data is an error, never a decode.
     if reader.remaining() == 0 {
         return Err(WalkError::Truncated);
     }
     // DC coefficient: category, then the extra bits.
+    let code_start = reader.bit_pos;
     let dc_code = tables.dc.lut[reader.peek16() as usize];
     if dc_code.0 == 0 {
         return Err(WalkError::InvalidCode);
     }
     reader.skip(dc_code.0 as usize)?;
-    let size = dc_code.1 as u32;
+    let category = dc_code.1;
+    let size = category as u32;
+    let value_start = reader.bit_pos;
     let extra = reader.read_bits(size)?;
     let diff = extend(size, extra);
     // AC coefficients, zig-zag order, up to 63.
@@ -764,7 +816,15 @@ fn decode_block(
         let _coefficient = extend(size as u32, extra);
         k += 1;
     }
-    Ok(diff)
+    Ok((
+        diff,
+        DcSpan {
+            code_start,
+            value_start,
+            value_bits: size,
+            diff,
+        },
+    ))
 }
 
 /// Walk the entropy-coded MCUs (ROADMAP 8.12.3). `unstuffed` is the
@@ -794,6 +854,8 @@ pub(crate) fn walk_mcus(
         } else {
             Vec::new()
         },
+        dc_sum: [0; MAX_COMPONENTS],
+        dc_blocks: [0; MAX_COMPONENTS],
         restarts_consumed: 0,
         geometry: geometry.clone(),
     };
@@ -858,8 +920,8 @@ pub(crate) fn walk_mcus(
             let h = component.h as usize;
             let v = component.v as usize;
             for _ in 0..(h * v) {
-                let diff = match decode_block(&mut reader, &tables[index]) {
-                    Ok(diff) => diff,
+                let (diff, _span) = match decode_block(&mut reader, &tables[index]) {
+                    Ok(span) => span,
                     Err(error) => {
                         stat.err = Some(error);
                         return finish(stat, reader.bit_pos, rest_index);
@@ -869,6 +931,10 @@ pub(crate) fn walk_mcus(
                 // Component 0 is the luma plane in interleaved scans.
                 if index == 0 && collect_dc && stat.dc_luma.len() < DC_LUMA_CAP {
                     stat.dc_luma.push(dc_pred[index]);
+                }
+                if collect_dc {
+                    stat.dc_sum[index] += i64::from(dc_pred[index]);
+                    stat.dc_blocks[index] += 1;
                 }
                 stat.blocks += 1;
             }
@@ -883,6 +949,116 @@ fn finish(mut stat: WalkStats, end_bit: usize, restarts_consumed: usize) -> Walk
     stat.end_bit = end_bit;
     stat.restarts_consumed = restarts_consumed;
     stat
+}
+
+/// Category (in bits) of `|v|`, capped at 11 (JPEG baseline DC categories).
+fn category_abs(v: i32) -> u8 {
+    if v == 0 {
+        return 0;
+    }
+    (32 - v.unsigned_abs().leading_zeros()) as u8
+}
+
+/// The JPEG `extend` amplitude bits for value `v` of category `cat`.
+fn amplitude_bits(v: i32, cat: u8) -> u32 {
+    // Negative values use the one's complement within `cat` bits.
+    if v < 0 {
+        ((1u32 << cat) - 1) - v.unsigned_abs()
+    } else {
+        v.unsigned_abs()
+    }
+}
+
+/// Pack a bit buffer MSB-first; the final byte is padded with 1s
+/// (the encoder pad the rest of the code assumes).
+fn pack_bits(bits: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bits.len() / 8 + 1);
+    let mut acc = 0u8;
+    let mut filled = 0u32;
+    for &bit in bits {
+        acc = (acc << 1) | bit;
+        filled += 1;
+        if filled == 8 {
+            out.push(acc);
+            acc = 0;
+            filled = 0;
+        }
+    }
+    if filled > 0 {
+        acc = (acc << (8 - filled)) | (0xFF >> filled);
+        out.push(acc);
+    }
+    out
+}
+
+/// ROADMAP 8.12.6: rewrite the first DC difference of every component whose
+/// `shift[i]` is non-zero, adding `shift[i]` to that difference so the
+/// per-component DC average lands on mid-gray (each channel ≈ 128). Only
+/// the first DC coefficient of each component is rewritten (category code
+/// and amplitude); the rest of the bitstream is untouched. Returns the
+/// re-packed kept-scan bytes (with 1-bit padding, as `extract_bits` does).
+///
+/// `kept` is the bit-packed kept scan (as produced by `extract_bits`);
+/// `total_bits` is its real length in bits (excluding the encoder pad).
+pub(crate) fn splice_first_dc(
+    kept: &[u8],
+    total_bits: usize,
+    geometry: &ScanGeometry,
+    tables: &[ComponentTables<'_>],
+    shift: &[i32; MAX_COMPONENTS],
+) -> Result<Vec<u8>, WalkError> {
+    // Expand to a bit buffer (small scans, few MiB at worst).
+    let mut bits = Vec::with_capacity(total_bits + 8);
+    for i in 0..total_bits {
+        bits.push((kept[i / 8] >> (7 - (i % 8))) & 1);
+    }
+    // Decode MCU 0 (full blocks; we only fix the first block of each component).
+    let tmp = pack_bits(&bits);
+    let mut reader = BitReader::with_offset(&tmp, 0);
+    let mut spans: Vec<Option<DcSpan>> = vec![None; geometry.components.len()];
+    for (index, component) in geometry.components.iter().enumerate() {
+        for _ in 0..(component.h as usize * component.v as usize) {
+            let (_diff, span) = decode_block(&mut reader, &tables[index])?;
+            if spans[index].is_none() {
+                spans[index] = Some(span);
+            }
+        }
+    }
+    // Replacements, applied from the highest offset backwards.
+    let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    for (index, span) in spans.into_iter().enumerate() {
+        let Some(span) = span else {
+            continue;
+        };
+        let s = shift[index];
+        if s == 0 {
+            continue;
+        }
+        let adjusted = span.diff.saturating_add(s).clamp(-2047, 2047);
+        let category = category_abs(adjusted);
+        let (code, code_len) = tables[index]
+            .dc
+            .encode(category)
+            .ok_or_else(|| WalkError::InvalidSegment("no code for DC category".to_string()))?;
+        let amp = amplitude_bits(adjusted, category);
+        let mut repl = Vec::with_capacity(code_len as usize + category as usize);
+        for i in (0..code_len as usize).rev() {
+            repl.push(((code >> i) & 1) as u8);
+        }
+        for i in (0..category as usize).rev() {
+            repl.push(((amp >> i) & 1) as u8);
+        }
+        edits.push((
+            span.code_start,
+            span.value_start + span.value_bits as usize,
+            repl,
+        ));
+    }
+    edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    for (start, end, repl) in edits {
+        bits.splice(start..end, repl);
+    }
+    Ok(pack_bits(&bits))
 }
 
 /// Decode an entropy sector and check the MCU count and the end-of-scan
