@@ -951,12 +951,16 @@ fn finish(mut stat: WalkStats, end_bit: usize, restarts_consumed: usize) -> Walk
     stat
 }
 
-/// Category (in bits) of `|v|`, capped at 11 (JPEG baseline DC categories).
+/// Category (in bits) of `|v|`, saturated at 11 (JPEG baseline DC
+/// categories). `-2048` would nominally need 12 bits; values reaching the
+/// splice are clamped to ±2047 upstream, and the clamp here keeps the
+/// encoder total even for out-of-contract inputs.
 fn category_abs(v: i32) -> u8 {
     if v == 0 {
         return 0;
     }
-    (32 - v.unsigned_abs().leading_zeros()) as u8
+    let magnitude = v.unsigned_abs().min(2047);
+    (32 - magnitude.leading_zeros()) as u8
 }
 
 /// The JPEG `extend` amplitude bits for value `v` of category `cat`.
@@ -1480,6 +1484,45 @@ mod tests {
         assert_eq!(stats.dc_luma.len(), stats.mcus as usize * 4); // 4:2:0
         assert!(stats.first_boundaries.len() <= FIRST_BOUNDARIES_CAP);
         assert!(stats.dc_luma.len() <= DC_LUMA_CAP);
+    }
+
+    #[test]
+    fn dc_category_and_amplitude_bits_have_total_behaviour() {
+        // category_abs saturates at 11 (baseline DC categories) for any input.
+        assert_eq!(category_abs(0), 0);
+        assert_eq!(category_abs(1), 1);
+        assert_eq!(category_abs(-1), 1);
+        assert_eq!(category_abs(2), 2);
+        assert_eq!(category_abs(3), 2);
+        assert_eq!(category_abs(-4), 3);
+        assert_eq!(category_abs(2047), 11);
+        assert_eq!(category_abs(-2047), 11);
+        assert_eq!(category_abs(-2048), 11, "saturates, never 12 bits");
+        assert_eq!(category_abs(i32::MIN), 11, "saturates for any input");
+        // JPEG `extend` amplitude bits: positive = raw bits, negative =
+        // one's complement within the category.
+        assert_eq!(amplitude_bits(0, 0), 0);
+        assert_eq!(amplitude_bits(5, 3), 5);
+        assert_eq!(amplitude_bits(-5, 3), 2);
+        assert_eq!(amplitude_bits(1, 1), 1);
+        assert_eq!(amplitude_bits(-1, 1), 0);
+        assert_eq!(amplitude_bits(2047, 11), 2047);
+        assert_eq!(amplitude_bits(-2047, 11), 0);
+    }
+
+    #[test]
+    fn annex_k_dc_tables_encode_every_dc_category() {
+        let annex = annex_k();
+        for table in [&annex.dc_luma, &annex.dc_chroma] {
+            for category in 0..=11u8 {
+                let (_, length) = table
+                    .encode(category)
+                    .unwrap_or_else(|| panic!("category {category} must be encodable"));
+                assert!(length > 0);
+            }
+            // an out-of-range category encodes to nothing, never panics
+            assert!(table.encode(12).is_none());
+        }
     }
 
     #[test]

@@ -20,7 +20,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   record is unchanged (no `dc_adjusted` evidence/notes); the sibling
   carries evidence `dc_adjusted`, notes `; dc-adjusted`, the same offset,
   tier and confidence. New fixture `baseline_512x384_dark_q80.jpg` drives
-  the test. 287 lib tests, 117 golden, clippy `-D warnings`, fmt clean.
+  the test. 289 lib tests, 117 golden, clippy `-D warnings`, fmt clean.
+
+### Fixed
+- **The DC-adjusted sibling can no longer abort a carve (ROADMAP 8.12.6)**.
+  A write/create/AlreadyExists failure of the auxiliary sibling previously
+  marked the whole carver run failed after the raw rebuilt file had
+  already been written and reported. The sibling is now skipped with a
+  `[bxmap] warning: ...` line and the raw rebuilt file stands.
+  Additionally `category_abs` saturates at 11 (the `-2048` corner would
+  nominally need 12 bits), and unit tests pin the totality of
+  `category_abs`/`amplitude_bits` plus `HuffmanTable::encode` over all 12
+  DC categories for both Annex K DC tables.
 
 ### Changed
 - **The 8.12.4 estimation probe is now parallel (ROADMAP 8.12.8a)**.

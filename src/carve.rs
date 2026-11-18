@@ -2171,63 +2171,70 @@ impl Carver {
                                 };
                                 // ROADMAP 8.12.6: the DC-equalized sibling is
                                 // written beside the raw rebuilt file and
-                                // recorded in the same report.
+                                // recorded in the same report. The sibling is
+                                // an auxiliary artifact: a failure here must
+                                // never abort the carve — the raw rebuilt file
+                                // (already written) still stands, so the
+                                // sibling is skipped with a warning instead.
                                 let mut sibling: Option<AdjustedSibling> = None;
                                 if let (Some(adjusted_bytes), Some(_)) = (&rebuilt.adjusted, &path)
                                 {
                                     let partial = out_dir.unwrap().join("partial");
                                     if let Err(error) = std::fs::create_dir_all(&partial) {
-                                        failure = Some(error);
-                                        return false;
-                                    }
-                                    let sha_adj = {
-                                        let mut hasher = Sha256::new();
-                                        hasher.update(adjusted_bytes);
-                                        hex(&hasher.finalize())
-                                    };
-                                    let entropy_adj = {
-                                        let mut counts = [0u64; 256];
-                                        for &byte in adjusted_bytes {
-                                            counts[byte as usize] += 1;
+                                        eprintln!(
+                                            "[bxmap] warning: skipping DC-adjusted sibling: cannot create '{}': {error}",
+                                            partial.display()
+                                        );
+                                    } else {
+                                        let sha_adj = {
+                                            let mut hasher = Sha256::new();
+                                            hasher.update(adjusted_bytes);
+                                            hex(&hasher.finalize())
+                                        };
+                                        let entropy_adj = {
+                                            let mut counts = [0u64; 256];
+                                            for &byte in adjusted_bytes {
+                                                counts[byte as usize] += 1;
+                                            }
+                                            entropy(&counts, adjusted_bytes.len() as u64)
+                                        };
+                                        let mut adj_name = carved_file_name_with_ext(
+                                            rebuilt.kept_dump_offset,
+                                            CarveKind::Jpeg,
+                                            "jpg",
+                                            CarveRole::Rebuilt,
+                                            &sha_adj,
+                                        );
+                                        adj_name = adj_name.replace(
+                                            ".jpg.rebuilt.carved",
+                                            ".jpg.adjusted.rebuilt.carved",
+                                        );
+                                        let adj_path = partial.join(&adj_name);
+                                        if adj_path.exists() {
+                                            eprintln!(
+                                                "[bxmap] warning: skipping DC-adjusted sibling: '{}' already exists",
+                                                adj_path.display()
+                                            );
+                                        } else if let Err(error) =
+                                            std::fs::write(&adj_path, adjusted_bytes)
+                                        {
+                                            eprintln!(
+                                                "[bxmap] warning: skipping DC-adjusted sibling: cannot write '{}': {error}",
+                                                adj_path.display()
+                                            );
+                                        } else {
+                                            let mut evidence_adj = evidence.clone();
+                                            evidence_adj.push("dc_adjusted");
+                                            sibling = Some(AdjustedSibling {
+                                                sha256: sha_adj,
+                                                entropy: entropy_adj,
+                                                evidence: evidence_adj,
+                                                notes: format!("{notes}; dc-adjusted"),
+                                                trailer_sha256: rebuilt.trailer.2.clone(),
+                                                trailer_preview: rebuilt.trailer.3.clone(),
+                                            });
                                         }
-                                        entropy(&counts, adjusted_bytes.len() as u64)
-                                    };
-                                    let mut adj_name = carved_file_name_with_ext(
-                                        rebuilt.kept_dump_offset,
-                                        CarveKind::Jpeg,
-                                        "jpg",
-                                        CarveRole::Rebuilt,
-                                        &sha_adj,
-                                    );
-                                    adj_name = adj_name.replace(
-                                        ".jpg.rebuilt.carved",
-                                        ".jpg.adjusted.rebuilt.carved",
-                                    );
-                                    let path = partial.join(adj_name);
-                                    if path.exists() {
-                                        failure = Some(io::Error::new(
-                                            io::ErrorKind::AlreadyExists,
-                                            format!(
-                                                "refusing to overwrite '{}'; use a fresh --carve-out",
-                                                path.display()
-                                            ),
-                                        ));
-                                        return false;
                                     }
-                                    if let Err(error) = std::fs::write(&path, adjusted_bytes) {
-                                        failure = Some(error);
-                                        return false;
-                                    }
-                                    let mut evidence_adj = evidence.clone();
-                                    evidence_adj.push("dc_adjusted");
-                                    sibling = Some(AdjustedSibling {
-                                        sha256: sha_adj,
-                                        entropy: entropy_adj,
-                                        evidence: evidence_adj,
-                                        notes: format!("{notes}; dc-adjusted"),
-                                        trailer_sha256: rebuilt.trailer.2.clone(),
-                                        trailer_preview: rebuilt.trailer.3.clone(),
-                                    });
                                 }
                                 by_hash.insert(sha256.clone(), report.files.len());
                                 report.bytes_written += size;
