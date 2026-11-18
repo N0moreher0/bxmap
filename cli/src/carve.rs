@@ -575,9 +575,22 @@ pub fn write_carve_export_sarif(
     out.flush()
 }
 
-pub fn write_carve_index(report: &CarveReport, path: &str) -> io::Result<()> {
-    let ndjson = path.to_ascii_lowercase().ends_with(".ndjson");
-    let csv = path.to_ascii_lowercase().ends_with(".csv");
+/// Ghi kết quả carve ra `path` — định dạng chọn theo đuôi file, cùng một kênh
+/// với index JSON/NDJSON/CSV (ROADMAP 8.14.7, không thêm cờ mới):
+/// `.ndjson` = một record mỗi dòng · `.csv` = bảng RFC 4180 23 cột cố định ·
+/// `.sarif` / `.sarif.json` = SARIF 2.1.0 (code-scanning) · `.stix` /
+/// `.stix.json` = bundle STIX 2.1 (MISP/OpenCTI/Velociraptor) · đuôi khác =
+/// JSON array. `dump_name` chỉ dùng để đặt tên report trong SARIF/STIX.
+pub fn write_carve_index(report: &CarveReport, dump_name: &str, path: &str) -> io::Result<()> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".sarif") || lower.ends_with(".sarif.json") {
+        return write_carve_export_sarif(report, dump_name, path);
+    }
+    if lower.ends_with(".stix") || lower.ends_with(".stix.json") {
+        return write_carve_export_stix(report, dump_name, path);
+    }
+    let ndjson = lower.ends_with(".ndjson");
+    let csv = lower.ends_with(".csv");
     let mut out = BufWriter::new(File::create(path)?);
     if csv {
         return write_carve_index_csv(report, &mut out);

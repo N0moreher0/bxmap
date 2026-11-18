@@ -742,9 +742,24 @@ Ranh giới giữ nguyên: chỉ cắt, dựng header/CD/header từ cấu trúc
   PE carve từ RAM nằm theo VA (align 0x1000), không theo RawData (align 0x200). Phát hiện mapped vs raw bằng đối chiếu section table với chữ ký tại `PointerToRawData` vs `VirtualAddress`; dịch các section về đúng layout đĩa → `.pe.unmapped.carved` mở được trên IDA/Ghidra/sandbox. Cần đặc tả rõ IAT/loader semantics và cách xử lý khi section bị partial-overwrite; design review trước khi code.
 - **8.14.7 SARIF / STIX 2.1 export · XONG 2026-11-18**
   Hai cờ mới cho `--carve`, không đụng vào bản carved:
-  - **`--export-sarif <file>`** — SARIF 2.1.0: mỗi file carve là một `result` (`note` khi complete, `warning` ngược lại), `carve/<kind>` rule cho mỗi kind, mỗi file một `artifact` với hash `SHA-256`, `partialFingerprints."bxmap.sha256/v1"` trên mọi result (dedupe qua các lần chạy); `invocations[0].executionSuccessful=true`.
-  - **`--export-stix <file>`** — bundle STIX 2.1: một `file` SCO/record (hash, size, offset tuyệt đối, role/tier/ext/evidence/encrypted_ranges dưới `x_bxmap_*`), một `observed-data` gói chúng, một `report` (`report_types: ["threat-report"]`), và **indicator chỉ khi trailer printable khớp hình victim ID** (chỉ `[A-Za-z0-9_-]`, ≥ 6 ký tự, có ≥ 1 chữ cái + 1 chữ số — bỏ binary junk đọc nhầm) với `pattern_type: stix` / `indicator_types: ["unknown"]` — manh mối, không phải verdict. Ids tất định (UUID RFC 4122 layout, nibble v5, suy từ SHA-256) → chạy lại cùng input ra bundle cùng cấu trúc; trùng trailer cùng SHA-256 bị dedupe (id bundle không trùng).
-  - `evidence` giữ trong index; `x_bxmap_trailer_*` giữ trong bundle; **không** tạo verdict "ransomware" — chỉ ghi bằng chứng.
+  - **`--carve-index <file.sarif>` / `.sarif.json`** (không thêm cờ mới —
+    chọn writer theo đuôi file như `.ndjson`/`.csv`) — SARIF 2.1.0: mỗi
+    file carve là một `result` (`note` khi complete, `warning` ngược lại),
+    `carve/<kind>` rule cho mỗi kind, mỗi file một `artifact` với hash
+    `SHA-256`, `partialFingerprints."bxmap.sha256/v1"` trên mọi result
+    (dedupe qua các lần chạy); `invocations[0].executionSuccessful=true`.
+  - **`--carve-index <file.stix>` / `.stix.json`** — bundle STIX 2.1: một
+    `file` SCO/record (hash, size, offset tuyệt đối, role/tier/ext/evidence/encrypted_ranges
+    dưới `x_bxmap_*`), một `observed-data` gói chúng, một `report`
+    (`report_types: ["threat-report"]`), và **indicator chỉ khi trailer
+    printable khớp hình victim ID** (chỉ `[A-Za-z0-9_-]`, ≥ 6 ký tự, có
+    ≥ 1 chữ cái + 1 chữ số — bỏ binary junk đọc nhầm) với
+    `pattern_type: stix` / `indicator_types: ["unknown"]` — manh mối,
+    không phải verdict. Ids tất định (UUID RFC 4122 layout, nibble v5,
+    suy từ SHA-256) → chạy lại cùng input ra bundle cùng cấu trúc;
+    trùng trailer cùng SHA-256 bị dedupe (id bundle không trùng).
+  - `evidence` giữ trong index; `x_bxmap_trailer_*` giữ trong bundle;
+    **không** tạo verdict "ransomware" — chỉ ghi bằng chứng.
   - **Bench (412 MB): files byte-identical 32/32, 30/63; SARIF 32 results (23 note + 9 warning), 13 rules, 32 artifacts có SHA-256; STIX bundle 37 object, 1 indicator = `VICTIM-ID-777`** (ground-truth ransom-note trailer của bench).
   - **Lab 6 (1,61 GiB): 152 file; SARIF 152 results (146 note + 6 warning), 8 rules, 152 artifacts có SHA-256; STIX 155 object, 0 indicator** (không trailer nào khớp hình victim ID — không bịa IOC).
   - Test: golden `golden_carve_export_sarif_and_stix_ir` (dump PNG + trailer "VICTIM-ID-0001": SARIF version/rule/artifact/result đúng; STIX bundle có đủ identity/file/observed-data/indicator/relationship/report; file carved byte-identical). **310 lib + 118 golden**, clippy `-D warnings`, fmt clean.

@@ -241,8 +241,19 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
 - `--carve-out <dir>` — destination directory (default `<input>.bxmap/carved`).
   Existing files are never overwritten; re-running into the same directory
   exits with an error.
-- `--carve-index <file>` — write the carve index. `.ndjson` = one record per
-  line; `.csv` = RFC 4180 fixed 23-column table; anything else = JSON array.
+- `--carve-index <file>` — write the carve index. The format follows the
+  extension: `.ndjson` = one record per line; `.csv` = RFC 4180 fixed
+  23-column table; `.sarif` / `.sarif.json` = SARIF 2.1.0 (one `result`
+  per file — `note` when complete, `warning` otherwise; one
+  `carve/<kind>` rule per kind; `artifact` entries carrying `SHA-256` and
+  `partialFingerprints."bxmap.sha256/v1"` for cross-run dedupe) for
+  code-scanning viewers; `.stix` / `.stix.json` = a STIX 2.1 bundle
+  (one `file` SCO per record with `x_bxmap_*` properties, one
+  `observed-data`, a `threat-report` report, and one `indicator` per
+  trailer readable in the victim-ID shape — `[A-Za-z0-9_-]`, ≥ 6 chars,
+  ≥ 1 letter and 1 digit — de-duplicated by content hash;
+  `indicator_types: ["unknown"]`, a hint recorded as evidence, not a
+  verdict) for MISP/OpenCTI/Velociraptor; anything else = JSON array.
   The index is a separate channel from
   `--format` so carving never reshapes the string output.
   Each record has `offset`, `offset_hex`, `type`, `size`, `sha256`, `entropy`,
@@ -293,23 +304,6 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   `segment_duration` is `0xFFFFFFFF` (rest of the track) and rate is
   1.0. Evidence gains `elst_cut`; the full rebuilt file is always kept
   next to it, and no flag is needed.
-- `--export-sarif <file>` — write a SARIF 2.1.0 report of the carve. One
-  `result` per carved file (`note` when complete, `warning` otherwise),
-  one `rule` (`carve/<kind>`) per carved kind, one `artifact` per file
-  carrying a `SHA-256` hash, and `partialFingerprints."bxmap.sha256/v1"` on
-  every result for cross-run dedupe. Feeds code-scanning viewers
-  (GitHub, VS Code, ...). Does not reshape the string scan or the carved
-  files themselves.
-- `--export-stix <file>` — write a STIX 2.1 bundle of the carve for
-  MISP/OpenCTI/Velociraptor. One `file` SCO per record (hash, size,
-  absolute offset, role/tier/ext/evidence/encrypted_ranges as
-  `x_bxmap_*` properties), one `observed-data` wrapping them, a
-  `threat-report` report, and one `indicator` per trailer readable in the
-  victim-ID shape (`[A-Za-z0-9_-]`, ≥ 6 chars, ≥ 1 letter and 1 digit;
-  `file:contents MATCHES`, `indicator_types: ["unknown"]`), de-duplicated
-  by content hash — a hint recorded as evidence, not a verdict; trailers
-  that do not qualify simply produce no indicator. Ids are deterministic,
-  so re-running on the same dump yields the same bundle structure.
   Records also carry the evidence behind each file, so scripts do not have to
   parse the name: `file_name`, `ext` and `ext_source` (`kind`,
   `sniff:<rule>` or `fallback`), `role` (`whole`, `tail`, `reassembled`, `rebuilt`, `cut`),

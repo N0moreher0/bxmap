@@ -493,12 +493,13 @@ Recover structured files directly from a raw dump. The carver:
   (any role) carry the same after their terminator.
 - Refuses to overwrite existing files: re-running into the same `--carve-out`
   directory is an error.
-- Produces a separate `--carve-index` (NDJSON, CSV or JSON array) so carving never
+- Produces a separate `--carve-index` (NDJSON, CSV, SARIF/STIX by extension, or JSON array) so carving never
   reshapes the string output. Each record has `offset`, `type`, `size`, `sha256`,
   `entropy`, `complete`, `notes`, `path`, `encrypted_ranges` and `duplicates`. Treat `path` as
-  authoritative rather than parsing file names. With `--export-sarif` /
-  `--export-stix` the same record set is written as a SARIF 2.1.0 report
-  (code-scanning viewers) or a STIX 2.1 bundle (MISP/OpenCTI/Velociraptor).
+  authoritative rather than parsing file names. The same record set can be
+  written as a SARIF 2.1.0 report (`--carve-index report.sarif`, code-scanning
+  viewers) or a STIX 2.1 bundle (`--carve-index report.stix`,
+  MISP/OpenCTI/Velociraptor).
 - Runs before the string scan so a huge cap (`--carve-max-total`, `--carve-max-files`)
   fails fast with exit code 3.
 

@@ -7,12 +7,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - **SARIF 2.1.0 and STIX 2.1 exports of the carve (ROADMAP 8.14.7)**.
-  Two new flags extend `--carve` without changing the carved files:
-  `--export-sarif <file>` writes a SARIF 2.1.0 report (one `result` per
+  No new flags: `--carve-index` now picks the writer from the file
+  extension like it already did for `.ndjson`/`.csv`/JSON array —
+  `.sarif` / `.sarif.json` writes a SARIF 2.1.0 report (one `result` per
   carved file — `note` when complete, `warning` otherwise — one
   `carve/<kind>` rule per kind, one `artifact` per file with a
   `SHA-256` hash, and `partialFingerprints."bxmap.sha256/v1"` on every
-  result for cross-run dedupe), and `--export-stix <file>` writes a
+  result for cross-run dedupe), and `.stix` / `.stix.json` writes a
   STIX 2.1 bundle (one `file` SCO per record with `x_bxmap_*` properties
   carrying offset/role/tier/ext/evidence/encrypted_ranges, one
   `observed-data` wrapping them, a `threat-report` report, and `indicator`

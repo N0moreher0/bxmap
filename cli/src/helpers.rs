@@ -865,17 +865,16 @@ OPTIONS:
                           the file; to use one, strip the trailing .carved in
                           an isolated environment. Scripts should read `path`
                           from the index, not parse names.
-    --carve-index <file>  Write the carve index (.ndjson = one record per line,
-                          .csv = RFC 4180 fixed 23-column table, anything else
-                          = JSON array)
-    --export-sarif <file> Write a SARIF 2.1.0 report of the carve (one result
-                          per file; hashes in artifacts +
-                          partialFingerprints.bxmap.sha256/v1). For code-
-                          scanning viewers (GitHub, VS Code, ...)
-    --export-stix <file>  Write a STIX 2.1 bundle of the carve (one file SCO
-                          per record, one observed-data, based-on indicators
-                          for readable ransom-note trailers). For
-                          MISP/OpenCTI/Velociraptor
+    --carve-index <file>  Write the carve index; the format follows the
+                          extension: .ndjson = one record per line,
+                          .csv = RFC 4180 fixed 23-column table,
+                          .sarif/.sarif.json = SARIF 2.1.0 (code-scanning
+                          viewers; hashes in artifacts +
+                          partialFingerprints.bxmap.sha256/v1),
+                          .stix/.stix.json = STIX 2.1 bundle (MISP/OpenCTI/
+                          Velociraptor; one observed-data with file SCOs,
+                          indicator per victim-ID-shaped trailer),
+                          anything else = JSON array
     --carve-min-size <N>  Skip files smaller than N bytes (default 64)
     --carve-max-size <N>  Per-file ceiling; header sizes are clamped to it
                           (default 64 MiB)

@@ -57,10 +57,6 @@ pub struct Args {
     pub carve: Option<String>,
     pub carve_out: Option<String>,
     pub carve_index: Option<String>,
-    /// SARIF 2.1.0 report of the carve (ROADMAP 8.14.7), or None.
-    pub export_sarif: Option<String>,
-    /// STIX 2.1 bundle of the carve (ROADMAP 8.14.7), or None.
-    pub export_stix: Option<String>,
     pub carve_min_size: u64,
     pub carve_max_size: u64,
     pub carve_max_total: u64,
@@ -351,8 +347,6 @@ pub fn completions_for(shell: &str) -> String {
         "--carve",
         "--carve-out",
         "--carve-index",
-        "--export-sarif",
-        "--export-stix",
         "--carve-min-size",
         "--carve-max-size",
         "--carve-max-total",
@@ -546,8 +540,6 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
         carve: None,
         carve_out: None,
         carve_index: None,
-        export_sarif: None,
-        export_stix: None,
         carve_min_size: bxmap::carve::DEFAULT_MIN_SIZE,
         carve_max_size: bxmap::carve::DEFAULT_MAX_SIZE,
         carve_max_total: bxmap::carve::DEFAULT_MAX_TOTAL,
@@ -792,8 +784,6 @@ pub fn parse_args_from(values: Vec<String>) -> Result<(Args, ExplicitFlags), Str
                 args.carve_out = Some(next(&mut i)?);
             }
             "--carve-index" => args.carve_index = Some(next(&mut i)?),
-            "--export-sarif" => args.export_sarif = Some(next(&mut i)?),
-            "--export-stix" => args.export_stix = Some(next(&mut i)?),
             "--carve-min-size" => {
                 args.carve_min_size = parse_offset(&next(&mut i)?, "--carve-min-size")?;
             }

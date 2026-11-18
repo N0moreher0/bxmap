@@ -1726,8 +1726,10 @@ fn golden_carve_new_formats_gif_and_lnk() {
 fn golden_carve_export_sarif_and_stix_ir() {
     // ROADMAP 8.14.7: a synthetic dump whose PNG carve carries a ransom-note
     // trailer ("VICTIM-ID-0001" + 16 zero bytes) must produce both IR
-    // exports. The PNG's carved file stays byte-identical; the trailer is
-    // index/Export metadata only.
+    // exports through `--carve-index` (writer chosen by extension, like
+    // `.ndjson`/`.csv`). The PNG's carved file stays byte-identical; the
+    // trailer is index/Export metadata only. One flag = one output per
+    // run, so the two exports are separate invocations.
     let png = png_fixture(&vec![0x5au8; 300]);
 
     let mut dump = vec![0u8; 256];
@@ -1738,39 +1740,44 @@ fn golden_carve_export_sarif_and_stix_ir() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dump.bin");
     std::fs::write(&path, &dump).unwrap();
-    let out_dir = dir.path().join("carved");
-    let index = dir.path().join("index.ndjson");
-    let sarif = dir.path().join("report.sarif");
-    let stix = dir.path().join("report.stix.json");
 
-    let output = Command::new(bin_path())
-        .args([
-            path.to_str().unwrap(),
-            "--carve",
-            "png",
-            "--carve-out",
-            out_dir.to_str().unwrap(),
-            "--carve-index",
-            index.to_str().unwrap(),
-            "--export-sarif",
-            sarif.to_str().unwrap(),
-            "--export-stix",
-            stix.to_str().unwrap(),
-            "--max-strings",
-            "0",
-            "--no-progress",
-            "--report",
-            "none",
-        ])
-        .output()
-        .unwrap();
+    let carve_once = |name: &str| {
+        let out_dir = dir.path().join(format!("carved-{name}"));
+        let index = dir.path().join(name);
+        let output = Command::new(bin_path())
+            .args([
+                path.to_str().unwrap(),
+                "--carve",
+                "png",
+                "--carve-out",
+                out_dir.to_str().unwrap(),
+                "--carve-index",
+                index.to_str().unwrap(),
+                "--max-strings",
+                "0",
+                "--no-progress",
+                "--report",
+                "none",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "stderr: {stderr}");
+        assert!(stderr.contains("carve: 1 file(s) (1 complete)"), "{stderr}");
+        (out_dir, index)
+    };
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "stderr: {stderr}");
-    assert!(stderr.contains("carve: 1 file(s) (1 complete)"), "{stderr}");
+    let (out_sarif, sarif) = carve_once("report.sarif");
+    let carved = std::fs::read_dir(&out_sarif)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().contains(".png."))
+        .expect("one carved PNG");
+    assert_eq!(std::fs::read(&carved).unwrap(), png);
 
-    // The carved PNG must be byte-identical (trailer never enters the file).
-    let carved = std::fs::read_dir(&out_dir)
+    let (out_stix, stix) = carve_once("report.stix.json");
+    let carved = std::fs::read_dir(&out_stix)
         .unwrap()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
