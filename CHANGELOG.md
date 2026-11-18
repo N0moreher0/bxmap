@@ -6,6 +6,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **SQLite header rebuild for destroyed databases (ROADMAP 8.14.2)**.
+  When the 100-byte SQLite file header (inside page 1) is destroyed — the
+  ransomware / bad-sector shape — `--carve` now recovers the database from
+  its surviving pages: it scan-for-runs 4 KiB-aligned b-tree page type
+  bytes (`0x05`/`0x02`/`0x0D`/`0x0A`) at every page size from 512 to
+  65536, deep-validates every surviving page (type byte, freeblock, cell
+  count, cell-content offset), and rebuilds a fresh, honest 100-byte
+  header. A single bad page drops the candidate — no half-verified file
+  is shipped with a confident label. The rebuilt database is written to
+  `partial/` as `role=rebuilt`, tier 2, evidence `btree_pages_verified`
+  (+ `page1_tree_ok` when page 1's b-tree header survives, i.e. the
+  destruction stayed within the 100-byte header) with confidence
+  `medium`/`low`. `sqlite3` opens the result whenever page 1's schema
+  page is intact; destruction beyond the first page is reported in the
+  notes, never silently covered. Bench output byte-identical (30/63);
+  Lab 6 unchanged (no headerless DBs found); new module
+  `src/sqlite_rebuild.rs`.
+
 - **ZIP/OOXML header-footer encryption recovery (ROADMAP 8.14.1)**.
   When a ZIP's central directory and end record are destroyed
   (ransomware's header-footer shape), `--carve` now salvages surviving

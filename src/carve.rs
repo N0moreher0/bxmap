@@ -1683,6 +1683,7 @@ impl Carver {
         }
         if self.salvage {
             self.salvage_pass(dump_path, out_dir, file_len, &mut report, &donors)?;
+            self.sqlite_body_pass(dump_path, out_dir, file_len, &mut report)?;
         }
         if self.options.kinds.contains(&CarveKind::Text) {
             self.text_pass(dump_path, out_dir, file_len, &mut report)?;
@@ -2654,6 +2655,189 @@ impl Carver {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// ROADMAP 8.14.2: a destroyed SQLite file header (the first 100
+    /// bytes, inside page 1) leaves every surviving page intact. This
+    /// pass scans the dump for runs of b-tree page type bytes at a fixed
+    /// stride, deep-validates the pages and rebuilds a fresh, honest
+    /// 100-byte header.
+    ///
+    /// Every surviving page must pass validation — a single unreadable
+    /// page drops the candidate rather than shipping half a reconstruction
+    /// with a confident label. The rebuilt file is written to `partial/`
+    /// with `role=Rebuilt`, tier 2, and `btree_pages_verified` evidence;
+    /// its page 1's b-tree header starts at file offset 100, outside the
+    /// destroyed region, so `sqlite3` opens it whenever the destruction
+    /// stayed within the 100-byte header.
+    fn sqlite_body_pass(
+        &self,
+        dump_path: &str,
+        out_dir: Option<&Path>,
+        file_len: u64,
+        report: &mut CarveReport,
+    ) -> io::Result<()> {
+        if report.truncated || !self.options.kinds.contains(&CarveKind::Sqlite) {
+            return Ok(());
+        }
+        let mut source = File::open(dump_path)?;
+        let mut by_hash: HashMap<String, usize> = HashMap::new();
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        for file in report.files.iter() {
+            covered.push((file.offset, file.offset + file.size));
+            for &duplicate in &file.duplicates {
+                covered.push((duplicate, duplicate + file.size));
+            }
+        }
+
+        let candidates = crate::sqlite_rebuild::find_sqlite_bodies(
+            &mut source,
+            0,
+            file_len,
+            file_len,
+            self.options.max_size,
+        )?;
+        for candidate in &candidates {
+            if covered
+                .iter()
+                .any(|&(start, end)| candidate.start < end && start < candidate.end)
+            {
+                continue; // already (fully or partly) carved by another pass
+            }
+            let rebuilt = crate::sqlite_rebuild::rebuild_bytes(&mut source, candidate)?;
+            let rebuilt_size = rebuilt.len() as u64;
+            if rebuilt_size < self.options.min_size {
+                report.rejected += 1;
+                continue;
+            }
+            let sha256 = {
+                let mut hasher = Sha256::new();
+                hasher.update(&rebuilt);
+                hex(&hasher.finalize())
+            };
+            if let Some(&index) = by_hash.get(&sha256) {
+                report.duplicates += 1;
+                report.duplicate_bytes += rebuilt_size;
+                report.files[index].duplicates.push(candidate.start);
+                continue;
+            }
+            let entropy = {
+                let mut counts = [0u64; 256];
+                for &byte in &rebuilt {
+                    counts[byte as usize] += 1;
+                }
+                entropy(&counts, rebuilt_size)
+            };
+            if !self.ext_filter.allows(CarveKind::Sqlite, "sqlite") {
+                covered.push((candidate.start, candidate.end));
+                report.filtered += 1;
+                continue;
+            }
+            let evidence: Vec<&'static str> = if candidate.page1_tree_ok {
+                vec!["btree_pages_verified", "header_rebuilt", "page1_tree_ok"]
+            } else {
+                vec!["btree_pages_verified", "header_rebuilt"]
+            };
+            let confidence = if candidate.page1_tree_ok {
+                CarveConfidence::Medium
+            } else {
+                CarveConfidence::Low
+            };
+            let page1_note = if candidate.page1_tree_ok {
+                "page 1 b-tree header intact"
+            } else {
+                "page 1 b-tree header destroyed — schema may be unreadable"
+            };
+            let notes = format!(
+                "rebuild: SQLite header rebuilt from surviving pages; {} page(s) verified (page_size={}, {} bytes); header 100 bytes destroyed; {}; trailing pages not included",
+                candidate.page_count(),
+                candidate.page_size,
+                rebuilt_size,
+                page1_note,
+            );
+            let path = match out_dir {
+                Some(dir) => {
+                    // Rebuilt databases always go beside the other partials.
+                    let partial = dir.join("partial");
+                    std::fs::create_dir_all(&partial)?;
+                    let name = carved_file_name_with_ext(
+                        candidate.start,
+                        CarveKind::Sqlite,
+                        "sqlite",
+                        CarveRole::Rebuilt,
+                        &sha256,
+                    );
+                    let path = partial.join(name);
+                    if path.exists() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "refusing to overwrite '{}'; use a fresh --carve-out",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    std::fs::write(&path, &rebuilt)?;
+                    Some(path)
+                }
+                None => None,
+            };
+            // End-to-end: the written file must pass the same SQLite rules
+            // as every other carve.
+            if let Some(path) = &path {
+                let mut check_file = File::open(path)?;
+                let len = check_file.metadata()?.len();
+                let mut check = Source::new(&mut check_file, 0, len);
+                if !matches!(carve_sqlite(&mut check)?, Verdict::Valid) {
+                    std::fs::remove_file(path).ok();
+                    report.rejected += 1;
+                    if report.rejected_details.len() < 16 {
+                        report.rejected_details.push(format!(
+                            "{:#x} sqlite: rebuilt file invalid at own validator",
+                            candidate.start
+                        ));
+                    }
+                    continue;
+                }
+            }
+            by_hash.insert(sha256.clone(), report.files.len());
+            covered.push((candidate.start, candidate.end));
+            report.bytes_written += rebuilt_size;
+            report.files.push(CarvedFile {
+                offset: candidate.start,
+                kind: CarveKind::Sqlite,
+                size: rebuilt_size,
+                complete: true,
+                sha256,
+                entropy,
+                notes,
+                path,
+                duplicates: Vec::new(),
+                corrupted_offset: Some(candidate.start),
+                entropy_spike_at: None,
+                partial_encryption: None,
+                trailer_offset: None,
+                trailer_len: None,
+                trailer_sha256: None,
+                trailer_preview: None,
+                tracks_intact: None,
+                ext: "sqlite".to_string(),
+                ext_source: "kind".to_string(),
+                role: CarveRole::Rebuilt,
+                tier: 2,
+                evidence,
+                confidence,
+            });
+            if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
+                report.truncated = true;
+                return Ok(());
+            }
+            if self.options.max_total != 0 && report.bytes_written >= self.options.max_total {
+                report.truncated = true;
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     /// Third pass behind `--carve text` (it runs only when [`CarveKind::Text`]
@@ -11963,6 +12147,68 @@ mod tests {
         let len = bytes.len() as u64;
         let mut source = Source::new(&mut check_file, 0, len);
         assert!(matches!(carve_zip(&mut source).unwrap(), Verdict::Valid));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ROADMAP 8.14.2: a SQLite file whose 100-byte header was destroyed
+    /// (inside page 1) is rebuilt from the surviving pages — the rebuilt
+    /// file passes the same validator as every other SQLite carve, and no
+    /// double record is produced for the intact case.
+    #[test]
+    fn sqlite_header_destroyed_by_encryption_is_rebuilt() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/sqlite_simple.db");
+        // Destroy exactly the 100-byte file header; everything after
+        // offset 100 (page 1's b-tree header, cells, pages 2..N) survives.
+        let mut body = FIXTURE.to_vec();
+        for byte in &mut body[..100] {
+            *byte = 0xAA;
+        }
+        let mut dump = pseudo_random(777, 0x51E5_0000_0000_0001);
+        dump.extend_from_slice(&body);
+        dump.extend_from_slice(&pseudo_random(300, 0x51E5_0000_0000_0002));
+        let path = write_dump("sqlite-header-destroyed", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let out_dir = root.join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Sqlite],
+            min_size: 1,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .with_incomplete_dir(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        let sqlite_records: Vec<_> = report
+            .files
+            .iter()
+            .filter(|file| file.kind == CarveKind::Sqlite)
+            .collect();
+        assert_eq!(
+            sqlite_records.len(),
+            1,
+            "exactly one SQLite record is expected: {sqlite_records:?}"
+        );
+        let rebuilt = sqlite_records[0];
+        assert_eq!(rebuilt.role, CarveRole::Rebuilt);
+        assert_eq!(rebuilt.tier, 2);
+        assert_eq!(rebuilt.confidence, CarveConfidence::Medium);
+        assert!(
+            rebuilt.evidence.contains(&"btree_pages_verified"),
+            "{rebuilt:?}"
+        );
+        assert!(rebuilt.evidence.contains(&"page1_tree_ok"), "{rebuilt:?}");
+        assert!(rebuilt.notes.contains("header rebuilt"), "{rebuilt:?}");
+        let bytes = std::fs::read(rebuilt.path.as_ref().expect("written")).unwrap();
+        assert_eq!(&bytes[..16], b"SQLite format 3\x00");
+        // Page 1's b-tree header survives at file offset 100 and points at
+        // the sqlite_master page (a plausible b-tree page type for it).
+        assert!(matches!(bytes[100], 0x02 | 0x05 | 0x0A | 0x0D));
+        // The rebuilt file passes the same validator as every other carve.
+        let mut check_file = File::open(rebuilt.path.as_ref().expect("written")).unwrap();
+        let len = bytes.len() as u64;
+        let mut source = Source::new(&mut check_file, 0, len);
+        assert!(matches!(carve_sqlite(&mut source).unwrap(), Verdict::Valid));
         std::fs::remove_dir_all(&root).ok();
     }
 
