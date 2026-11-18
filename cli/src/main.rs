@@ -325,6 +325,14 @@ fn run_single_scan(mut args: Args) -> Result<(), String> {
                 write_carve_index(&report, index_path)
                     .map_err(|error| format!("cannot write carve index: {error}"))?;
             }
+            if let Some(sarif_path) = args.export_sarif.as_deref() {
+                write_carve_export_sarif(&report, &args.path, sarif_path)
+                    .map_err(|error| format!("cannot write SARIF export: {error}"))?;
+            }
+            if let Some(stix_path) = args.export_stix.as_deref() {
+                write_carve_export_stix(&report, &args.path, stix_path)
+                    .map_err(|error| format!("cannot write STIX export: {error}"))?;
+            }
             print_carve_summary(&report);
             carve_report = Some(report);
         }

@@ -1723,6 +1723,118 @@ fn golden_carve_new_formats_gif_and_lnk() {
 }
 
 #[test]
+fn golden_carve_export_sarif_and_stix_ir() {
+    // ROADMAP 8.14.7: a synthetic dump whose PNG carve carries a ransom-note
+    // trailer ("VICTIM-ID-0001" + 16 zero bytes) must produce both IR
+    // exports. The PNG's carved file stays byte-identical; the trailer is
+    // index/Export metadata only.
+    let png = png_fixture(&vec![0x5au8; 300]);
+
+    let mut dump = vec![0u8; 256];
+    dump.extend_from_slice(&png);
+    dump.extend_from_slice(b"VICTIM-ID-0001");
+    dump.extend_from_slice(&[0u8; 16]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dump.bin");
+    std::fs::write(&path, &dump).unwrap();
+    let out_dir = dir.path().join("carved");
+    let index = dir.path().join("index.ndjson");
+    let sarif = dir.path().join("report.sarif");
+    let stix = dir.path().join("report.stix.json");
+
+    let output = Command::new(bin_path())
+        .args([
+            path.to_str().unwrap(),
+            "--carve",
+            "png",
+            "--carve-out",
+            out_dir.to_str().unwrap(),
+            "--carve-index",
+            index.to_str().unwrap(),
+            "--export-sarif",
+            sarif.to_str().unwrap(),
+            "--export-stix",
+            stix.to_str().unwrap(),
+            "--max-strings",
+            "0",
+            "--no-progress",
+            "--report",
+            "none",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("carve: 1 file(s) (1 complete)"), "{stderr}");
+
+    // The carved PNG must be byte-identical (trailer never enters the file).
+    let carved = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().contains(".png."))
+        .expect("one carved PNG");
+    assert_eq!(std::fs::read(&carved).unwrap(), png);
+
+    let sarif_text = std::fs::read_to_string(&sarif).unwrap();
+    assert!(sarif_text.contains("\"version\":\"2.1.0\""), "{sarif_text}");
+    assert!(
+        sarif_text.contains("\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\""),
+        "{sarif_text}"
+    );
+    assert!(
+        sarif_text.contains("\"ruleId\":\"carve/png\""),
+        "{sarif_text}"
+    );
+    assert!(sarif_text.contains("\"level\":\"note\""), "{sarif_text}");
+    assert!(
+        sarif_text.contains("\"SHA-256\""),
+        "artifact must carry a SHA-256 hash: {sarif_text}"
+    );
+    assert!(sarif_text.contains("partialFingerprints"), "{sarif_text}");
+    assert!(
+        sarif_text.contains("\"executionSuccessful\":true"),
+        "{sarif_text}"
+    );
+
+    let stix_text = std::fs::read_to_string(&stix).unwrap();
+    assert!(stix_text.contains("\"type\":\"bundle\""), "{stix_text}");
+    assert!(stix_text.contains("\"type\":\"identity\""), "{stix_text}");
+    assert!(stix_text.contains("\"type\":\"file\""), "{stix_text}");
+    assert!(
+        stix_text.contains("\"type\":\"observed-data\""),
+        "{stix_text}"
+    );
+    assert!(stix_text.contains("\"number_observed\":1"), "{stix_text}");
+    // The ransom-note trailer must become exactly one indicator + relationship.
+    assert_eq!(
+        stix_text.matches("\"type\":\"indicator\"").count(),
+        1,
+        "{stix_text}"
+    );
+    assert_eq!(
+        stix_text.matches("\"type\":\"relationship\"").count(),
+        1,
+        "{stix_text}"
+    );
+    assert!(
+        stix_text.contains("file:contents MATCHES 'VICTIM-ID-0001'"),
+        "{stix_text}"
+    );
+    assert!(
+        stix_text.contains("\"relationship_type\":\"based-on\""),
+        "{stix_text}"
+    );
+    assert!(stix_text.contains("\"type\":\"report\""), "{stix_text}");
+    assert!(
+        stix_text.contains("\"report_types\":[\"threat-report\"]"),
+        "{stix_text}"
+    );
+}
+
+#[test]
 fn golden_carve_extension_alias_selects_the_container_kind() {
     // `jpg` là alias của `jpeg`: chọn loại theo đuôi file, kết quả vẫn type=jpeg.
     let dir = tempfile::tempdir().unwrap();

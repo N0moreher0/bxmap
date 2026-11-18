@@ -6,6 +6,29 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **SARIF 2.1.0 and STIX 2.1 exports of the carve (ROADMAP 8.14.7)**.
+  Two new flags extend `--carve` without changing the carved files:
+  `--export-sarif <file>` writes a SARIF 2.1.0 report (one `result` per
+  carved file — `note` when complete, `warning` otherwise — one
+  `carve/<kind>` rule per kind, one `artifact` per file with a
+  `SHA-256` hash, and `partialFingerprints."bxmap.sha256/v1"` on every
+  result for cross-run dedupe), and `--export-stix <file>` writes a
+  STIX 2.1 bundle (one `file` SCO per record with `x_bxmap_*` properties
+  carrying offset/role/tier/ext/evidence/encrypted_ranges, one
+  `observed-data` wrapping them, a `threat-report` report, and `indicator`
+  objects only for readable trailers shaped like a victim ID —
+  `[A-Za-z0-9_-]`, at least 6 characters, at least one letter and one
+  digit — using `file:contents MATCHES` with
+  `indicator_types: ["unknown"]`; binary false-positives are dropped and
+  identical trailers are de-duplicated by deterministic id). STIX ids are
+  deterministic (SHA-256-derived RFC 4122 v5-layout UUIDs), so re-running
+  on the same input yields the same bundle structure. Feeds code-scanning
+  viewers and MISP/OpenCTI/Velociraptor; it never modifies the carved
+  files. Bench files stay byte-identical (30/63) with exactly one
+  indicator (`VICTIM-ID-777`); Lab 6 reports zero indicators (none of its
+  trailers qualifies) rather than fabricating IOCs. Golden test covers
+  both exports on a synthetic dump with a ransom-note-shaped trailer.
+
 - **Intermittent-encryption mapping in the index (ROADMAP 8.14.3)**.
   `--carve` now emits `encrypted_ranges` — absolute dump offsets
   `[start, end)` of high-entropy 4 KiB windows — into the carve index

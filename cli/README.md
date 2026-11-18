@@ -242,12 +242,13 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   Existing files are never overwritten; re-running into the same directory
   exits with an error.
 - `--carve-index <file>` — write the carve index. `.ndjson` = one record per
-  line; anything else = JSON array. The index is a separate channel from
+  line; `.csv` = RFC 4180 fixed 23-column table; anything else = JSON array.
+  The index is a separate channel from
   `--format` so carving never reshapes the string output.
   Each record has `offset`, `offset_hex`, `type`, `size`, `sha256`, `entropy`,
   `complete`, `corrupted_offset`, `entropy_spike_at`, `partial_encryption`,
   `trailer_offset`, `trailer_len`, `trailer_sha256`, `trailer_preview`,
-  `tracks_intact`, `notes`, `path`, and `duplicates`. For incomplete files
+  `tracks_intact`, `encrypted_ranges`, `notes`, `path`, and `duplicates`. For incomplete files
   `corrupted_offset`
   is where structural validation stopped and `entropy_spike_at` is the first
   4 KiB window that jumps to >= 7.8 bits/byte after structured data (both
@@ -257,12 +258,21 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   signature of file-system encryption that encrypts a fraction of every
   file. Heuristic hint, **not** a ransomware verdict: compressed data also
   scores as high entropy. Fully structured and uniformly high (compressed or
-  encrypted end to end) files produce `null`. `trailer_offset`,
+  encrypted end to end) files produce `null`. `encrypted_ranges` is `null`,
+  or an array of `[start, end)` absolute dump offsets of high-entropy
+  4 KiB windows (merged across at most one structured window, cap 64;
+  uniformly-high files produce `null`) - a raw entropy map of where
+  intermittently-encrypted blocks may sit; a hint, **not** a verdict.
+  Records with at least one range gain the `suspect:intermittent` evidence
+  token. `trailer_offset`,
   `trailer_len`, `trailer_sha256` and `trailer_preview` (hex + ASCII, max
-  64 bytes) are non-null only for `role: "rebuilt"` and `role: "cut"` files: they describe
+  128 bytes; 64 on the rebuilt/cut MP4 path) are non-null for any role when
+  the terminator is known — JPEG (`FF D9`), PNG (`IEND`), PDF (`%%EOF`),
+  ZIP (EOCD), SQLite, and every `role: "rebuilt"`/`cut` file. For
+  rebuilt/cut files they describe
   the ransomware trailer that followed the original `moov` box, cut out of
-  the rebuilt file (len capped at 1 MiB of the source remainder); every
-  other role gets `null`. `tracks_intact` is `null` outside rebuilt/cut MP4s,
+  the rebuilt file (len capped at 1 MiB of the source remainder); other
+  kinds carry at most 2 KiB, stopped at the first run of 16 zero bytes. `tracks_intact` is `null` outside rebuilt/cut MP4s,
   and an array of per-video-track verdicts otherwise:
   `{ "codec": "avc1", "samples": N, "intact": N, "intact_ratio": 0-1,
   "broken_prefix_samples": N, "first_intact_sync_sample": N|null,
@@ -283,6 +293,23 @@ ASCII logo is printed by `--help` only, so scans keep stderr clean.
   `segment_duration` is `0xFFFFFFFF` (rest of the track) and rate is
   1.0. Evidence gains `elst_cut`; the full rebuilt file is always kept
   next to it, and no flag is needed.
+- `--export-sarif <file>` — write a SARIF 2.1.0 report of the carve. One
+  `result` per carved file (`note` when complete, `warning` otherwise),
+  one `rule` (`carve/<kind>`) per carved kind, one `artifact` per file
+  carrying a `SHA-256` hash, and `partialFingerprints."bxmap.sha256/v1"` on
+  every result for cross-run dedupe. Feeds code-scanning viewers
+  (GitHub, VS Code, ...). Does not reshape the string scan or the carved
+  files themselves.
+- `--export-stix <file>` — write a STIX 2.1 bundle of the carve for
+  MISP/OpenCTI/Velociraptor. One `file` SCO per record (hash, size,
+  absolute offset, role/tier/ext/evidence/encrypted_ranges as
+  `x_bxmap_*` properties), one `observed-data` wrapping them, a
+  `threat-report` report, and one `indicator` per trailer readable in the
+  victim-ID shape (`[A-Za-z0-9_-]`, ≥ 6 chars, ≥ 1 letter and 1 digit;
+  `file:contents MATCHES`, `indicator_types: ["unknown"]`), de-duplicated
+  by content hash — a hint recorded as evidence, not a verdict; trailers
+  that do not qualify simply produce no indicator. Ids are deterministic,
+  so re-running on the same dump yields the same bundle structure.
   Records also carry the evidence behind each file, so scripts do not have to
   parse the name: `file_name`, `ext` and `ext_source` (`kind`,
   `sniff:<rule>` or `fallback`), `role` (`whole`, `tail`, `reassembled`, `rebuilt`, `cut`),
