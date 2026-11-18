@@ -1452,6 +1452,15 @@ impl Carver {
                             "eocd_rebuilt",
                         ]
                     };
+                    // ROADMAP 8.14.4: bytes after the original (destroyed)
+                    // archive span in the dump — recorded, never separated.
+                    let trailer = match universal_trailer(&mut source, offset + size, file_len) {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    };
                     let kept_list = rebuilt
                         .kept_names
                         .iter()
@@ -1519,10 +1528,10 @@ impl Carver {
                         corrupted_offset: Some(offset),
                         entropy_spike_at: None,
                         partial_encryption: None,
-                        trailer_offset: None,
-                        trailer_len: None,
-                        trailer_sha256: None,
-                        trailer_preview: None,
+                        trailer_offset: trailer.0,
+                        trailer_len: trailer.1,
+                        trailer_sha256: trailer.2,
+                        trailer_preview: trailer.3,
                         tracks_intact: None,
                         ext: choice.ext.to_string(),
                         ext_source: choice.source.to_string(),
@@ -1594,6 +1603,26 @@ impl Carver {
                     covered_end = offset + size;
                     continue;
                 }
+                // ROADMAP 8.14.4: a universal ransomware-trailer extractor
+                // for the kinds with a known terminator — bytes after the
+                // terminator inside the dump (never separated from the
+                // carved file, only recorded in the index).
+                let trailer = match kind {
+                    CarveKind::Jpeg
+                    | CarveKind::Png
+                    | CarveKind::Pdf
+                    | CarveKind::Zip
+                    | CarveKind::Sqlite => {
+                        match universal_trailer(&mut source, offset + size, file_len) {
+                            Ok(meta) => meta,
+                            Err(error) => {
+                                failure = Some(error);
+                                return false;
+                            }
+                        }
+                    }
+                    _ => (None, None, None, None),
+                };
                 let path = match out_dir {
                     Some(dir) => {
                         let name = carved_file_name_with_ext(
@@ -1650,10 +1679,10 @@ impl Carver {
                     corrupted_offset,
                     entropy_spike_at,
                     partial_encryption,
-                    trailer_offset: None,
-                    trailer_len: None,
-                    trailer_sha256: None,
-                    trailer_preview: None,
+                    trailer_offset: trailer.0,
+                    trailer_len: trailer.1,
+                    trailer_sha256: trailer.2,
+                    trailer_preview: trailer.3,
                     tracks_intact: None,
                     ext: choice.ext.to_string(),
                     ext_source: choice.source.to_string(),
@@ -2755,6 +2784,8 @@ impl Carver {
                 rebuilt_size,
                 page1_note,
             );
+            // ROADMAP 8.14.4: bytes after the rebuilt span in the dump.
+            let trailer = universal_trailer(&mut source, candidate.end, file_len)?;
             let path = match out_dir {
                 Some(dir) => {
                     // Rebuilt databases always go beside the other partials.
@@ -2816,10 +2847,10 @@ impl Carver {
                 corrupted_offset: Some(candidate.start),
                 entropy_spike_at: None,
                 partial_encryption: None,
-                trailer_offset: None,
-                trailer_len: None,
-                trailer_sha256: None,
-                trailer_preview: None,
+                trailer_offset: trailer.0,
+                trailer_len: trailer.1,
+                trailer_sha256: trailer.2,
+                trailer_preview: trailer.3,
                 tracks_intact: None,
                 ext: "sqlite".to_string(),
                 ext_source: "kind".to_string(),
@@ -4466,6 +4497,7 @@ fn salvage_zip_tail(
         _ => return Ok(None),
     }
     let spike = salvage_spike_before(file, start, prior_end, file_len)?;
+    let trailer = universal_trailer(file, end, file_len)?;
     Ok(Some(SalvageTail {
         start,
         end,
@@ -4474,7 +4506,7 @@ fn salvage_zip_tail(
             "salvage:tail: ZIP central directory ({entries} entries) + end record at {position:#x}; local headers and data are missing"
         ),
         extra_evidence: Vec::new(),
-        trailer: (None, None, None, None),
+        trailer,
     }))
 }
 
@@ -4900,6 +4932,7 @@ fn salvage_pdf_tail(
     } else {
         return Ok(None);
     }
+    let trailer = universal_trailer(file, end, file_len)?;
     Ok(Some(SalvageTail {
         start,
         end,
@@ -4908,7 +4941,7 @@ fn salvage_pdf_tail(
             "salvage:tail: PDF trailer ending at {position:#x} (startxref + EOF); header and body are missing"
         ),
         extra_evidence: Vec::new(),
-        trailer: (None, None, None, None),
+        trailer,
     }))
 }
 
@@ -4947,6 +4980,7 @@ fn salvage_png_tail(
     }
     let start = lower + boundary as u64;
     let spike = salvage_spike_before(file, start, prior_end, file_len)?;
+    let trailer = universal_trailer(file, end, file_len)?;
     Ok(Some(SalvageTail {
         start,
         end,
@@ -4955,7 +4989,7 @@ fn salvage_png_tail(
             "salvage:tail: PNG IDAT run ({chunks} chunk(s)) + IEND at {position:#x}; signature and IHDR are missing"
         ),
         extra_evidence: Vec::new(),
-        trailer: (None, None, None, None),
+        trailer,
     }))
 }
 
@@ -5926,6 +5960,78 @@ fn jpeg_trailer(file: &mut File, end: u64, file_len: u64) -> io::Result<TrailerM
         .collect();
     let preview = format!("{} | {ascii}", hex(preview_bytes));
     Ok((Some(end), Some(trailer_len), Some(digest), Some(preview)))
+}
+
+// --- Universal ransomware-trailer extractor (ROADMAP 8.14.4) --------------
+
+/// Largest universal trailer slice we record in the index (the JPEG/MP4
+/// paths keep their own 1 MiB caps; this one is deliberately small so a
+/// victim-ID appended after every whole file costs a few bytes of ndjson).
+const UNIVERSAL_TRAILER_CAP: u64 = 2048;
+/// A run of zeros this long ends the trailer slice — it is dump padding,
+/// not payload.
+const UNIVERSAL_TRAILER_ZERO_RUN: usize = 16;
+/// Preview size recorded in the index: first bytes as hex plus printable ASCII.
+const UNIVERSAL_TRAILER_PREVIEW: usize = 128;
+
+/// Trailer after a terminator of JPEG (`FF D9`), PNG (`IEND`), PDF
+/// (`%%EOF`), ZIP (EOCD) or SQLite (`page_size × page_count`) carves: the
+/// bytes the ransomware appended after the original file (often a victim
+/// ID). Reads at most [`UNIVERSAL_TRAILER_CAP`] bytes starting at `end`,
+/// stops the slice at the first run of [`UNIVERSAL_TRAILER_ZERO_RUN`]
+/// consecutive zero bytes (dump padding, not payload) or at end of dump.
+/// Recorded in the index only — never separated from the carved file.
+fn universal_trailer(file: &mut File, end: u64, file_len: u64) -> io::Result<TrailerMeta> {
+    if end >= file_len {
+        return Ok((None, None, None, None));
+    }
+    let take = (file_len - end).min(UNIVERSAL_TRAILER_CAP);
+    let Some(bytes) = salvage_read(file, end, take as usize, file_len)? else {
+        return Ok((None, None, None, None));
+    };
+    // Stop at the first 16 consecutive zeros: everything up to there is
+    // trailer, everything after it is padding. A buffer that starts with
+    // the full run carries no trailer at all.
+    let mut end_of_trailer = bytes.len();
+    let mut zeros = 0usize;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == 0 {
+            zeros += 1;
+            if zeros == UNIVERSAL_TRAILER_ZERO_RUN {
+                end_of_trailer = index + 1 - zeros;
+                break;
+            }
+        } else {
+            zeros = 0;
+        }
+    }
+    if end_of_trailer == 0 {
+        return Ok((None, None, None, None));
+    }
+    let trailer = &bytes[..end_of_trailer];
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(trailer);
+        hex(&hasher.finalize())
+    };
+    let preview_bytes = &trailer[..trailer.len().min(UNIVERSAL_TRAILER_PREVIEW)];
+    let ascii: String = preview_bytes
+        .iter()
+        .map(|&byte| {
+            if (0x20..=0x7e).contains(&byte) {
+                byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    let preview = format!("{} | {ascii}", hex(preview_bytes));
+    Ok((
+        Some(end),
+        Some(trailer.len() as u64),
+        Some(digest),
+        Some(preview),
+    ))
 }
 
 // --- MP4/MOV rebuild from a surviving `moov` (ROADMAP 8.11) ------------------
@@ -12071,6 +12177,110 @@ mod tests {
         let stats =
             crate::jpeg_scan::verify_scan(&bytes).expect("the adjusted scan must decode exactly");
         assert_eq!(stats.mcus, 32 * 24, "512x384 4:2:0 is 32x24 MCUs");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- ROADMAP 8.14.4: universal trailer extractor ----------------------
+
+    fn universal_trailer_at(
+        dump: &[u8],
+        end: u64,
+    ) -> (Option<u64>, Option<u64>, Option<String>, Option<String>) {
+        let path = write_dump("universal-trailer", dump);
+        let mut file = File::open(&path).unwrap();
+        let meta = universal_trailer(&mut file, end, dump.len() as u64).unwrap();
+        drop(file);
+        std::fs::remove_file(&path).ok();
+        meta
+    }
+
+    #[test]
+    fn universal_trailer_records_nothing_when_dump_ends_at_terminator() {
+        let data = vec![0xABu8; 500];
+        let meta = universal_trailer_at(&data, data.len() as u64);
+        assert_eq!(meta, (None, None, None, None));
+    }
+
+    #[test]
+    fn universal_trailer_records_appended_bytes() {
+        let mut data = vec![0xABu8; 500];
+        data.extend_from_slice(b"VICTIM-123456");
+        let meta = universal_trailer_at(&data, 500);
+        assert_eq!(meta.0, Some(500));
+        assert_eq!(meta.1, Some(13));
+        let expected = {
+            let mut hasher = Sha256::new();
+            hasher.update(b"VICTIM-123456");
+            hex(&hasher.finalize())
+        };
+        assert_eq!(meta.2.as_deref(), Some(expected.as_str()));
+        assert!(meta
+            .3
+            .as_deref()
+            .is_some_and(|p| p.contains("VICTIM-123456")));
+        // 16-byte \00-run terminates the slice.
+        let mut padded = data.clone();
+        padded.extend_from_slice(&[0u8; 16]);
+        padded.extend_from_slice(b"AFTER-ZEROES");
+        let meta = universal_trailer_at(&padded, 500);
+        assert_eq!(
+            meta.1,
+            Some(13),
+            "the zero run and what follows it are padding"
+        );
+    }
+
+    #[test]
+    fn universal_trailer_caps_at_two_kilobytes() {
+        let mut data = vec![0xABu8; 100];
+        data.extend_from_slice(&[0xCDu8; 5000]);
+        let meta = universal_trailer_at(&data, 100);
+        assert_eq!(meta.1, Some(UNIVERSAL_TRAILER_CAP));
+    }
+
+    #[test]
+    fn universal_trailer_all_zero_region_yields_nothing() {
+        let mut data = vec![0xABu8; 100];
+        data.extend_from_slice(&[0u8; 100]);
+        let meta = universal_trailer_at(&data, 100);
+        assert_eq!(meta, (None, None, None, None));
+    }
+
+    /// A whole JPEG whose terminator is followed by a victim ID must record
+    /// it in the index (and still write the carved file byte-identical).
+    #[test]
+    fn a_whole_jpeg_records_the_trailer_after_ff_d9() {
+        const JPEG: &[u8] = include_bytes!("../tests/fixtures/baseline_160x120_q75.jpg");
+        let mut dump = pseudo_random(640, 0x0A11_CE00_0000_0044);
+        let start = dump.len() as u64;
+        dump.extend_from_slice(JPEG);
+        dump.extend_from_slice(b"VICTIM-ID-0001");
+        dump.extend_from_slice(&[0u8; 16]);
+        let path = write_dump("jpeg-trailer", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let out_dir = root.join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Jpeg],
+            min_size: 1,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        let jpeg = report
+            .files
+            .iter()
+            .find(|file| file.kind == CarveKind::Jpeg)
+            .expect("one JPEG record");
+        assert_eq!(jpeg.role, CarveRole::Whole);
+        assert_eq!(jpeg.trailer_offset, Some(start + JPEG.len() as u64));
+        assert_eq!(jpeg.trailer_len, Some(14));
+        let preview = jpeg.trailer_preview.as_deref().unwrap_or("");
+        assert!(preview.contains("VICTIM-ID-0001"), "{preview}");
+        // The carved file must not contain the trailer.
+        let bytes = std::fs::read(jpeg.path.as_ref().expect("written")).unwrap();
+        assert_eq!(bytes.len(), JPEG.len());
+        assert_eq!(bytes, JPEG);
         std::fs::remove_dir_all(&root).ok();
     }
 

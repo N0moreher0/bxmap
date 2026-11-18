@@ -6,6 +6,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Universal ransomware-trailer extractor (ROADMAP 8.14.4)**.
+  JPEG (`FF D9`), PNG (`IEND`), PDF (`%%EOF`), ZIP (EOCD) and SQLite
+  (`page_size x page_count`) whole carves now record `trailer_*` (offset,
+  length, SHA-256, first-128-byte hex/ASCII preview) for the bytes the
+  ransomware appended after the terminator — mirroring what MP4 rebuilts
+  already did, generalized to every terminator, capped at 2 KiB and
+  stopped at the first run of 16 zero bytes. Tails salvaged from ruined
+  file heads, ZIP member-salvage rebuilts (8.14.1) and SQLite header
+  rebuilts (8.14.2) record the same. The carved file itself is never
+  modified — index metadata only. Bench ground truth: the bench MP4's
+  trailer is now visible as `VICTIM-ID-777` in the index; bench files
+  byte-identical, 30/63; Lab 6 unchanged with 20 records now carrying a
+  trailer; JPEG/MP4 tails keep their 1 MiB caps.
+
 - **SQLite header rebuild for destroyed databases (ROADMAP 8.14.2)**.
   When the 100-byte SQLite file header (inside page 1) is destroyed — the
   ransomware / bad-sector shape — `--carve` now recovers the database from
