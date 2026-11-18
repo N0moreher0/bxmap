@@ -883,7 +883,9 @@ OPTIONS:
     --carve-max-files <N> Stop after N files (default 1000)
     --carved[-out|-index|-min-size|-max-size|-max-total|-max-files]
                           Aliases of the matching --carve option (one option
-                          each: giving both spellings is an error).
+                          each: giving both spellings is an error). Legacy
+                          spellings: not advertised in shell completions;
+                          prefer --carve*.
     --reassemble          Reassemble carved fragments in page order (requires
                           --carve and a minidump input). Merges adjacent
                           fragments back into whole files using the minidump's

@@ -297,76 +297,93 @@ pub fn encoding_filter_for(encoding: Encoding) -> EncodingFilter {
     }
 }
 
+/// Canonical long-flag list advertised by shell completions.
+///
+/// Single source for `completions_for` and the unit test, so the list
+/// cannot silently drift from the parser — when you add a flag, add it
+/// here too (the test rejects duplicates and legacy spellings).
+/// Legacy `--carved-*` aliases deliberately stay unadvertised.
+pub const COMPLETION_FLAGS: &[&str] = &[
+    // Scan parameters
+    "--min-len",
+    "--max-str-len",
+    "--max-strings",
+    "--start",
+    "--end",
+    "--encoding",
+    "--noise-threshold",
+    "--threads",
+    "--parallel-files",
+    "--output-dir",
+    "--auto-tune",
+    "--max-memory",
+    "--config",
+    "--progress",
+    "--no-progress",
+    "--dedupe",
+    "--compact",
+    // Modes and feature bundles
+    "--mode",
+    "--with",
+    "--format",
+    "--output",
+    // Artifacts and reporting
+    "--extract",
+    "--report",
+    "--min-files-in-user",
+    "--filter-appdata",
+    "--stats",
+    "--filter-regex",
+    // Detectors and rules
+    "--detect",
+    "--detect-strict",
+    "--detect-rules",
+    "--detect-format",
+    "--yar",
+    "--brute-xor",
+    "--xor-exhaustive",
+    "--parse-pid",
+    // Entropy
+    "--entropy",
+    "--entropy-window",
+    "--entropy-threshold",
+    "--entropy-merge",
+    "--entropy-no-data",
+    "--entropy-max-data",
+    // Binary signatures
+    "--signature",
+    // Minidump analysis
+    "--tree",
+    "--no-tree",
+    "--map-va",
+    "--no-map-va",
+    "--in-module",
+    "--rwx-only",
+    "--heap-only",
+    "--vmware-info",
+    "--no-vmware-info",
+    // Reassembly and carving
+    "--reassemble",
+    "--carve",
+    "--carve-out",
+    "--carve-index",
+    "--carve-min-size",
+    "--carve-max-size",
+    "--carve-max-total",
+    "--carve-max-files",
+    // Help
+    "--help",
+    "--help-advanced",
+    "--help-all",
+    "--version",
+    // Short spellings
+    "-o",
+    "-h",
+    "-V",
+];
+
 pub fn completions_for(shell: &str) -> String {
-    let flags = [
-        "--with",
-        "--mode",
-        "--min-len",
-        "--max-str-len",
-        "--max-strings",
-        "--start",
-        "--end",
-        "--encoding",
-        "--noise-threshold",
-        "--threads",
-        "--parallel-files",
-        "--output-dir",
-        "--auto-tune",
-        "--max-memory",
-        "--config",
-        "--format",
-        "--compact",
-        "--dedupe",
-        "--extract",
-        "--report",
-        "--detect",
-        "--detect-format",
-        "--filter-regex",
-        "--stats",
-        "--entropy",
-        "--entropy-window",
-        "--entropy-threshold",
-        "--entropy-merge",
-        "--entropy-no-data",
-        "--entropy-max-data",
-        "--signature",
-        "--yar",
-        "--brute-xor",
-        "--xor-exhaustive",
-        "--tree",
-        "--no-tree",
-        "--map-va",
-        "--no-map-va",
-        "--in-module",
-        "--rwx-only",
-        "--heap-only",
-        "--vmware-info",
-        "--no-vmware-info",
-        "--reassemble",
-        "--signature",
-        "--carve",
-        "--carve-out",
-        "--carve-index",
-        "--carve-min-size",
-        "--carve-max-size",
-        "--carve-max-total",
-        "--carve-max-files",
-        "--carved",
-        "--carved-out",
-        "--carved-index",
-        "--carved-min-size",
-        "--carved-max-size",
-        "--carved-max-total",
-        "--carved-max-files",
-        "--mode",
-        "--with",
-        "-o",
-        "--output",
-        "-h",
-        "--help",
-        "-V",
-        "--version",
-    ];
+    let flags: &[&str] = COMPLETION_FLAGS;
     match shell {
         "bash" => {
             let mut out = String::from("_bxmap() {\n  local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n  COMPREPLY=( $(compgen -W \"");
@@ -1032,6 +1049,124 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         parse_args_from(args.iter().map(|s| s.to_string()).collect()).map(|(args, _)| args)
+    }
+
+    #[test]
+    fn completion_flags_are_clean_and_complete() {
+        let flags = COMPLETION_FLAGS;
+        let unique: std::collections::BTreeSet<&&str> = flags.iter().collect();
+        assert_eq!(
+            flags.len(),
+            unique.len(),
+            "duplicate flags in COMPLETION_FLAGS"
+        );
+        assert!(flags
+            .iter()
+            .all(|flag| flag.starts_with("--") || matches!(*flag, "-o" | "-h" | "-V")));
+        // Canonical spellings for every subsystem must be advertised.
+        for required in [
+            "--mode",
+            "--with",
+            "--format",
+            "--output",
+            "--parallel-files",
+            "--output-dir",
+            "--progress",
+            "--no-progress",
+            "--dedupe",
+            "--compact",
+            "--min-len",
+            "--max-str-len",
+            "--max-strings",
+            "--start",
+            "--end",
+            "--encoding",
+            "--noise-threshold",
+            "--threads",
+            "--auto-tune",
+            "--max-memory",
+            "--config",
+            "--extract",
+            "--report",
+            "--min-files-in-user",
+            "--filter-appdata",
+            "--stats",
+            "--filter-regex",
+            "--detect",
+            "--detect-strict",
+            "--detect-rules",
+            "--detect-format",
+            "--yar",
+            "--brute-xor",
+            "--xor-exhaustive",
+            "--parse-pid",
+            "--entropy",
+            "--entropy-window",
+            "--entropy-threshold",
+            "--entropy-merge",
+            "--entropy-no-data",
+            "--entropy-max-data",
+            "--signature",
+            "--tree",
+            "--no-tree",
+            "--map-va",
+            "--no-map-va",
+            "--in-module",
+            "--rwx-only",
+            "--heap-only",
+            "--vmware-info",
+            "--no-vmware-info",
+            "--reassemble",
+            "--carve",
+            "--carve-out",
+            "--carve-index",
+            "--carve-min-size",
+            "--carve-max-size",
+            "--carve-max-total",
+            "--carve-max-files",
+            "--help",
+            "--help-advanced",
+            "--help-all",
+            "--version",
+            "-o",
+            "-h",
+            "-V",
+        ] {
+            assert!(
+                flags.contains(&required),
+                "missing canonical flag {required}"
+            );
+        }
+        // Legacy spellings stay unadvertised (they still parse).
+        for legacy in [
+            "--carved",
+            "--carved-out",
+            "--carved-index",
+            "--carved-min-size",
+            "--carved-max-size",
+            "--carved-max-total",
+            "--carved-max-files",
+        ] {
+            assert!(
+                !flags.contains(&legacy),
+                "legacy spelling advertised: {legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_output_covers_the_canonical_list() {
+        for shell in ["bash", "zsh", "fish", "powershell"] {
+            let out = completions_for(shell);
+            assert!(out.len() > 100, "{shell} completion looks empty");
+            // fish strips leading dashes; the others keep them.
+            assert!(out.contains("carve"), "{shell} completion misses carve");
+            assert!(
+                !out.contains("carved-out"),
+                "{shell} completion advertises a legacy spelling"
+            );
+        }
+        assert!(completions_for("unknown-shell").starts_with("unknown shell"));
     }
 
     #[test]
