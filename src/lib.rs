@@ -59,6 +59,7 @@ pub mod classifier;
 pub(crate) mod jpeg_donor;
 pub(crate) mod jpeg_probe;
 pub(crate) mod jpeg_scan;
+pub(crate) mod zip_members;
 pub use classifier::{
     classify, detect_bitlocker_header, detect_encryption_shell, detect_luks_header,
     detect_openssl_encrypted, detect_pgp_container, detect_secrets, detect_secrets_detailed,

@@ -1375,6 +1375,176 @@ impl Carver {
                     report.rejected += 1;
                     continue;
                 }
+                // ROADMAP 8.14.1: the header-footer-encryption case — the
+                // CD+EOCD is gone (notes set by the ZIP validator) but
+                // members in the body may survive. Salvage and rebuild
+                // instead of emitting the incomplete record.
+                let member_rebuilt = if kind == CarveKind::Zip && !notes.is_empty() {
+                    match crate::zip_members::salvage_zip_members(
+                        &mut source,
+                        offset,
+                        size,
+                        file_len,
+                    ) {
+                        Ok(Some(rebuilt)) if !rebuilt.bytes.is_empty() => Some(rebuilt),
+                        // No surviving members (or an archive we cannot
+                        // rebuild) — keep the usual incomplete record.
+                        Ok(_) => None,
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(rebuilt) = member_rebuilt {
+                    let rebuilt_size = rebuilt.bytes.len() as u64;
+                    if rebuilt_size < self.options.min_size {
+                        report.rejected += 1;
+                        covered_end = covered_end.max(offset + size);
+                        continue;
+                    }
+                    // Digest the *rebuilt* bytes (the rebuilt archive is
+                    // the carved artifact, not the dump region).
+                    let rebuilt_entropy;
+                    let sha256;
+                    {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&rebuilt.bytes);
+                        sha256 = hex(&hasher.finalize());
+                        let mut counts = [0u64; 256];
+                        for &byte in &rebuilt.bytes {
+                            counts[byte as usize] += 1;
+                        }
+                        rebuilt_entropy = entropy(&counts, rebuilt_size);
+                    }
+                    if let Some(&index) = by_hash.get(&sha256) {
+                        report.duplicates += 1;
+                        report.duplicate_bytes += rebuilt_size;
+                        report.files[index].duplicates.push(offset);
+                        covered_end = covered_end.max(offset + rebuilt_size);
+                        continue;
+                    }
+                    let choice = crate::carve_ext::refine_ext(
+                        CarveKind::Zip,
+                        &mut std::io::Cursor::new(&rebuilt.bytes),
+                        0,
+                        rebuilt_size,
+                    );
+                    if !self.ext_filter.allows(CarveKind::Zip, choice.ext) {
+                        report.filtered += 1;
+                        covered_end = covered_end.max(offset + rebuilt_size);
+                        continue;
+                    }
+                    let evidence: Vec<&'static str> = if rebuilt.any_deflate {
+                        vec![
+                            "zip_members_verified",
+                            "crc32_verified",
+                            "deflate_ok",
+                            "eocd_rebuilt",
+                        ]
+                    } else {
+                        vec![
+                            "zip_members_verified",
+                            "crc32_verified",
+                            "stored_crc",
+                            "eocd_rebuilt",
+                        ]
+                    };
+                    let kept_list = rebuilt
+                        .kept_names
+                        .iter()
+                        .take(6)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let more = rebuilt.kept_names.len().saturating_sub(6);
+                    let notes = format!(
+                        "rebuild: ZIP salvaged from header-footer encryption; {} member(s) verified, {} local headers rejected; members: {}{}; original archive spanned {:#x}..{:#x} ({} bytes, CD/EOCD destroyed); destroyed members lost",
+                        rebuilt.kept,
+                        rebuilt.rejected,
+                        kept_list,
+                        if more > 0 { format!(", … (+{more} more)") } else { String::new() },
+                        offset,
+                        offset + size,
+                        size,
+                    );
+                    let path = match out_dir {
+                        Some(dir) => {
+                            // Estimation-style rebuilts always land in partial/.
+                            let partial = dir.join("partial");
+                            if let Err(error) = std::fs::create_dir_all(&partial) {
+                                failure = Some(error);
+                                return false;
+                            }
+                            let name = carved_file_name_with_ext(
+                                offset,
+                                CarveKind::Zip,
+                                choice.ext,
+                                CarveRole::Rebuilt,
+                                &sha256,
+                            );
+                            let path = partial.join(name);
+                            if path.exists() {
+                                failure = Some(io::Error::new(
+                                    io::ErrorKind::AlreadyExists,
+                                    format!(
+                                        "refusing to overwrite '{}'; use a fresh --carve-out",
+                                        path.display()
+                                    ),
+                                ));
+                                return false;
+                            }
+                            if let Err(error) = std::fs::write(&path, &rebuilt.bytes) {
+                                failure = Some(error);
+                                return false;
+                            }
+                            Some(path)
+                        }
+                        None => None,
+                    };
+                    by_hash.insert(sha256.clone(), report.files.len());
+                    report.bytes_written += rebuilt_size;
+                    report.files.push(CarvedFile {
+                        offset,
+                        kind: CarveKind::Zip,
+                        size: rebuilt_size,
+                        complete: true,
+                        sha256,
+                        entropy: rebuilt_entropy,
+                        notes,
+                        path,
+                        duplicates: Vec::new(),
+                        corrupted_offset: Some(offset),
+                        entropy_spike_at: None,
+                        partial_encryption: None,
+                        trailer_offset: None,
+                        trailer_len: None,
+                        trailer_sha256: None,
+                        trailer_preview: None,
+                        tracks_intact: None,
+                        ext: choice.ext.to_string(),
+                        ext_source: choice.source.to_string(),
+                        role: CarveRole::Rebuilt,
+                        tier: 2,
+                        evidence,
+                        confidence: CarveConfidence::Medium,
+                    });
+                    covered_end = covered_end.max(offset + rebuilt_size);
+                    if self.options.max_files != 0 && report.files.len() >= self.options.max_files {
+                        report.truncated = true;
+                        stop = true;
+                        return false;
+                    }
+                    if self.options.max_total != 0 && report.bytes_written >= self.options.max_total
+                    {
+                        report.truncated = true;
+                        stop = true;
+                        return false;
+                    }
+                    continue;
+                }
                 let digest = match digest_region(&mut source, offset, size) {
                     Ok(digest) => digest,
                     Err(error) => {
@@ -8576,7 +8746,7 @@ fn entropy(counts: &[u64; 256], size: u64) -> f64 {
 }
 
 /// CRC-32 (IEEE, as used by PNG and gzip).
-fn crc32(state: u32, data: &[u8]) -> u32 {
+pub(crate) fn crc32(state: u32, data: &[u8]) -> u32 {
     static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
         let mut table = [0u32; 256];
@@ -11717,6 +11887,82 @@ mod tests {
         let stats =
             crate::jpeg_scan::verify_scan(&bytes).expect("the adjusted scan must decode exactly");
         assert_eq!(stats.mcus, 32 * 24, "512x384 4:2:0 is 32x24 MCUs");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ROADMAP 8.14.1: a ZIP whose first local header(s) and whose
+    /// CD+EOCD were destroyed (header-footer encryption) must be rebuilt
+    /// from the surviving members; the rebuilt archive passes the same
+    /// validator as every other ZIP.
+    #[test]
+    fn zip_header_footer_encryption_is_rebuilt_from_surviving_members() {
+        fn member(name: &str, payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            let crc = crc32(0xffff_ffff, payload) ^ 0xffff_ffff;
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // stored
+            out.extend_from_slice(&0u16.to_le_bytes()); // time
+            out.extend_from_slice(&0u16.to_le_bytes()); // date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+        let payload_a: Vec<u8> = (0u8..=200).cycle().take(3000).collect();
+        let payload_b: Vec<u8> = (7u8..=213).cycle().take(2000).collect();
+        let member1 = member("docs/a.txt", &payload_a);
+        let member2 = member("docs/b.bin", &payload_b);
+        // Đầu file (member data + CD giả vờ) bị xóa trắng; 2 member sống;
+        // CD+EOCD cuối file cũng bị xóa trắng.
+        let mut dump = pseudo_random(900, 0x1EAF_0000_0000_00A1);
+        dump.extend_from_slice(&member1);
+        dump.extend_from_slice(&member2);
+        dump.extend_from_slice(&pseudo_random(400, 0x1EAF_0000_0000_00A2));
+        let path = write_dump("zip-headerfooter", &dump);
+        let root = path.parent().unwrap().to_path_buf();
+        let out_dir = root.join("out");
+        let options = CarveOptions {
+            kinds: vec![CarveKind::Zip],
+            min_size: 1,
+            ..Default::default()
+        };
+        let report = Carver::new(options)
+            .with_salvage(true)
+            .with_incomplete_dir(true)
+            .carve_to_dir(path.to_str().unwrap(), &out_dir)
+            .unwrap();
+        let zip_records: Vec<_> = report
+            .files
+            .iter()
+            .filter(|file| file.kind == CarveKind::Zip)
+            .collect();
+        assert_eq!(
+            zip_records.len(),
+            1,
+            "exactly one ZIP record is expected: {zip_records:?}"
+        );
+        let rebuilt = zip_records[0];
+        assert_eq!(rebuilt.role, CarveRole::Rebuilt);
+        assert_eq!(rebuilt.tier, 2);
+        assert_eq!(rebuilt.confidence, CarveConfidence::Medium);
+        assert!(
+            rebuilt.evidence.contains(&"zip_members_verified"),
+            "{rebuilt:?}"
+        );
+        assert!(rebuilt.notes.contains("member"), "{rebuilt:?}");
+        let bytes = std::fs::read(rebuilt.path.as_ref().expect("written")).unwrap();
+        assert!(bytes.starts_with(b"PK\x03\x04"));
+        // Archive dựng lại qua được chính validator dùng cho mọi ZIP.
+        let mut check_file = File::open(rebuilt.path.as_ref().expect("written")).unwrap();
+        let len = bytes.len() as u64;
+        let mut source = Source::new(&mut check_file, 0, len);
+        assert!(matches!(carve_zip(&mut source).unwrap(), Verdict::Valid));
         std::fs::remove_dir_all(&root).ok();
     }
 

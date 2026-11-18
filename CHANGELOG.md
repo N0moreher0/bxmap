@@ -6,6 +6,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **ZIP/OOXML header-footer encryption recovery (ROADMAP 8.14.1)**.
+  When a ZIP's central directory and end record are destroyed
+  (ransomware's header-footer shape), `--carve` now salvages surviving
+  local members — every member is verified (CRC-32 of the payload must
+  match the local header; method 8 additionally inflates to exactly
+  `usize` bytes), nested member hits are suppressed, and the rebuilt
+  archive is written to `partial/` as `role=rebuilt`, tier 2,
+  confidence=medium, evidence `zip_members_verified` + `crc32_verified`
+  (+ `deflate_ok` or `stored_crc`, `eocd_rebuilt`). The notes list the
+  kept members, the rejected local headers and the original destroyed
+  span. The Lab 6 RAM dump went 128 → 152 files (+11 PE, +13 ICO); the
+  bench is byte-identical (30/63). New module `src/zip_members.rs`.
+
 - **DC-equalized sibling for rebuilt JPEGs (ROADMAP 8.12.6)**.
   A rebuilt baseline JPEG's scan starts at MCU 0 with the DC predictor
   forced to zero, so every channel of a mostly-uniform image is shifted
